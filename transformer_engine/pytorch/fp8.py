@@ -75,22 +75,34 @@ def get_amax_buffer_key(fp8_meta: Dict[str, Any], forward: bool = True) -> str:
     return f"BWD_AMAX_{fp8_meta['autocast_id_bwd']}"
 
 
+def get_scale_buffer_key(fp8_meta: Dict[str, Any], forward: bool = True) -> str:
+    """Return a key in `_global_fp8_buffer` for the AMAX storage."""
+    if forward:
+        return f"FWD_SCALE_{fp8_meta['autocast_id_fwd']}"
+    return f"BWD_SCALE_{fp8_meta['autocast_id_bwd']}"
+
+
 def add_amax_to_global_buffer(fp8_meta: Dict[str, Any], forward: bool = True) -> None:
     """Append 1D tensor `amax` to global buffer."""
     global _global_fp8_buffer
-    buffer_key = get_amax_buffer_key(fp8_meta, forward=forward)
+    amax_buffer_key = get_amax_buffer_key(fp8_meta, forward=forward)
+    scale_buffer_key = get_scale_buffer_key(fp8_meta, forward=forward)
     fp8_meta_tensor_key = get_meta_tensor_key(forward=forward)
     buffer_position_key = get_buffer_position_key(forward=forward)
 
-    if buffer_key not in _global_fp8_buffer:
-        _global_fp8_buffer[buffer_key] = [fp8_meta[fp8_meta_tensor_key].amax_history[0]]
+    if amax_buffer_key not in _global_fp8_buffer:
+        _global_fp8_buffer[amax_buffer_key] = [fp8_meta[fp8_meta_tensor_key].amax_history[0]]
+        _global_fp8_buffer[scale_buffer_key] = [fp8_meta[fp8_meta_tensor_key].scale]
     else:
-        _global_fp8_buffer[buffer_key].append(
+        _global_fp8_buffer[amax_buffer_key].append(
             fp8_meta[fp8_meta_tensor_key].amax_history[0]
+        )
+        _global_fp8_buffer[scale_buffer_key].append(
+            fp8_meta[fp8_meta_tensor_key].scale
         )
 
     if buffer_position_key not in fp8_meta:
-        fp8_meta[buffer_position_key] = len(_global_fp8_buffer[buffer_key]) - 1
+        fp8_meta[buffer_position_key] = len(_global_fp8_buffer[amax_buffer_key]) - 1
 
 
 def copy_amax_from_global_buffer(
@@ -102,7 +114,11 @@ def copy_amax_from_global_buffer(
     if buffer_position_key not in fp8_meta:
         return
     amax_buffer_key = get_amax_buffer_key(fp8_meta, forward=forward)
+    scale_buffer_key = get_scale_buffer_key(fp8_meta, forward=forward)
     fp8_meta[fp8_meta_tensor_key].amax_history[0] = _global_fp8_buffer[amax_buffer_key][
+        fp8_meta[buffer_position_key]
+    ]
+    fp8_meta[fp8_meta_tensor_key].scale = _global_fp8_buffer[scale_buffer_key][
         fp8_meta[buffer_position_key]
     ]
 
@@ -233,10 +249,7 @@ def get_fp8_group() -> Union[dist_group_type, None]:
 
 def update_amax_history(amax_history: torch.Tensor) -> torch.Tensor:
     """Update amax history and set next amax to zero."""
-    amax_history = torch.roll(amax_history, -1, 0)
-    amax_history[0].fill_(0.0)
-    return amax_history
-
+    return torch.zeros_like(amax_history)
 
 @torch.jit.script
 def _default_get_amax(
@@ -280,15 +293,10 @@ def fused_amax_and_scale_update(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Amax to scale conversion."""
 
-    # Get amax from history.
-    amax_history, amax = _default_get_amax(
-        amax_history,
-        amax_compute_algo,
-    )
 
     # Calculate new scaling factor.
     return amax_history, _default_sf_compute(
-        amax,
+        amax_history,
         scale,
         fp8_max,
         margin,
@@ -396,6 +404,7 @@ def global_amax_reduction(
     """Concatenate, reduce, and split amaxes in the global buffer."""
     global _global_fp8_buffer
     amax_buffer_key = get_amax_buffer_key(fp8_meta, forward=forward)
+    scale_buffer_key = get_scale_buffer_key(fp8_meta, forward=forward)
 
     # Key already deleted.
     if amax_buffer_key not in _global_fp8_buffer:
@@ -403,12 +412,28 @@ def global_amax_reduction(
 
     chunk_sizes = [x.numel() for x in _global_fp8_buffer[amax_buffer_key]]
     contiguous_amax = torch.cat(_global_fp8_buffer[amax_buffer_key])
+    contiguous_scale = torch.cat(_global_fp8_buffer[scale_buffer_key])
 
     reduce_tensor_across_group_op_max(contiguous_amax, fp8_meta["fp8_group"])
     if reduce_amax_across_tp_group:
         reduce_tensor_across_group_op_max(contiguous_amax, tp_group)
 
+
+    (
+        contiguous_amax,
+        contiguous_scale,
+    ) = fused_amax_and_scale_update(
+        contiguous_amax,
+        contiguous_scale,
+        fp8_meta["fp8_max_fwd" if forward else "fp8_max_bwd"],
+        fp8_meta["recipe"].margin,
+        fp8_meta["recipe"].amax_compute_algo,
+    )
+
+    contiguous_amax.fill_(0.0)
+
     _global_fp8_buffer[amax_buffer_key] = list(contiguous_amax.split(chunk_sizes))
+    _global_fp8_buffer[scale_buffer_key] = list(contiguous_scale.split(chunk_sizes))
 
 
 def delete_key_from_amax_buffer(forward: bool = True) -> None:

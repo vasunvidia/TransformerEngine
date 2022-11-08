@@ -303,7 +303,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         if self.fp8_meta.get("update_amax_and_scale_fwd", False):
             # Previous iteration was grad_enabled
             copy_amax_from_global_buffer(self.fp8_meta, forward=True)
-            amax_and_scale_update(self.fp8_meta, True)
+            #amax_and_scale_update(self.fp8_meta, True)
             set_amax_buffer_key_deletion(self.fp8_meta, forward=True)
 
         if self.fp8 and torch.is_grad_enabled() and self.training:
@@ -346,7 +346,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # From previous iteration
         copy_amax_from_global_buffer(fp8_meta, forward=False)
-        amax_and_scale_update(fp8_meta, False)
+        #amax_and_scale_update(fp8_meta, False)
         set_amax_buffer_key_deletion(fp8_meta, forward=False)
 
         # Get new backward key.
