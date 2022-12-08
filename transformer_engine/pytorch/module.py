@@ -105,6 +105,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.tp_group_initialized = False
         self.tp_size = 1
         self.sequence_parallel = False
+        self.reduce_amax_dp = True
         self.fp8_weight_shapes = []
 
     def set_meta_tensor(self, fwd: bool) -> None:
@@ -332,6 +333,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             reduce_func = partial(
                 global_amax_reduction,
                 self.fp8_meta,
+                self.reduce_amax_dp,
                 self.sequence_parallel,
                 self.tp_group,
                 forward=True,
@@ -361,6 +363,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
     def post_backward(
         fp8: bool,
         fp8_meta: Dict[str, Any],
+        reduce_amax_across_dp: bool,
         reduce_amax_across_tp_group: bool,
         tp_group: Union[dist_group_type, None],
     ) -> None:
@@ -370,7 +373,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         if fp8_meta["first_module"]:
             global_amax_reduction(
-                fp8_meta, reduce_amax_across_tp_group, tp_group, forward=False
+                fp8_meta, reduce_amax_across_dp, reduce_amax_across_tp_group, tp_group, forward=False
             )
             delete_key_from_amax_buffer(forward=False)
 

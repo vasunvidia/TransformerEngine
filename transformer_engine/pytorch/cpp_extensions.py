@@ -33,6 +33,8 @@ def fp8_gemm(
     empty_tensor = torch.Tensor()
     if out_index is not None:
         assert fp8_meta_tensor is not None
+    if out_dtype == torch.int8:
+        assert out_fp8_subtype is not None
 
     return_output = False
     if out is None:
@@ -45,7 +47,7 @@ def fp8_gemm(
         return_output = True
 
     out_dtype = tex.DType.kFloat32 if fp32_output else TE_DType[out_dtype]
-    bias_dtype = output_dtype if bias is None else TE_DType[bias.dtype]
+    bias_dtype = out_dtype if bias is None else TE_DType[bias.dtype]
     out_dtype = out_fp8_subtype if out_fp8_subtype is not None else out_dtype
 
     tex.te_gemm(
