@@ -134,6 +134,41 @@ std::vector<at::Tensor> fused_cast_transpose_bgrad(at::Tensor grad_output,
 }
 
 
+std::vector<at::Tensor> fused_fp8_transpose_bgrad(at::Tensor grad_output,
+                                                   at::Tensor scale,
+                                                   at::Tensor amax,
+                                                   at::Tensor scale_inv,
+                                                   transformer_engine::DType otype,
+                                                   transformer_engine::DType grad_bias_type
+) {
+  using namespace transformer_engine;
+
+  size_t M = static_cast<size_t>(grad_output.size(0));
+  size_t N = static_cast<size_t>(grad_output.size(1));
+
+  auto grad_bias = allocateTorchTensor(grad_output.size(-1), grad_bias_type);
+  auto grad_output_cast =
+            allocateTorchTensor(grad_output.size(0),
+                                grad_output.size(1),
+                                DType::kByte);
+  auto grad_output_transpose =
+            allocateTorchTensor(grad_output.size(1),
+                                grad_output.size(0),
+                                DType::kByte);
+
+  dispatch_fp8_bgrad_transpose_fusion(
+          grad_output.data_ptr(), {M, N}, otype,
+          scale.data_ptr(), {1}, DType::kFloat32,
+          grad_output_cast.data_ptr(), {M, N}, otype,
+          grad_output_transpose.data_ptr(), {N, M}, otype,
+          amax.data_ptr(), {1}, DType::kFloat32,
+          grad_bias.data_ptr(), {N}, grad_bias_type,
+          scale_inv.data_ptr(), {1}, DType::kFloat32);
+
+  return {grad_bias, grad_output_cast, grad_output_transpose};
+}
+
+
 std::vector<at::Tensor> fused_cast_transpose_bgrad_dgelu(at::Tensor grad_output,
                                                          at::Tensor gelu_input,
                                                          at::Tensor scale,
@@ -703,6 +738,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_cast_transpose", &fused_cast_transpose, "Fused Cast + Transpose");
   m.def("fused_cast_transpose_bgrad", &fused_cast_transpose_bgrad,
                                               "Fused Cast + Transpose + BGRAD");
+  m.def("fused_fp8_transpose_bgrad", &fused_fp8_transpose_bgrad,
+                                              "Fused Transpose + BGRAD");
   m.def("fused_cast_transpose_bgrad_dgelu", &fused_cast_transpose_bgrad_dgelu,
                                               "Fused Cast + Transpose + BGRAD + DGELU");
   m.def("fused_multi_cast_transpose", &fused_multi_cast_transpose,

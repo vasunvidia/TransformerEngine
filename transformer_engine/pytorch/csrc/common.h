@@ -258,6 +258,28 @@ void dispatch_bgrad_cast_transpose_fusion(void* input,                          
                                           const transformer_engine::DType scale_inv_type
 );
 
+void dispatch_fp8_bgrad_transpose_fusion(void* input,                                          // i
+                                     const std::vector<size_t>& input_shape,
+                                     const transformer_engine::DType input_type,
+                                     void* scale,                                          // i
+                                     const std::vector<size_t>& scale_shape,
+                                     const transformer_engine::DType scale_type,
+                                     void* cast_output,                                    // o
+                                     const std::vector<size_t>& cast_output_shape,
+                                     const transformer_engine::DType cast_output_type,
+                                     void* transposed_output,                              // o
+                                     const std::vector<size_t>& transposed_output_shape,
+                                     const transformer_engine::DType transposed_output_type,
+                                     void* amax,                                           // o
+                                     const std::vector<size_t>& amax_shape,
+                                     const transformer_engine::DType amax_type,
+                                     void* dbias,                                          // o
+                                     const std::vector<size_t>& dbias_shape,
+                                     const transformer_engine::DType dbias_type,
+                                     void* scale_inv,                                      // o
+                                     const std::vector<size_t>& scale_inv_shape,
+                                     const transformer_engine::DType scale_inv_type
+);
 
 void dispatch_bgrad_dgelu_cast_transpose_fusion(
         void* input,                                            // i

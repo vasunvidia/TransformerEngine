@@ -310,6 +310,55 @@ void dispatch_bgrad_cast_transpose_fusion(void* input,                          
 }
 
 
+void dispatch_fp8_bgrad_transpose_fusion(void* input,                                          // i
+                                     const std::vector<size_t>& input_shape,
+                                     const transformer_engine::DType input_type,
+                                     void* scale,                                          // i
+                                     const std::vector<size_t>& scale_shape,
+                                     const transformer_engine::DType scale_type,
+                                     void* cast_output,                                    // o
+                                     const std::vector<size_t>& cast_output_shape,
+                                     const transformer_engine::DType cast_output_type,
+                                     void* transposed_output,                              // o
+                                     const std::vector<size_t>& transposed_output_shape,
+                                     const transformer_engine::DType transposed_output_type,
+                                     void* amax,                                           // o
+                                     const std::vector<size_t>& amax_shape,
+                                     const transformer_engine::DType amax_type,
+                                     void* dbias,                                          // o
+                                     const std::vector<size_t>& dbias_shape,
+                                     const transformer_engine::DType dbias_type,
+                                     void* scale_inv,                                      // o
+                                     const std::vector<size_t>& scale_inv_shape,
+                                     const transformer_engine::DType scale_inv_type
+) {
+  auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type, amax, scale, scale_inv);
+  auto cast_output_cu       = makeTransformerEngineTensor(cast_output, cast_output_shape,
+                                                          cast_output_type, amax, scale,
+                                                          scale_inv);
+  auto transposed_output_cu = makeTransformerEngineTensor(transposed_output,
+                                                          transposed_output_shape,
+                                                          transposed_output_type,
+                                                          amax, scale, scale_inv);
+  auto dbias_cu             = makeTransformerEngineTensor(dbias, dbias_shape, dbias_type);
+  transformer_engine::TensorWrapper workspace;
+
+  nvte_fp8_transpose_dbias(input_cu.data(), cast_output_cu.data(),
+                            transposed_output_cu.data(), dbias_cu.data(),
+                            workspace.data(), at::cuda::getCurrentCUDAStream());
+
+  // Fill workspace
+  auto workspace_data = allocateSpace(workspace.shape(), workspace.dtype());
+  workspace = makeTransformerEngineTensor(workspace_data.data_ptr(),
+                                          workspace.shape(),
+                                          workspace.dtype());
+
+  nvte_fp8_transpose_dbias(input_cu.data(), cast_output_cu.data(),
+                            transposed_output_cu.data(), dbias_cu.data(),
+                            workspace.data(), at::cuda::getCurrentCUDAStream());
+}
+
+
 void dispatch_bgrad_dgelu_cast_transpose_fusion(
     void* input,                                            // i
     const std::vector<size_t>& input_shape,
