@@ -264,9 +264,6 @@ void dispatch_fp8_bgrad_transpose_fusion(void* input,                           
                                      void* scale,                                          // i
                                      const std::vector<size_t>& scale_shape,
                                      const transformer_engine::DType scale_type,
-                                     void* cast_output,                                    // o
-                                     const std::vector<size_t>& cast_output_shape,
-                                     const transformer_engine::DType cast_output_type,
                                      void* transposed_output,                              // o
                                      const std::vector<size_t>& transposed_output_shape,
                                      const transformer_engine::DType transposed_output_type,

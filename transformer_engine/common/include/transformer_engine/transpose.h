@@ -87,7 +87,6 @@ void nvte_cast_transpose_dbias(const NVTETensor input,
  *  \param[in]     stream              CUDA stream used for the operation.
  */
 void nvte_fp8_transpose_dbias(const NVTETensor input,
-                               NVTETensor cast_output,
                                NVTETensor transposed_output,
                                NVTETensor dbias,
                                NVTETensor workspace,

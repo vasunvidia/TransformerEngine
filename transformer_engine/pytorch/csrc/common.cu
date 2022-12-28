@@ -316,9 +316,6 @@ void dispatch_fp8_bgrad_transpose_fusion(void* input,                           
                                      void* scale,                                          // i
                                      const std::vector<size_t>& scale_shape,
                                      const transformer_engine::DType scale_type,
-                                     void* cast_output,                                    // o
-                                     const std::vector<size_t>& cast_output_shape,
-                                     const transformer_engine::DType cast_output_type,
                                      void* transposed_output,                              // o
                                      const std::vector<size_t>& transposed_output_shape,
                                      const transformer_engine::DType transposed_output_type,
@@ -333,9 +330,6 @@ void dispatch_fp8_bgrad_transpose_fusion(void* input,                           
                                      const transformer_engine::DType scale_inv_type
 ) {
   auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type, amax, scale, scale_inv);
-  auto cast_output_cu       = makeTransformerEngineTensor(cast_output, cast_output_shape,
-                                                          cast_output_type, amax, scale,
-                                                          scale_inv);
   auto transposed_output_cu = makeTransformerEngineTensor(transposed_output,
                                                           transposed_output_shape,
                                                           transposed_output_type,
@@ -343,7 +337,7 @@ void dispatch_fp8_bgrad_transpose_fusion(void* input,                           
   auto dbias_cu             = makeTransformerEngineTensor(dbias, dbias_shape, dbias_type);
   transformer_engine::TensorWrapper workspace;
 
-  nvte_fp8_transpose_dbias(input_cu.data(), cast_output_cu.data(),
+  nvte_fp8_transpose_dbias(input_cu.data(),
                             transposed_output_cu.data(), dbias_cu.data(),
                             workspace.data(), at::cuda::getCurrentCUDAStream());
 
@@ -353,7 +347,7 @@ void dispatch_fp8_bgrad_transpose_fusion(void* input,                           
                                           workspace.shape(),
                                           workspace.dtype());
 
-  nvte_fp8_transpose_dbias(input_cu.data(), cast_output_cu.data(),
+  nvte_fp8_transpose_dbias(input_cu.data(),
                             transposed_output_cu.data(), dbias_cu.data(),
                             workspace.data(), at::cuda::getCurrentCUDAStream());
 }

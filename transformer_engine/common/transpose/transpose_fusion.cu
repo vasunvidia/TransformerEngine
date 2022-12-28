@@ -68,7 +68,6 @@ struct TDBiasParam {
     using OutputType = OType;
     using ComputeType = CType;
     const IType *input;
-    OType *output_c;
     OType *output_t;
     const CType *scale_inv;
     CType *workspace;
@@ -231,9 +230,6 @@ transpose_dbias_kernel_notaligned(const Param param,
   const size_t tile_id_y = tile_id / num_tiles_x;
 
   const IType * const my_input_tile = param.input + (tile_id_x * nvec_in +
-                                                     tile_id_y * row_length * nvec_out) *
-                                                    THREADS_PER_WARP;
-  OType * const my_output_c_tile = param.output_c + (tile_id_x * nvec_in +
                                                      tile_id_y * row_length * nvec_out) *
                                                     THREADS_PER_WARP;
   OType * const my_output_t_tile = param.output_t + (tile_id_y * nvec_out +
@@ -445,7 +441,6 @@ void reduce_dbias(const Tensor &workspace, Tensor *dbias,
 }
 
 void fp8_transpose_dbias(const Tensor &input,
-                          Tensor *cast_output,
                           Tensor *transposed_output,
                           Tensor *dbias,
                           Tensor *workspace,
@@ -496,7 +491,6 @@ void fp8_transpose_dbias(const Tensor &input,
       using Param = TDBiasParam<Type, Type, ComputeType>;
       Param param;
       param.input     = reinterpret_cast<const Type *>(input.data.dptr);
-      param.output_c  = reinterpret_cast<Type *>(cast_output->data.dptr);
       param.output_t  = reinterpret_cast<Type *>(transposed_output->data.dptr);
       param.scale_inv = reinterpret_cast<const ComputeType *>(transposed_output->scale_inv.dptr);
       param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
@@ -530,14 +524,12 @@ void fp8_transpose_dbias(const Tensor &input,
 }  // namespace transformer_engine
 
 void nvte_fp8_transpose_dbias(const NVTETensor input,
-                               NVTETensor cast_output,
                                NVTETensor transposed_output,
                                NVTETensor dbias,
                                NVTETensor workspace,
                                cudaStream_t stream) {
   using namespace transformer_engine;
   fp8_transpose_dbias(*reinterpret_cast<const Tensor*>(input),
-                       reinterpret_cast<Tensor*>(cast_output),
                        reinterpret_cast<Tensor*>(transposed_output),
                        reinterpret_cast<Tensor*>(dbias),
                        reinterpret_cast<Tensor*>(workspace),

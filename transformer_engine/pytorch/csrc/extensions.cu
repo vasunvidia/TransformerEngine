@@ -147,10 +147,6 @@ std::vector<at::Tensor> fused_fp8_transpose_bgrad(at::Tensor grad_output,
   size_t N = static_cast<size_t>(grad_output.size(1));
 
   auto grad_bias = allocateTorchTensor(grad_output.size(-1), grad_bias_type);
-  auto grad_output_cast =
-            allocateTorchTensor(grad_output.size(0),
-                                grad_output.size(1),
-                                DType::kByte);
   auto grad_output_transpose =
             allocateTorchTensor(grad_output.size(1),
                                 grad_output.size(0),
@@ -159,13 +155,12 @@ std::vector<at::Tensor> fused_fp8_transpose_bgrad(at::Tensor grad_output,
   dispatch_fp8_bgrad_transpose_fusion(
           grad_output.data_ptr(), {M, N}, otype,
           scale.data_ptr(), {1}, DType::kFloat32,
-          grad_output_cast.data_ptr(), {M, N}, otype,
           grad_output_transpose.data_ptr(), {N, M}, otype,
           amax.data_ptr(), {1}, DType::kFloat32,
           grad_bias.data_ptr(), {N}, grad_bias_type,
           scale_inv.data_ptr(), {1}, DType::kFloat32);
 
-  return {grad_bias, grad_output_cast, grad_output_transpose};
+  return {grad_bias, grad_output_transpose};
 }
 
 
