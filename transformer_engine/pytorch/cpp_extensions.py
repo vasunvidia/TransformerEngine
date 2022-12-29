@@ -246,8 +246,21 @@ def fp8_gelu(
     fp8_meta_tensor: tex.FP8TensorMeta,
     fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
     otype: tex.DType,
+    fp8_input_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors] = None,
 ) -> torch.Tensor:
     """GeLU with FP8 output"""
+    if fp8_input_tensor is not None:
+        return tex.fp8_gelu_fp8input(
+            inp,
+            fp8_meta_tensor.scale[fp8_input_tensor],
+            fp8_meta_tensor.amax_history[0][fp8_input_tensor],
+            fp8_meta_tensor.scale_inv[fp8_input_tensor],
+            fp8_meta_tensor.scale[fp8_tensor],
+            fp8_meta_tensor.amax_history[0][fp8_tensor],
+            fp8_meta_tensor.scale_inv[fp8_tensor],
+            otype,
+        )
+
     return tex.fp8_gelu(
         inp,
         fp8_meta_tensor.scale[fp8_tensor],

@@ -338,6 +338,38 @@ at::Tensor fp8_gelu(at::Tensor input,
 }
 
 
+at::Tensor fp8_gelu_fp8input(at::Tensor input,
+                    at::Tensor input_scale,
+                    at::Tensor input_amax,
+                    at::Tensor input_scale_inv,
+                    at::Tensor output_scale,
+                    at::Tensor output_amax,
+                    at::Tensor output_scale_inv,
+                    transformer_engine::DType otype
+) {
+  using namespace transformer_engine;
+
+  size_t M = static_cast<size_t>(input.size(0));
+  size_t N = static_cast<size_t>(input.size(1));
+
+  auto output =
+            allocateTorchTensor(input.size(0),
+                                input.size(1),
+                                DType::kByte);
+
+  dispatch_gelu(input.data_ptr(), {M, N}, otype,
+                input_scale.data_ptr(), {1}, DType::kFloat32,
+                input_amax.data_ptr(), {1}, DType::kFloat32,
+                input_scale_inv.data_ptr(), {1}, DType::kFloat32,
+                output_scale.data_ptr(), {1}, DType::kFloat32,
+                output.data_ptr(), {M, N}, otype,
+                output_amax.data_ptr(), {1}, DType::kFloat32,
+                output_scale_inv.data_ptr(), {1}, DType::kFloat32);
+
+  return output;
+}
+
+
 std::vector<at::Tensor> layernorm_bwd(const at::Tensor &dz,
                                       const at::Tensor &x,
                                       const at::Tensor &mu,
@@ -744,6 +776,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("te_gemm", &te_gemm, "CublasLt GEMM");
   m.def("fp8_transpose", &fp8_transpose, "Transpose with FP8 I/O");
   m.def("fp8_gelu", &fp8_gelu, "GeLU with FP8 output");
+  m.def("fp8_gelu_fp8input", &fp8_gelu_fp8input, "GeLU with FP8 input and output");
 
   // Data structures
   py::class_<transformer_engine::FP8TensorMeta>(m, "FP8TensorMeta")

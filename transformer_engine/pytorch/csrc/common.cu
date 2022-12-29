@@ -247,6 +247,40 @@ void dispatch_gelu(void* input,                                            // i
 }
 
 
+void dispatch_gelu(void* input,                                            // i
+                   const std::vector<size_t>& input_shape,
+                   const transformer_engine::DType input_type,
+                   void* input_scale,                                            // i
+                   const std::vector<size_t>& input_scale_shape,
+                   const transformer_engine::DType input_scale_type,
+                   void* input_amax,                                             // o
+                   const std::vector<size_t>& input_amax_shape,
+                   const transformer_engine::DType input_amax_type,
+                   void* input_scale_inv,                                        // o
+                   const std::vector<size_t>& input_scale_inv_shape,
+                   const transformer_engine::DType input_scale_inv_type,
+                   void* output_scale,                                            // i
+                   const std::vector<size_t>& output_scale_shape,
+                   const transformer_engine::DType output_scale_type,
+                   void* output,                                           // o
+                   const std::vector<size_t>& output_shape,
+                   const transformer_engine::DType output_type,
+                   void* output_amax,                                             // o
+                   const std::vector<size_t>& output_amax_shape,
+                   const transformer_engine::DType output_amax_type,
+                   void* output_scale_inv,                                        // o
+                   const std::vector<size_t>& output_scale_inv_shape,
+                   const transformer_engine::DType output_scale_inv_type
+) {
+    auto input_cu =     makeTransformerEngineTensor(input, input_shape, input_type,
+		                                    input_amax, input_scale, input_scale_inv);
+    auto output_cu =    makeTransformerEngineTensor(output, output_shape, output_type,
+                                                    output_amax, output_scale, output_scale_inv);
+
+    nvte_gelu_fp8input(input_cu.data(), output_cu.data(), at::cuda::getCurrentCUDAStream());
+}
+
+
 void dispatch_transpose(void* input,                                            // i
                         const std::vector<size_t>& input_shape,
                         const transformer_engine::DType input_type,

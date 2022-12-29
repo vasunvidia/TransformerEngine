@@ -89,6 +89,17 @@ at::Tensor fp8_gelu(at::Tensor input,
 );
 
 
+at::Tensor fp8_gelu_fp8input(at::Tensor input,
+                    at::Tensor input_scale,
+                    at::Tensor input_amax,
+                    at::Tensor input_scale_inv,
+                    at::Tensor output_scale,
+                    at::Tensor output_amax,
+                    at::Tensor output_scale_inv,
+                    transformer_engine::DType otype
+);
+
+
 std::vector<at::Tensor> layernorm_bwd(const at::Tensor &dz,
                                       const at::Tensor &x,
                                       const at::Tensor &mu,

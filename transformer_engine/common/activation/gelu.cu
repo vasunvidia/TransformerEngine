@@ -17,9 +17,15 @@ namespace transformer_engine {
 
 namespace detail {
 
-struct GELUParam {};
+struct GELUParam {
+  const fp32 *scale_inv;
+};
 
 __device__ inline fp32 gelu(fp32 value, const GELUParam &) {
+  return value * (0.5F + 0.5F * tanhf(value * (0.79788456F + 0.03567741F * value * value)));
+}
+__device__ inline fp32 gelu_dequantize(fp32 value, const GELUParam &p) {
+  value = value * (*(p.scale_inv));
   return value * (0.5F + 0.5F * tanhf(value * (0.79788456F + 0.03567741F * value * value)));
 }
 
@@ -38,6 +44,8 @@ void gelu_cast(const Tensor &input,
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(input.data.dtype, IType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(output->data.dtype, OType,
       constexpr int nvec = 32 / sizeof(IType);
+      detail::GELUParam p;
+      p.scale_inv = reinterpret_cast<fp32*>(input.scale_inv.dptr);
       VectorizedUnaryKernelLauncher<nvec, detail::GELUParam, detail::gelu>(
         reinterpret_cast<const IType*>(input.data.dptr),
         reinterpret_cast<OType*>(output->data.dptr),
@@ -45,7 +53,35 @@ void gelu_cast(const Tensor &input,
         reinterpret_cast<fp32*>(output->scale_inv.dptr),
         reinterpret_cast<fp32*>(output->amax.dptr),
         tot_elts,
-        {},
+	p,
+        stream);
+    );  // NOLINT(*)
+  );  // NOLINT(*)
+}
+
+void gelu_cast_fp8input(const Tensor &input,
+               Tensor *output,
+               cudaStream_t stream) {
+  CheckInputTensor(input, "gelu_input");
+  CheckOutputTensor(*output, "gelu_output");
+  NVTE_CHECK(input.data.shape.size() == 2, "Input must have 2 dimensions.");
+  NVTE_CHECK(output->data.shape.size() == 2, "Output must have 2 dimensions.");
+  NVTE_CHECK(input.data.shape == output->data.shape, "Input and output shapes must match.");
+  const size_t tot_elts = input.data.shape[1] * input.data.shape[0];
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(input.data.dtype, IType,
+    TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(output->data.dtype, OType,
+      constexpr int nvec = 32 / sizeof(IType);
+      detail::GELUParam p;
+      p.scale_inv = reinterpret_cast<fp32*>(input.scale_inv.dptr);
+      VectorizedUnaryKernelLauncher<nvec, detail::GELUParam, detail::gelu_dequantize>(
+        reinterpret_cast<const IType*>(input.data.dptr),
+        reinterpret_cast<OType*>(output->data.dptr),
+        reinterpret_cast<const fp32*>(output->scale.dptr),
+        reinterpret_cast<fp32*>(output->scale_inv.dptr),
+        reinterpret_cast<fp32*>(output->amax.dptr),
+        tot_elts,
+	p,
         stream);
     );  // NOLINT(*)
   );  // NOLINT(*)
@@ -58,6 +94,14 @@ void nvte_gelu(const NVTETensor input,
                cudaStream_t stream) {
   using namespace transformer_engine;
   gelu_cast(*reinterpret_cast<const Tensor*>(input),
+            reinterpret_cast<Tensor*>(output),
+            stream);
+}
+void nvte_gelu_fp8input(const NVTETensor input,
+               NVTETensor output,
+               cudaStream_t stream) {
+  using namespace transformer_engine;
+  gelu_cast_fp8input(*reinterpret_cast<const Tensor*>(input),
             reinterpret_cast<Tensor*>(output),
             stream);
 }
