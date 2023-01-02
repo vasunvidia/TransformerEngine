@@ -1008,6 +1008,7 @@ void cast_transpose_dbias_dgelu(const Tensor &input,
       constexpr int otype_size = sizeof(OutputType);
       constexpr int nvec_in = desired_load_size_dgelu / itype_size;
       constexpr int nvec_out = desired_store_size_dgelu / otype_size;
+      std::cout << "nvec_in " << nvec_in << " nvec_out " << nvec_out << "\n";
 
       if (workspace->data.dptr == nullptr) {
         populate_cast_transpose_dbias_workspace_config(*cast_output, workspace, nvec_out);

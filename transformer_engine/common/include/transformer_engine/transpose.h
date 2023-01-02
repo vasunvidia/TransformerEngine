@@ -121,6 +121,35 @@ void nvte_cast_transpose_dbias_dgelu(const NVTETensor input,
                                      NVTETensor workspace,
                                      cudaStream_t stream);
 
+/*! \brief Compute backward of GELU operation on the input, then transpose. Additionally,
+ *         reduce the result of the GELU backward along the first dimension.
+ *
+ * This function produces 3 results:
+ *  - `dgelu_output` is equal to `dGELU(input)`
+ *  - `transposed_output` is equal to `transpose(dGELU(input))`
+ *  - `dbias` is equal to `reduce(dGELU(input), axis=0)`
+ *
+ *  Calling this function with workspace being an empty tensor will not perform the operation,
+ *  but instead set the shape and type of the workspace tensor to the required values.
+ *
+ *  \param[in]     input               Input tensor of shape [N, H].
+ *  \param[in]     gelu_input          Tensor used as input to the forward of GELU operation.
+ *                                     Shape [N, H].
+ *  \param[in,out] dgelu_output        Result of the dGELU. Shape: [N, H].
+ *  \param[in,out] transposed_output   Result of the transpose. Shape: [H, N].
+ *  \param[out]    dbias               Result of the reduction of the dGELU(input) along the
+ *                                     first dimension. Shape: [H].
+ *  \param[out]    workspace           Workspace tensor.
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_transpose_dbias_dgelu(const NVTETensor input,
+                                const NVTETensor gelu_input,
+                                NVTETensor dgelu_output,
+                                NVTETensor transposed_output,
+                                NVTETensor dbias,
+                                NVTETensor workspace,
+                                cudaStream_t stream);
+
 /*! \brief Cast and transpose multiple tensors.
  *
  * This function casts each input tensor and produces 2 results:
