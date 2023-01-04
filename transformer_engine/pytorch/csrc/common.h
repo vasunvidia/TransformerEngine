@@ -349,15 +349,15 @@ void dispatch_bgrad_dgelu_transpose_fusion(
         void* input,                                            // i
         const std::vector<size_t>& input_shape,
         const transformer_engine::DType input_type,
-        void* gelu_input,                                       // i
-        const std::vector<size_t>& gelu_input_shape,
-        const transformer_engine::DType gelu_input_type,
-        void* gelu_output,                                       // i
-        const std::vector<size_t>& gelu_output_shape,
-        const transformer_engine::DType gelu_output_type,
-        void* gelu_output_scale_inv,                                            // i
-        const std::vector<size_t>& gelu_output_scale_inv_shape,
-        const transformer_engine::DType gelu_output_scale_inv_type,
+//        void* input_scale_inv,                                            // i
+//        const std::vector<size_t>& input_scale_inv_shape,
+//        const transformer_engine::DType input_scale_inv_type,
+        void* dgelu_input,                                       // i
+        const std::vector<size_t>& dgelu_input_shape,
+        const transformer_engine::DType dgelu_input_type,
+        void* dgelu_input_scale_inv,                                            // i
+        const std::vector<size_t>& dgelu_input_scale_inv_shape,
+        const transformer_engine::DType dgelu_input_scale_inv_type,
         void* scale,                                            // i
         const std::vector<size_t>& scale_shape,
         const transformer_engine::DType scale_type,

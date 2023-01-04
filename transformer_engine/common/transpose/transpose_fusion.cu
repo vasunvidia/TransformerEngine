@@ -46,8 +46,11 @@ inline __device__ void dgelu_regs(const IVec (&in)[nvec_out],
 }
 
 template <bool full_tile, int nvec_in, int nvec_out,
-          typename IVec, typename OVec, typename CVec, typename CType>
+          typename IVec, /*typename IVec2,*/ typename OVec, typename CVec, typename CType>
 inline __device__ void dgelu_and_transpose_regs_partial_dbias(const IVec (&in)[nvec_out],
+                                                             //const CType in_scale_inv,
+                                                             //const IVec2 (&dgelu_in)[nvec_out], 
+                                                             //const CType dgelu_in_scale_inv,
                                                              OVec (&out_trans)[nvec_in],
                                                              CVec &out_dbias,  // NOLINT(*)
                                                              typename OVec::type *output_cast_tile,
@@ -67,7 +70,7 @@ inline __device__ void dgelu_and_transpose_regs_partial_dbias(const IVec (&in)[n
     OVecC out_cast;
 #pragma unroll
     for (unsigned int j = 0; j < nvec_in; ++j) {
-      const CType tmp = in[i].data.elt[j];
+      const CType tmp = in[i].data.elt[j];//CType(in[i].data.elt[j]) * in_scale_inv * CType(dgelu_in[i].data.elt[j]) * dgelu_in_scale_inv;
       const T elt_o = T(scale * tmp);
 
       /* dbias: thread tile local accumulation */
@@ -151,17 +154,16 @@ struct TDBiasParam {
     CType *workspace;
 };
 
-template <typename IType, typename IType2, typename IType3, typename OType, typename CType>
+template <typename IType, typename IType2, typename OType, typename CType>
 struct TDBiasDGeluParam {
     using InputType = IType;
     using InputType2 = IType2;
-    using InputType3 = IType3;
     using OutputType = OType;
     using ComputeType = CType;
     const IType *input;
-    const IType2 *gelu_input;
-    const IType3 *gelu_output;
-    const CType *gelu_output_scale_inv;
+//    const CType *input_scale_inv;
+    const IType2 *dgelu_input;
+    const CType *dgelu_input_scale_inv;
     OType *output_c;
     OType *output_t;
     const CType *scale_ptr;
@@ -663,12 +665,10 @@ transpose_dbias_dgelu_kernel(const Param param,
                                   const size_t num_tiles) {
   using IType = typename Param::InputType;
   using IType2 = typename Param::InputType2;
-  using IType3 = typename Param::InputType3;
   using OType = typename Param::OutputType;
   using CType = typename Param::ComputeType;
   using IVec = Vec<IType, nvec_in>;
   using IVec2 = Vec<IType2, nvec_in>;
-  using IVec3 = Vec<IType3, nvec_in>;
   using OVec = Vec<OType, nvec_out>;
   using CVec = Vec<CType, nvec_in>;
 
@@ -687,11 +687,7 @@ transpose_dbias_dgelu_kernel(const Param param,
   const IType * const my_input_tile = param.input + (tile_id_x * nvec_in +
                                                      tile_id_y * row_length * nvec_out) *
     THREADS_PER_WARP;
-  const IType2 * const my_gelu_input_tile = param.gelu_input +
-                                            (tile_id_x * nvec_in +
-                                             tile_id_y * row_length * nvec_out) *
-                                            THREADS_PER_WARP;
-  const IType3 * const my_gelu_output_tile = param.gelu_output +
+  const IType2 * const my_dgelu_input_tile = param.dgelu_input +
                                             (tile_id_x * nvec_in +
                                              tile_id_y * row_length * nvec_out) *
                                             THREADS_PER_WARP;
@@ -712,8 +708,7 @@ transpose_dbias_dgelu_kernel(const Param param,
   CVec * const my_dbias_scratch = reinterpret_cast<CVec *>(scratch);
 
   IVec in[2][nvec_out];
-  IVec2 gelu_in[2][nvec_out];
-  IVec3 gelu_out[2][nvec_out];
+  IVec2 dgelu_in[2][nvec_out];
   const unsigned int warp_id_in_tile = warp_id % n_warps_per_tile;
   constexpr unsigned int n_iterations = THREADS_PER_WARP / n_warps_per_tile;
   OVec out_space[n_iterations][nvec_in];
@@ -727,15 +722,15 @@ transpose_dbias_dgelu_kernel(const Param param,
                           THREADS_PER_WARP;
   CType max = 0;
   const CType scale = param.scale_ptr != nullptr ? *param.scale_ptr : 1;
-  const CType gelu_output_scale_inv = param.gelu_output_scale_inv != nullptr ? *param.gelu_output_scale_inv : 1;
+//  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
+  const CType dgelu_input_scale_inv = param.dgelu_input_scale_inv != nullptr ? *param.dgelu_input_scale_inv : 1;
 
   partial_dbias.clear();
 
 #pragma unroll
   for (unsigned int i = 0; i < nvec_out; ++i) {
     in[0][i].load_from(my_input_tile, current_stride + my_place + stride * i);
-    gelu_in[0][i].load_from(my_gelu_input_tile, current_stride + my_place + stride * i);
-    gelu_out[0][i].load_from(my_gelu_output_tile, current_stride + my_place + stride * i);
+    dgelu_in[0][i].load_from(my_dgelu_input_tile, current_stride + my_place + stride * i);
   }
 #pragma unroll
   for (unsigned int i = 0; i < n_iterations; ++i) {
@@ -747,10 +742,7 @@ transpose_dbias_dgelu_kernel(const Param param,
       for (unsigned int j = 0; j < nvec_out; ++j) {
         in[current_in][j].load_from(my_input_tile,
                                     current_stride + my_place_in + stride * (nvec_out + j));
-        gelu_in[current_in][j].load_from(my_gelu_input_tile,
-                                         current_stride + my_place_in +
-                                         stride * (nvec_out + j));
-        gelu_out[current_in][j].load_from(my_gelu_output_tile,
+        dgelu_in[current_in][j].load_from(my_dgelu_input_tile,
                                          current_stride + my_place_in +
                                          stride * (nvec_out + j));
       }
@@ -760,11 +752,12 @@ transpose_dbias_dgelu_kernel(const Param param,
     for (unsigned int j = 0; j < nvec_out; ++j) {
 #pragma unroll
       for (unsigned int k = 0; k < nvec_in; ++k) {
-        after_dgelu[j].data.elt[k] = dgelu<CType>(gelu_in[current_in ^ 1][j].data.elt[k], gelu_out[current_in ^ 1][j].data.elt[k], gelu_output_scale_inv) *
-                                     CType(in[current_in ^ 1][j].data.elt[k]);
+        after_dgelu[j].data.elt[k] = CType(dgelu_in[current_in ^ 1][j].data.elt[k]) * dgelu_input_scale_inv *
+                                     CType(in[current_in ^ 1][j].data.elt[k])/* * input_scale_inv*/;
       }
     }
     OVec out_trans[nvec_in];  // NOLINT(*)
+//    dgelu_and_transpose_regs_partial_dbias<true>(in[current_in ^ 1], input_scale_inv, dgelu_in[current_in ^ 1], dgelu_input_scale_inv, out_trans,
     dgelu_and_transpose_regs_partial_dbias<true>(after_dgelu, out_trans,
                                                 partial_dbias, my_output_c_tile,
                                                 current_place, stride, max, scale,
@@ -836,12 +829,10 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
                                              const size_t num_tiles) {
   using IType = typename Param::InputType;
   using IType2 = typename Param::InputType2;
-  using IType3 = typename Param::InputType3;
   using OType = typename Param::OutputType;
   using CType = typename Param::ComputeType;
   using IVec = Vec<IType, nvec_in>;
   using IVec2 = Vec<IType2, nvec_in>;
-  using IVec3 = Vec<IType3, nvec_in>;
   using OVec = Vec<OType, nvec_out>;
   using CVec = Vec<CType, nvec_in>;
 
@@ -860,11 +851,7 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
   const IType * const my_input_tile = param.input + (tile_id_x * nvec_in +
                                                      tile_id_y * row_length * nvec_out) *
                                                     THREADS_PER_WARP;
-  const IType2 * const my_gelu_input_tile = param.gelu_input +
-                                            (tile_id_x * nvec_in +
-                                             tile_id_y * row_length * nvec_out) *
-                                            THREADS_PER_WARP;
-  const IType3 * const my_gelu_output_tile = param.gelu_output +
+  const IType2 * const my_dgelu_input_tile = param.dgelu_input +
                                             (tile_id_x * nvec_in +
                                              tile_id_y * row_length * nvec_out) *
                                             THREADS_PER_WARP;
@@ -894,8 +881,7 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
   CVec * const my_dbias_scratch = reinterpret_cast<CVec *>(scratch);
 
   IVec in[2][nvec_out];
-  IVec2 gelu_in[2][nvec_out];
-  IVec3 gelu_out[2][nvec_out];
+  IVec2 dgelu_in[2][nvec_out];
   const unsigned int warp_id_in_tile = warp_id % n_warps_per_tile;
   constexpr unsigned int n_iterations = THREADS_PER_WARP / n_warps_per_tile;
   OVec out_space[n_iterations][nvec_in];
@@ -907,7 +893,8 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
                           THREADS_PER_WARP;
   CType max = 0;
   const CType scale = param.scale_ptr != nullptr ? *param.scale_ptr : 1;
-  const CType gelu_output_scale_inv = param.gelu_output_scale_inv != nullptr ? *param.gelu_output_scale_inv : 1;
+//  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
+  const CType dgelu_input_scale_inv = param.dgelu_input_scale_inv != nullptr ? *param.dgelu_input_scale_inv : 1;
 
   partial_dbias.clear();
 
@@ -918,12 +905,10 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
     for (unsigned int i = 0; i < nvec_out; ++i) {
       if (valid_load) {
         in[0][i].load_from(my_input_tile, current_stride + my_place + stride * i);
-        gelu_in[0][i].load_from(my_gelu_input_tile, current_stride + my_place + stride * i);
-        gelu_out[0][i].load_from(my_gelu_output_tile, current_stride + my_place + stride * i);
+        dgelu_in[0][i].load_from(my_dgelu_input_tile, current_stride + my_place + stride * i);
       } else {
         in[0][i].clear();
-        gelu_in[0][i].clear();
-        gelu_out[0][i].clear();
+        dgelu_in[0][i].clear();
       }
     }
   }
@@ -940,16 +925,12 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
         if (valid_load) {
           in[current_in][j].load_from(my_input_tile,
                                       current_stride + my_place_in + stride * (nvec_out + j));
-          gelu_in[current_in][j].load_from(my_gelu_input_tile,
-                                           current_stride + my_place_in +
-                                           stride * (nvec_out + j));
-          gelu_out[current_in][j].load_from(my_gelu_output_tile,
+          dgelu_in[current_in][j].load_from(my_dgelu_input_tile,
                                            current_stride + my_place_in +
                                            stride * (nvec_out + j));
         } else {
           in[current_in][j].clear();
-          gelu_in[current_in][j].clear();
-          gelu_out[current_in][j].clear();
+          dgelu_in[current_in][j].clear();
         }
       }
     }
@@ -958,13 +939,14 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
     for (unsigned int j = 0; j < nvec_out; ++j) {
 #pragma unroll
       for (unsigned int k = 0; k < nvec_in; ++k) {
-        after_dgelu[j].data.elt[k] = dgelu<CType>(gelu_in[current_in ^ 1][j].data.elt[k], gelu_out[current_in ^ 1][j].data.elt[k], gelu_output_scale_inv) *
-                                     CType(in[current_in ^ 1][j].data.elt[k]);
+        after_dgelu[j].data.elt[k] = CType(dgelu_in[current_in ^ 1][j].data.elt[k]) * dgelu_input_scale_inv *
+                                     CType(in[current_in ^ 1][j].data.elt[k])/* * input_scale_inv*/;
       }
     }
     OVec out_trans[nvec_in];  // NOLINT(*)
     const bool valid_store = my_place < tile_length &&
                              warp_id_in_tile * n_iterations + i < tile_height;
+//    dgelu_and_transpose_regs_partial_dbias<false>(in[current_in ^ 1], input_scale_inv, dgelu_in[current_in ^ 1], dgelu_input_scale_inv, out_trans,
     dgelu_and_transpose_regs_partial_dbias<false>(after_dgelu, out_trans,
                                                 partial_dbias, my_output_c_tile,
                                                 current_place, stride, max, scale,
@@ -1033,16 +1015,14 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
 }
 
 void transpose_dbias_dgelu(const Tensor &input,
-                                const Tensor &gelu_input,
-                                const Tensor &gelu_output,
+                                const Tensor &dgelu_input,
                                 Tensor *cast_output,
                                 Tensor *transposed_output,
                                 Tensor *dbias,
                                 Tensor *workspace,
                                 cudaStream_t stream) {
-  CheckInputTensor(input, "cast_transpose_dbias_dgelu_input");
-  CheckInputTensor(gelu_input, "gelu_input");
-  CheckInputTensor(gelu_output, "gelu_output");
+  CheckInputTensor(input, "transpose_dbias_dgelu_input");
+  CheckInputTensor(dgelu_input, "dgelu_input");
   CheckOutputTensor(*cast_output, "cast_output");
   CheckOutputTensor(*transposed_output, "transposed_output");
   CheckOutputTensor(*dbias, "dbias");
@@ -1068,17 +1048,14 @@ void transpose_dbias_dgelu(const Tensor &input,
   NVTE_CHECK(cast_output->scale_inv.dptr == transposed_output->scale_inv.dptr,
              "C and T outputs need to share scale inverse tensor.");
 
-  NVTE_CHECK(dbias->data.dtype == input.data.dtype, "DBias must have the same type as input.");
+  //NVTE_CHECK(dbias->data.dtype == input.data.dtype, "DBias must have the same type as input.");
   NVTE_CHECK(dbias->data.shape == std::vector<size_t>{ row_length }, "Wrong shape of DBias.");
 
-//  NVTE_CHECK(input.data.dtype == gelu_input.data.dtype, "Types of both inputs must match.");
-  NVTE_CHECK(input.data.shape == gelu_input.data.shape, "Shapes of inputs must match.");
-  NVTE_CHECK(input.data.shape == gelu_output.data.shape, "Shapes of inputs must match.");
+  NVTE_CHECK(input.data.shape == dgelu_input.data.shape, "Shapes of inputs must match.");
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(input.data.dtype, InputType,
-    TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(gelu_output.data.dtype, InputType3,
+    TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(dgelu_input.data.dtype, InputType2,
       TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(cast_output->data.dtype, OutputType,
-        using InputType2 = InputType;
         /* dgelu fusion kernel uses more registers */
         constexpr int desired_load_size_dgelu = 4;
         constexpr int desired_store_size_dgelu = 4;
@@ -1109,12 +1086,12 @@ void transpose_dbias_dgelu(const Tensor &input,
         constexpr size_t shared_size_dbias = cast_transpose_num_threads *
         sizeof(Vec<ComputeType, nvec_in>);
         static_assert(shared_size_transpose >= shared_size_dbias);
-        using Param = TDBiasDGeluParam<InputType, InputType2, InputType3, OutputType, ComputeType>;
+        using Param = TDBiasDGeluParam<InputType, InputType2, OutputType, ComputeType>;
         Param param;
         param.input = reinterpret_cast<const InputType *>(input.data.dptr);
-        param.gelu_input = reinterpret_cast<const InputType2 *>(gelu_input.data.dptr);
-        param.gelu_output = reinterpret_cast<const InputType3 *>(gelu_output.data.dptr);
-        param.gelu_output_scale_inv = reinterpret_cast<const ComputeType *>(gelu_output.scale_inv.dptr);
+        //param.input_scale_inv = reinterpret_cast<const ComputeType *>(input.scale_inv.dptr);
+        param.dgelu_input = reinterpret_cast<const InputType2 *>(dgelu_input.data.dptr);
+        param.dgelu_input_scale_inv = reinterpret_cast<const ComputeType *>(dgelu_input.scale_inv.dptr);
         param.output_c = reinterpret_cast<OutputType *>(cast_output->data.dptr);
         param.output_t = reinterpret_cast<OutputType *>(transposed_output->data.dptr);
         param.scale_ptr = reinterpret_cast<const ComputeType *>(cast_output->scale.dptr);
@@ -1529,8 +1506,7 @@ void nvte_fp8_transpose_dbias(const NVTETensor input,
 }
 
 void nvte_transpose_dbias_dgelu(const NVTETensor input,
-                                const NVTETensor gelu_input,
-                                const NVTETensor gelu_output,
+                                const NVTETensor dgelu_input,
                                 NVTETensor dgelu_output,
                                 NVTETensor transposed_output,
                                 NVTETensor dbias,
@@ -1538,8 +1514,7 @@ void nvte_transpose_dbias_dgelu(const NVTETensor input,
                                 cudaStream_t stream) {
   using namespace transformer_engine;
   transpose_dbias_dgelu(*reinterpret_cast<const Tensor*>(input),
-                             *reinterpret_cast<const Tensor*>(gelu_input),
-                             *reinterpret_cast<const Tensor*>(gelu_output),
+                             *reinterpret_cast<const Tensor*>(dgelu_input),
                              reinterpret_cast<Tensor*>(dgelu_output),
                              reinterpret_cast<Tensor*>(transposed_output),
                              reinterpret_cast<Tensor*>(dbias),

@@ -236,14 +236,16 @@ at::Tensor dgelu(at::Tensor grad_output,
 }
 
 std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
-                                                    at::Tensor gelu_input,
-                                                    at::Tensor gelu_output,
-                                                    transformer_engine::DType gelu_output_type,
-                                                    at::Tensor gelu_output_scale_inv,
+//                                                    transformer_engine::DType grad_output_type,
+//                                                    at::Tensor grad_output_scale_inv,
+                                                    at::Tensor dgelu_input,
+                                                    transformer_engine::DType dgelu_input_type,
+                                                    at::Tensor dgelu_input_scale_inv,
                                                     at::Tensor scale,
                                                     at::Tensor amax,
                                                     at::Tensor scale_inv,
-                                                    transformer_engine::DType otype
+                                                    transformer_engine::DType otype,
+                                                    transformer_engine::DType bias_type
 ) {
   using namespace transformer_engine;
 
@@ -251,7 +253,7 @@ std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
   size_t N = static_cast<size_t>(grad_output.size(1));
 
   DType grad_output_type = GetTransformerEngineDType(grad_output.scalar_type());
-  auto grad_bias = allocateTorchTensor(grad_output.size(-1), grad_output_type);
+  auto grad_bias = allocateTorchTensor(grad_output.size(-1), bias_type);
   auto dgelu =
             allocateTorchTensor(grad_output.size(0),
                                 grad_output.size(1),
@@ -263,14 +265,14 @@ std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
 
   dispatch_bgrad_dgelu_transpose_fusion(
           grad_output.data_ptr(), {M, N}, grad_output_type,
-          gelu_input.data_ptr(), {M, N}, grad_output_type,
-          gelu_output.data_ptr(), {M, N}, gelu_output_type,
-          gelu_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
+//          grad_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
+          dgelu_input.data_ptr(), {M, N}, dgelu_input_type,
+          dgelu_input_scale_inv.data_ptr(), {1}, DType::kFloat32,
           scale.data_ptr(), {1}, DType::kFloat32,
           dgelu.data_ptr(), {M, N}, otype,
           dgelu_transpose.data_ptr(), {N, M}, otype,
           amax.data_ptr(), {1}, DType::kFloat32,
-          grad_bias.data_ptr(), {N}, grad_output_type,
+          grad_bias.data_ptr(), {N}, bias_type,
           scale_inv.data_ptr(), {1}, DType::kFloat32);
 
   return {grad_bias, dgelu, dgelu_transpose};
