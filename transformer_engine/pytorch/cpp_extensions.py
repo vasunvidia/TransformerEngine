@@ -244,7 +244,8 @@ def fp8_cast_transpose_bgrad_dgelu_fused(
 def fp8_transpose_bgrad_dgelu_fused(
     grad_output: torch.Tensor,
     gelu_input: torch.Tensor,
-    gelu_input_type: tex.DType,
+    gelu_output: torch.Tensor,
+    gelu_output_type: tex.DType,
     gelu_output_scale_inv: torch.Tensor, #ToDo: How to pass this in a cleaner way?
     fp8_meta_tensor: tex.FP8TensorMeta,
     fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
@@ -255,7 +256,8 @@ def fp8_transpose_bgrad_dgelu_fused(
     return tex.fused_transpose_bgrad_dgelu(
         grad_output,
         gelu_input,
-        gelu_input_type,
+        gelu_output,
+        gelu_output_type,
         gelu_output_scale_inv,
         fp8_meta_tensor.scale[fp8_tensor],
         fp8_meta_tensor.amax_history[0][fp8_tensor],
@@ -263,6 +265,29 @@ def fp8_transpose_bgrad_dgelu_fused(
         otype,
     )
 
+def fp8_dgelu(
+    grad_output: torch.Tensor,
+    gelu_input: torch.Tensor,
+#    gelu_output: torch.Tensor,
+#    gelu_output_type: tex.DType,
+#    gelu_output_scale_inv: torch.Tensor, #ToDo: How to pass this in a cleaner way?
+    fp8_meta_tensor: tex.FP8TensorMeta,
+    fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
+    otype: tex.DType,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast + Transpose + BGRAD + DGELU with FP8 output"""
+#    print ('fp8_transpose_bgrad_dgelu_fused gelu_input_type {} otype {}'.format(gelu_input_type, otype))
+    return tex.dgelu(
+        grad_output,
+        gelu_input,
+#        gelu_output,
+#        gelu_output_type,
+#        gelu_output_scale_inv,
+        fp8_meta_tensor.scale[fp8_tensor],
+        fp8_meta_tensor.amax_history[0][fp8_tensor],
+        fp8_meta_tensor.scale_inv[fp8_tensor],
+        otype,
+    )
 
 def fp8_gelu(
     inp: torch.Tensor,

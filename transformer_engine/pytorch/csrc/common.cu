@@ -452,9 +452,12 @@ void dispatch_bgrad_dgelu_transpose_fusion(
     void* gelu_input,                                       // i
     const std::vector<size_t>& gelu_input_shape,
     const transformer_engine::DType gelu_input_type,
-    void* gelu_input_scale_inv,                                        // o
-    const std::vector<size_t>& gelu_input_scale_inv_shape,
-    const transformer_engine::DType gelu_input_scale_inv_type,
+    void* gelu_output,                                       // i
+    const std::vector<size_t>& gelu_output_shape,
+    const transformer_engine::DType gelu_output_type,
+    void* gelu_output_scale_inv,                                        // o
+    const std::vector<size_t>& gelu_output_scale_inv_shape,
+    const transformer_engine::DType gelu_output_scale_inv_type,
     void* scale,                                            // i
     const std::vector<size_t>& scale_shape,
     const transformer_engine::DType scale_type,
@@ -476,9 +479,11 @@ void dispatch_bgrad_dgelu_transpose_fusion(
 ) {
   transformer_engine::TensorWrapper workspace;
   auto gelu_input_cu        = makeTransformerEngineTensor(gelu_input, gelu_input_shape,
-                                                          gelu_input_type, nullptr, nullptr, gelu_input_scale_inv);
+                                                          gelu_input_type);
+  auto gelu_output_cu       = makeTransformerEngineTensor(gelu_output, gelu_output_shape,
+                                                          gelu_output_type, nullptr, nullptr, gelu_output_scale_inv);
   auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type);
-  auto dgelu_output_cu       = makeTransformerEngineTensor(dgelu_output, dgelu_output_shape,
+  auto dgelu_output_cu      = makeTransformerEngineTensor(dgelu_output, dgelu_output_shape,
                                                           dgelu_output_type, amax, scale,
                                                           scale_inv);
   auto transposed_output_cu = makeTransformerEngineTensor(transposed_output,
@@ -487,7 +492,7 @@ void dispatch_bgrad_dgelu_transpose_fusion(
                                                           amax, scale, scale_inv);
   auto dbias_cu             = makeTransformerEngineTensor(dbias, dbias_shape, dbias_type);
 
-  nvte_transpose_dbias_dgelu(input_cu.data(), gelu_input_cu.data(),
+  nvte_transpose_dbias_dgelu(input_cu.data(), gelu_input_cu.data(), gelu_output_cu.data(),
                              dgelu_output_cu.data(), transposed_output_cu.data(),
                              dbias_cu.data(), workspace.data(),
                              at::cuda::getCurrentCUDAStream());
@@ -498,10 +503,51 @@ void dispatch_bgrad_dgelu_transpose_fusion(
                                           workspace.shape(),
                                           workspace.dtype());
 
-  nvte_transpose_dbias_dgelu(input_cu.data(), gelu_input_cu.data(),
+  nvte_transpose_dbias_dgelu(input_cu.data(), gelu_input_cu.data(), gelu_output_cu.data(),
                              dgelu_output_cu.data(), transposed_output_cu.data(),
                              dbias_cu.data(), workspace.data(),
                              at::cuda::getCurrentCUDAStream());
+}
+
+
+void dispatch_dgelu(
+    void* input,                                            // i
+    const std::vector<size_t>& input_shape,
+    const transformer_engine::DType input_type,
+    void* gelu_input,                                       // i
+    const std::vector<size_t>& gelu_input_shape,
+    const transformer_engine::DType gelu_input_type,
+/*    void* gelu_output,                                       // i
+    const std::vector<size_t>& gelu_output_shape,
+    const transformer_engine::DType gelu_output_type,
+    void* gelu_output_scale_inv,                                        // o
+    const std::vector<size_t>& gelu_output_scale_inv_shape,
+    const transformer_engine::DType gelu_output_scale_inv_type,*/
+    void* scale,                                            // i
+    const std::vector<size_t>& scale_shape,
+    const transformer_engine::DType scale_type,
+    void* dgelu_output,                                      // o
+    const std::vector<size_t>& dgelu_output_shape,
+    const transformer_engine::DType dgelu_output_type,
+    void* amax,                                             // o
+    const std::vector<size_t>& amax_shape,
+    const transformer_engine::DType amax_type,
+    void* scale_inv,                                        // o
+    const std::vector<size_t>& scale_inv_shape,
+    const transformer_engine::DType scale_inv_type
+) {
+  auto gelu_input_cu        = makeTransformerEngineTensor(gelu_input, gelu_input_shape,
+                                                          gelu_input_type);
+//  auto gelu_output_cu       = makeTransformerEngineTensor(gelu_output, gelu_output_shape,
+//                                                          gelu_output_type, nullptr, nullptr, gelu_output_scale_inv);
+  auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type);
+  auto dgelu_output_cu      = makeTransformerEngineTensor(dgelu_output, dgelu_output_shape,
+                                                          dgelu_output_type, amax, scale,
+                                                          scale_inv);
+
+  nvte_dgelu(input_cu.data(), gelu_input_cu.data(), /*gelu_output_cu.data(),*/
+             dgelu_output_cu.data(),
+             at::cuda::getCurrentCUDAStream());
 }
 
 

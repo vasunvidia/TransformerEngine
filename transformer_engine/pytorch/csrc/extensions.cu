@@ -201,10 +201,45 @@ std::vector<at::Tensor> fused_cast_transpose_bgrad_dgelu(at::Tensor grad_output,
 }
 
 
+at::Tensor dgelu(at::Tensor grad_output,
+                 at::Tensor gelu_input,
+                 //at::Tensor gelu_output,
+                 //transformer_engine::DType gelu_output_type,
+                 //at::Tensor gelu_output_scale_inv,
+                 at::Tensor scale,
+                 at::Tensor amax,
+                 at::Tensor scale_inv,
+                 transformer_engine::DType otype
+) {
+  using namespace transformer_engine;
+
+  size_t M = static_cast<size_t>(grad_output.size(0));
+  size_t N = static_cast<size_t>(grad_output.size(1));
+
+  DType grad_output_type = GetTransformerEngineDType(grad_output.scalar_type());
+  auto dgelu =
+            allocateTorchTensor(grad_output.size(0),
+                                grad_output.size(1),
+                                DType::kByte);
+
+  dispatch_dgelu(
+          grad_output.data_ptr(), {M, N}, grad_output_type,
+          gelu_input.data_ptr(), {M, N}, grad_output_type,
+//          gelu_output.data_ptr(), {M, N}, gelu_output_type,
+//          gelu_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
+          scale.data_ptr(), {1}, DType::kFloat32,
+          dgelu.data_ptr(), {M, N}, otype,
+          amax.data_ptr(), {1}, DType::kFloat32,
+          scale_inv.data_ptr(), {1}, DType::kFloat32);
+
+  return dgelu;
+}
+
 std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
                                                     at::Tensor gelu_input,
-                                                    transformer_engine::DType gelu_input_type,
-                                                    at::Tensor gelu_input_scale_inv,
+                                                    at::Tensor gelu_output,
+                                                    transformer_engine::DType gelu_output_type,
+                                                    at::Tensor gelu_output_scale_inv,
                                                     at::Tensor scale,
                                                     at::Tensor amax,
                                                     at::Tensor scale_inv,
@@ -228,8 +263,9 @@ std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
 
   dispatch_bgrad_dgelu_transpose_fusion(
           grad_output.data_ptr(), {M, N}, grad_output_type,
-          gelu_input.data_ptr(), {M, N}, /*grad_output_type,*/gelu_input_type,
-          gelu_input_scale_inv.data_ptr(), {1}, DType::kFloat32,
+          gelu_input.data_ptr(), {M, N}, grad_output_type,
+          gelu_output.data_ptr(), {M, N}, gelu_output_type,
+          gelu_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
           scale.data_ptr(), {1}, DType::kFloat32,
           dgelu.data_ptr(), {M, N}, otype,
           dgelu_transpose.data_ptr(), {N, M}, otype,
@@ -811,6 +847,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                               "Fused Cast + Transpose + BGRAD + DGELU");
   m.def("fused_transpose_bgrad_dgelu", &fused_transpose_bgrad_dgelu,
                                               "Fused Transpose + BGRAD + DGELU");
+  m.def("dgelu", &dgelu,
+                                              "DGELU with FP8 output");
   m.def("fused_multi_cast_transpose", &fused_multi_cast_transpose,
                                               "Fused Multi-tensor Cast + Transpose");
   m.def("cast_to_fp8", &cast_to_fp8, "Cast to FP8");

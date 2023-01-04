@@ -66,10 +66,22 @@ std::vector<at::Tensor> fused_cast_transpose_bgrad_dgelu(at::Tensor grad_output,
 );
 
 
+at::Tensor dgelu(at::Tensor grad_output,
+                 at::Tensor gelu_input,
+//                 at::Tensor gelu_output,
+//                 transformer_engine::DType gelu_output_type,
+//                 at::Tensor gelu_output_scale_inv,
+                 at::Tensor scale,
+                 at::Tensor amax,
+                 at::Tensor scale_inv,
+                 transformer_engine::DType otype
+);
+
 std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
                                                     at::Tensor gelu_input,
-                                                    transformer_engine::DType gelu_input_type,
-                                                    at::Tensor gelu_input_scale_inv,
+                                                    at::Tensor gelu_output,
+                                                    transformer_engine::DType gelu_output_type,
+                                                    at::Tensor gelu_output_scale_inv,
                                                     at::Tensor scale,
                                                     at::Tensor amax,
                                                     at::Tensor scale_inv,

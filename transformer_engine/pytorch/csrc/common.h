@@ -340,9 +340,12 @@ void dispatch_bgrad_dgelu_transpose_fusion(
         void* gelu_input,                                       // i
         const std::vector<size_t>& gelu_input_shape,
         const transformer_engine::DType gelu_input_type,
-        void* gelu_input_scale_inv,                                            // i
-        const std::vector<size_t>& gelu_input_scale_inv_shape,
-        const transformer_engine::DType gelu_input_scale_inv_type,
+        void* gelu_output,                                       // i
+        const std::vector<size_t>& gelu_output_shape,
+        const transformer_engine::DType gelu_output_type,
+        void* gelu_output_scale_inv,                                            // i
+        const std::vector<size_t>& gelu_output_scale_inv_shape,
+        const transformer_engine::DType gelu_output_scale_inv_type,
         void* scale,                                            // i
         const std::vector<size_t>& scale_shape,
         const transformer_engine::DType scale_type,
@@ -358,6 +361,34 @@ void dispatch_bgrad_dgelu_transpose_fusion(
         void* dbias,                                            // o
         const std::vector<size_t>& dbias_shape,
         const transformer_engine::DType dbias_type,
+        void* scale_inv,                                        // o
+        const std::vector<size_t>& scale_inv_shape,
+        const transformer_engine::DType scale_inv_type
+);
+
+
+void dispatch_dgelu(
+        void* input,                                            // i
+        const std::vector<size_t>& input_shape,
+        const transformer_engine::DType input_type,
+        void* gelu_input,                                       // i
+        const std::vector<size_t>& gelu_input_shape,
+        const transformer_engine::DType gelu_input_type,
+//        void* gelu_output,                                       // i
+//        const std::vector<size_t>& gelu_output_shape,
+//        const transformer_engine::DType gelu_output_type,
+//        void* gelu_output_scale_inv,                                            // i
+//        const std::vector<size_t>& gelu_output_scale_inv_shape,
+//        const transformer_engine::DType gelu_output_scale_inv_type,
+        void* scale,                                            // i
+        const std::vector<size_t>& scale_shape,
+        const transformer_engine::DType scale_type,
+        void* dgelu_output,                                      // o
+        const std::vector<size_t>& dgelu_output_shape,
+        const transformer_engine::DType dgelu_output_type,
+        void* amax,                                             // o
+        const std::vector<size_t>& amax_shape,
+        const transformer_engine::DType amax_type,
         void* scale_inv,                                        // o
         const std::vector<size_t>& scale_inv_shape,
         const transformer_engine::DType scale_inv_type
