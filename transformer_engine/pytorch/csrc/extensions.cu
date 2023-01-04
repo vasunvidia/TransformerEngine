@@ -433,7 +433,7 @@ at::Tensor fp8_gelu_fp8input(at::Tensor input,
                                 input.size(1),
                                 DType::kByte);
 
-  dispatch_gelu(input.data_ptr(), {M, N}, otype,
+  dispatch_gelu_fp8input(input.data_ptr(), {M, N}, otype,
                 input_scale.data_ptr(), {1}, DType::kFloat32,
                 input_amax.data_ptr(), {1}, DType::kFloat32,
                 input_scale_inv.data_ptr(), {1}, DType::kFloat32,

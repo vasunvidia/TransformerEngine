@@ -248,7 +248,7 @@ void dispatch_gelu(void* input,                                            // i
 }
 
 
-void dispatch_gelu(void* input,                                            // i
+void dispatch_gelu_fp8input(void* input,                                            // i
                    const std::vector<size_t>& input_shape,
                    const transformer_engine::DType input_type,
                    void* input_scale,                                            // i
