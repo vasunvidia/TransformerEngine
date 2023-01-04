@@ -414,13 +414,16 @@ at::Tensor fp8_gelu(at::Tensor input,
 }
 
 
-at::Tensor fp8_gelu_fp8input(at::Tensor input,
+std::vector<at::Tensor> fp8_gelu_fp8input(at::Tensor input,
                     at::Tensor input_scale,
                     at::Tensor input_amax,
                     at::Tensor input_scale_inv,
                     at::Tensor output_scale,
                     at::Tensor output_amax,
                     at::Tensor output_scale_inv,
+                    at::Tensor dgelu_output_scale,
+                    at::Tensor dgelu_output_amax,
+                    at::Tensor dgelu_output_scale_inv,
                     transformer_engine::DType otype
 ) {
   using namespace transformer_engine;
@@ -432,17 +435,25 @@ at::Tensor fp8_gelu_fp8input(at::Tensor input,
             allocateTorchTensor(input.size(0),
                                 input.size(1),
                                 DType::kByte);
+  auto dgelu_output =
+            allocateTorchTensor(input.size(0),
+                                input.size(1),
+                                DType::kByte);
 
   dispatch_gelu_fp8input(input.data_ptr(), {M, N}, otype,
                 input_scale.data_ptr(), {1}, DType::kFloat32,
                 input_amax.data_ptr(), {1}, DType::kFloat32,
                 input_scale_inv.data_ptr(), {1}, DType::kFloat32,
                 output_scale.data_ptr(), {1}, DType::kFloat32,
+                dgelu_output_scale.data_ptr(), {1}, DType::kFloat32,
                 output.data_ptr(), {M, N}, otype,
                 output_amax.data_ptr(), {1}, DType::kFloat32,
-                output_scale_inv.data_ptr(), {1}, DType::kFloat32);
+                output_scale_inv.data_ptr(), {1}, DType::kFloat32,
+                dgelu_output.data_ptr(), {M, N}, otype,
+                dgelu_output_amax.data_ptr(), {1}, DType::kFloat32,
+                dgelu_output_scale_inv.data_ptr(), {1}, DType::kFloat32);
 
-  return output;
+  return {output, dgelu_output};
 }
 
 

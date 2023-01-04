@@ -29,12 +29,14 @@ void nvte_gelu(const NVTETensor input,
 
 /*! \brief Compute GELU activation of the input.
  *
- *  \param[in]     input     FP8 Input tensor for GELU activation.
- *  \param[in,out] output    Output tensor.
- *  \param[in]     stream    CUDA stream used for the operation.
+ *  \param[in]     input           FP8 Input tensor for GELU activation.
+ *  \param[in,out] output          GELU Output tensor.
+ *  \param[in,out] dgelu_output    GELU DGRAD Output tensor.
+ *  \param[in]     stream          CUDA stream used for the operation.
  */
 void nvte_gelu_fp8input(const NVTETensor input,
                NVTETensor output,
+               NVTETensor dgelu_output,
                cudaStream_t stream);
 
 #ifdef __cplusplus

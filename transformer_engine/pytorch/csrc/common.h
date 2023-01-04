@@ -241,6 +241,9 @@ void dispatch_gelu_fp8input(void* input,                                        
                    void* output_scale,                                            // i
                    const std::vector<size_t>& output_scale_shape,
                    const transformer_engine::DType output_scale_type,
+                   void* dgelu_output_scale,                                            // i
+                   const std::vector<size_t>& dgelu_output_scale_shape,
+                   const transformer_engine::DType dgelu_output_scale_type,
                    void* output,                                           // o
                    const std::vector<size_t>& output_shape,
                    const transformer_engine::DType output_type,
@@ -249,7 +252,16 @@ void dispatch_gelu_fp8input(void* input,                                        
                    const transformer_engine::DType output_amax_type,
                    void* output_scale_inv,                                        // o
                    const std::vector<size_t>& output_scale_inv_shape,
-                   const transformer_engine::DType output_scale_inv_type
+                   const transformer_engine::DType output_scale_inv_type,
+                   void* dgelu_output,                                           // o
+                   const std::vector<size_t>& dgelu_output_shape,
+                   const transformer_engine::DType dgelu_output_type,
+                   void* dgelu_output_amax,                                             // o
+                   const std::vector<size_t>& dgelu_output_amax_shape,
+                   const transformer_engine::DType dgelu_output_amax_type,
+                   void* dgelu_output_scale_inv,                                        // o
+                   const std::vector<size_t>& dgelu_output_scale_inv_shape,
+                   const transformer_engine::DType dgelu_output_scale_inv_type
 );
 
 
