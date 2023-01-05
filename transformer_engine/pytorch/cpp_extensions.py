@@ -243,8 +243,8 @@ def fp8_cast_transpose_bgrad_dgelu_fused(
 
 def fp8_transpose_bgrad_dgelu_fused(
     grad_output: torch.Tensor,
-    #grad_output_type: tex.DType,
-    #grad_output_scale_inv: torch.Tensor, #ToDo: How to pass this in a cleaner way?
+    grad_output_type: tex.DType,
+    grad_output_scale_inv: torch.Tensor, #ToDo: How to pass this in a cleaner way?
     dgelu_input: torch.Tensor,
     dgelu_input_type: tex.DType,
     dgelu_input_scale_inv: torch.Tensor, #ToDo: How to pass this in a cleaner way?
@@ -257,8 +257,8 @@ def fp8_transpose_bgrad_dgelu_fused(
 #    print ('fp8_transpose_bgrad_dgelu_fused gelu_input_type {} otype {}'.format(gelu_input_type, otype))
     return tex.fused_transpose_bgrad_dgelu(
         grad_output,
-        #grad_output_type,
-        #grad_output_scale_inv,
+        grad_output_type,
+        grad_output_scale_inv,
         dgelu_input,
         dgelu_input_type,
         dgelu_input_scale_inv,

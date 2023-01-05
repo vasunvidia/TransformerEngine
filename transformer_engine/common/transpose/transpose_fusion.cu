@@ -161,7 +161,7 @@ struct TDBiasDGeluParam {
     using OutputType = OType;
     using ComputeType = CType;
     const IType *input;
-//    const CType *input_scale_inv;
+    const CType *input_scale_inv;
     const IType2 *dgelu_input;
     const CType *dgelu_input_scale_inv;
     OType *output_c;
@@ -722,7 +722,7 @@ transpose_dbias_dgelu_kernel(const Param param,
                           THREADS_PER_WARP;
   CType max = 0;
   const CType scale = param.scale_ptr != nullptr ? *param.scale_ptr : 1;
-//  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
+  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
   const CType dgelu_input_scale_inv = param.dgelu_input_scale_inv != nullptr ? *param.dgelu_input_scale_inv : 1;
 
   partial_dbias.clear();
@@ -753,7 +753,7 @@ transpose_dbias_dgelu_kernel(const Param param,
 #pragma unroll
       for (unsigned int k = 0; k < nvec_in; ++k) {
         after_dgelu[j].data.elt[k] = CType(dgelu_in[current_in ^ 1][j].data.elt[k]) * dgelu_input_scale_inv *
-                                     CType(in[current_in ^ 1][j].data.elt[k])/* * input_scale_inv*/;
+                                     CType(in[current_in ^ 1][j].data.elt[k]) * input_scale_inv;
       }
     }
     OVec out_trans[nvec_in];  // NOLINT(*)
@@ -893,7 +893,7 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
                           THREADS_PER_WARP;
   CType max = 0;
   const CType scale = param.scale_ptr != nullptr ? *param.scale_ptr : 1;
-//  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
+  const CType input_scale_inv = param.input_scale_inv != nullptr ? *param.input_scale_inv : 1;
   const CType dgelu_input_scale_inv = param.dgelu_input_scale_inv != nullptr ? *param.dgelu_input_scale_inv : 1;
 
   partial_dbias.clear();
@@ -940,7 +940,7 @@ transpose_dbias_dgelu_kernel_notaligned(const Param param,
 #pragma unroll
       for (unsigned int k = 0; k < nvec_in; ++k) {
         after_dgelu[j].data.elt[k] = CType(dgelu_in[current_in ^ 1][j].data.elt[k]) * dgelu_input_scale_inv *
-                                     CType(in[current_in ^ 1][j].data.elt[k])/* * input_scale_inv*/;
+                                     CType(in[current_in ^ 1][j].data.elt[k]) * input_scale_inv;
       }
     }
     OVec out_trans[nvec_in];  // NOLINT(*)
@@ -1053,72 +1053,74 @@ void transpose_dbias_dgelu(const Tensor &input,
 
   NVTE_CHECK(input.data.shape == dgelu_input.data.shape, "Shapes of inputs must match.");
 
-  TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(input.data.dtype, InputType,
+  TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(input.data.dtype, InputType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(dgelu_input.data.dtype, InputType2,
-      TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(cast_output->data.dtype, OutputType,
-        /* dgelu fusion kernel uses more registers */
-        constexpr int desired_load_size_dgelu = 4;
-        constexpr int desired_store_size_dgelu = 4;
-        constexpr int itype_size = sizeof(InputType);
-        constexpr int otype_size = sizeof(OutputType);
-        constexpr int nvec_in = desired_load_size_dgelu / itype_size;
-        constexpr int nvec_out = desired_store_size_dgelu / otype_size;
+      TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(dbias->data.dtype, BiasType,
+        TRANSFORMER_ENGINE_TYPE_SWITCH_OUTPUT(cast_output->data.dtype, OutputType,
+          /* dgelu fusion kernel uses more registers */
+          constexpr int desired_load_size_dgelu = 4;
+          constexpr int desired_store_size_dgelu = 4;
+          constexpr int itype_size = sizeof(InputType);
+          constexpr int otype_size = sizeof(OutputType);
+          constexpr int nvec_in = desired_load_size_dgelu / itype_size;
+          constexpr int nvec_out = desired_store_size_dgelu / otype_size;
 
-        if (workspace->data.dptr == nullptr) {
-          populate_transpose_dbias_workspace_config(input, workspace, nvec_out);
-          return;
-        }
+          if (workspace->data.dptr == nullptr) {
+            populate_transpose_dbias_workspace_config(input, workspace, nvec_out);
+            return;
+          }
 
-        NVTE_CHECK(row_length % nvec_in  == 0, "Unsupported shape.");
-        NVTE_CHECK(num_rows   % nvec_out == 0, "Unsupported shape.");
-        const size_t n_tiles = DIVUP(row_length, static_cast<size_t>(nvec_in * THREADS_PER_WARP)) *
-                               DIVUP(num_rows, static_cast<size_t>(nvec_out * THREADS_PER_WARP));
-        const size_t n_warps_per_block = cast_transpose_num_threads / THREADS_PER_WARP;
-        const size_t n_blocks = DIVUP(n_tiles * n_warps_per_tile, n_warps_per_block);
+          NVTE_CHECK(row_length % nvec_in  == 0, "Unsupported shape.");
+          NVTE_CHECK(num_rows   % nvec_out == 0, "Unsupported shape.");
+          const size_t n_tiles = DIVUP(row_length, static_cast<size_t>(nvec_in * THREADS_PER_WARP)) *
+                                 DIVUP(num_rows, static_cast<size_t>(nvec_out * THREADS_PER_WARP));
+          const size_t n_warps_per_block = cast_transpose_num_threads / THREADS_PER_WARP;
+          const size_t n_blocks = DIVUP(n_tiles * n_warps_per_tile, n_warps_per_block);
 
-        const bool full_tile = row_length % (nvec_in * THREADS_PER_WARP) == 0 &&
-                               num_rows % (nvec_out * THREADS_PER_WARP) == 0;
+          const bool full_tile = row_length % (nvec_in * THREADS_PER_WARP) == 0 &&
+                                 num_rows % (nvec_out * THREADS_PER_WARP) == 0;
 
-        using ComputeType = fp32;
-        constexpr size_t shared_size_transpose = cast_transpose_num_threads / n_warps_per_tile *
-        (THREADS_PER_WARP + 1) *
-        sizeof(Vec<OutputType, nvec_out>);
-        constexpr size_t shared_size_dbias = cast_transpose_num_threads *
-        sizeof(Vec<ComputeType, nvec_in>);
-        static_assert(shared_size_transpose >= shared_size_dbias);
-        using Param = TDBiasDGeluParam<InputType, InputType2, OutputType, ComputeType>;
-        Param param;
-        param.input = reinterpret_cast<const InputType *>(input.data.dptr);
-        //param.input_scale_inv = reinterpret_cast<const ComputeType *>(input.scale_inv.dptr);
-        param.dgelu_input = reinterpret_cast<const InputType2 *>(dgelu_input.data.dptr);
-        param.dgelu_input_scale_inv = reinterpret_cast<const ComputeType *>(dgelu_input.scale_inv.dptr);
-        param.output_c = reinterpret_cast<OutputType *>(cast_output->data.dptr);
-        param.output_t = reinterpret_cast<OutputType *>(transposed_output->data.dptr);
-        param.scale_ptr = reinterpret_cast<const ComputeType *>(cast_output->scale.dptr);
-        param.amax = reinterpret_cast<ComputeType *>(cast_output->amax.dptr);
-        param.scale_inv = reinterpret_cast<ComputeType *>(cast_output->scale_inv.dptr);
-        param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
-        if (full_tile) {
-          cudaFuncSetAttribute(transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>,
-                               cudaFuncAttributePreferredSharedMemoryCarveout,
-                               100);
-          transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>
-            <<<n_blocks,
-            cast_transpose_num_threads,
-            shared_size_transpose,
-            stream>>>(param, row_length, num_rows, n_tiles);
-        } else {
-          cudaFuncSetAttribute(transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>,
-                               cudaFuncAttributePreferredSharedMemoryCarveout,
-                               100);
-          transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>
-            <<<n_blocks,
-            cast_transpose_num_threads,
-            shared_size_transpose,
-            stream>>>(param, row_length, num_rows, n_tiles);
-        }
+          using ComputeType = fp32;
+          constexpr size_t shared_size_transpose = cast_transpose_num_threads / n_warps_per_tile *
+          (THREADS_PER_WARP + 1) *
+          sizeof(Vec<OutputType, nvec_out>);
+          constexpr size_t shared_size_dbias = cast_transpose_num_threads *
+          sizeof(Vec<ComputeType, nvec_in>);
+          static_assert(shared_size_transpose >= shared_size_dbias);
+          using Param = TDBiasDGeluParam<InputType, InputType2, OutputType, ComputeType>;
+          Param param;
+          param.input = reinterpret_cast<const InputType *>(input.data.dptr);
+          param.input_scale_inv = reinterpret_cast<const ComputeType *>(input.scale_inv.dptr);
+          param.dgelu_input = reinterpret_cast<const InputType2 *>(dgelu_input.data.dptr);
+          param.dgelu_input_scale_inv = reinterpret_cast<const ComputeType *>(dgelu_input.scale_inv.dptr);
+          param.output_c = reinterpret_cast<OutputType *>(cast_output->data.dptr);
+          param.output_t = reinterpret_cast<OutputType *>(transposed_output->data.dptr);
+          param.scale_ptr = reinterpret_cast<const ComputeType *>(cast_output->scale.dptr);
+          param.amax = reinterpret_cast<ComputeType *>(cast_output->amax.dptr);
+          param.scale_inv = reinterpret_cast<ComputeType *>(cast_output->scale_inv.dptr);
+          param.workspace = reinterpret_cast<ComputeType *>(workspace->data.dptr);
+          if (full_tile) {
+            cudaFuncSetAttribute(transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 100);
+            transpose_dbias_dgelu_kernel<nvec_in, nvec_out, Param>
+              <<<n_blocks,
+              cast_transpose_num_threads,
+              shared_size_transpose,
+              stream>>>(param, row_length, num_rows, n_tiles);
+          } else {
+            cudaFuncSetAttribute(transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 100);
+            transpose_dbias_dgelu_kernel_notaligned<nvec_in, nvec_out, Param>
+              <<<n_blocks,
+              cast_transpose_num_threads,
+              shared_size_transpose,
+              stream>>>(param, row_length, num_rows, n_tiles);
+          }
 
-        reduce_dbias<InputType>(*workspace, dbias, row_length, num_rows, nvec_out, stream);
+          reduce_dbias<BiasType>(*workspace, dbias, row_length, num_rows, nvec_out, stream);
+        ); // NOLINT(*)
       ); // NOLINT(*)
     ); // NOLINT(*)
   );  // NOLINT(*)

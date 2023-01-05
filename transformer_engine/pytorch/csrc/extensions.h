@@ -78,8 +78,8 @@ at::Tensor dgelu(at::Tensor grad_output,
 );
 
 std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
-//                                                    transformer_engine::DType grad_output_type,
-//                                                    at::Tensor grad_output_scale_inv,
+                                                    transformer_engine::DType grad_output_type,
+                                                    at::Tensor grad_output_scale_inv,
                                                     at::Tensor dgelu_input,
                                                     transformer_engine::DType dgelu_input_type,
                                                     at::Tensor dgelu_input_scale_inv,

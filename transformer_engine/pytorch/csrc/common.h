@@ -349,9 +349,9 @@ void dispatch_bgrad_dgelu_transpose_fusion(
         void* input,                                            // i
         const std::vector<size_t>& input_shape,
         const transformer_engine::DType input_type,
-//        void* input_scale_inv,                                            // i
-//        const std::vector<size_t>& input_scale_inv_shape,
-//        const transformer_engine::DType input_scale_inv_type,
+        void* input_scale_inv,                                            // i
+        const std::vector<size_t>& input_scale_inv_shape,
+        const transformer_engine::DType input_scale_inv_type,
         void* dgelu_input,                                       // i
         const std::vector<size_t>& dgelu_input_shape,
         const transformer_engine::DType dgelu_input_type,

@@ -236,8 +236,8 @@ at::Tensor dgelu(at::Tensor grad_output,
 }
 
 std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
-//                                                    transformer_engine::DType grad_output_type,
-//                                                    at::Tensor grad_output_scale_inv,
+                                                    transformer_engine::DType grad_output_type,
+                                                    at::Tensor grad_output_scale_inv,
                                                     at::Tensor dgelu_input,
                                                     transformer_engine::DType dgelu_input_type,
                                                     at::Tensor dgelu_input_scale_inv,
@@ -252,7 +252,7 @@ std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
   size_t M = static_cast<size_t>(grad_output.size(0));
   size_t N = static_cast<size_t>(grad_output.size(1));
 
-  DType grad_output_type = GetTransformerEngineDType(grad_output.scalar_type());
+//  DType grad_output_type = GetTransformerEngineDType(grad_output.scalar_type());
   auto grad_bias = allocateTorchTensor(grad_output.size(-1), bias_type);
   auto dgelu =
             allocateTorchTensor(grad_output.size(0),
@@ -265,7 +265,7 @@ std::vector<at::Tensor> fused_transpose_bgrad_dgelu(at::Tensor grad_output,
 
   dispatch_bgrad_dgelu_transpose_fusion(
           grad_output.data_ptr(), {M, N}, grad_output_type,
-//          grad_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
+          grad_output_scale_inv.data_ptr(), {1}, DType::kFloat32,
           dgelu_input.data_ptr(), {M, N}, dgelu_input_type,
           dgelu_input_scale_inv.data_ptr(), {1}, DType::kFloat32,
           scale.data_ptr(), {1}, DType::kFloat32,

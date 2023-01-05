@@ -463,9 +463,9 @@ void dispatch_bgrad_dgelu_transpose_fusion(
     void* input,                                            // i
     const std::vector<size_t>& input_shape,
     const transformer_engine::DType input_type,
-//    void* input_scale_inv,                                            // i
-//    const std::vector<size_t>& input_scale_inv_shape,
-//    const transformer_engine::DType input_scale_inv_type,
+    void* input_scale_inv,                                            // i
+    const std::vector<size_t>& input_scale_inv_shape,
+    const transformer_engine::DType input_scale_inv_type,
     void* dgelu_input,                                       // i
     const std::vector<size_t>& dgelu_input_shape,
     const transformer_engine::DType dgelu_input_type,
@@ -494,7 +494,7 @@ void dispatch_bgrad_dgelu_transpose_fusion(
   transformer_engine::TensorWrapper workspace;
   auto dgelu_input_cu        = makeTransformerEngineTensor(dgelu_input, dgelu_input_shape,
                                                           dgelu_input_type, nullptr, nullptr, dgelu_input_scale_inv);
-  auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type/*, nullptr, nullptr, input_scale_inv*/);
+  auto input_cu             = makeTransformerEngineTensor(input, input_shape, input_type, nullptr, nullptr, input_scale_inv);
   auto dgelu_output_cu      = makeTransformerEngineTensor(dgelu_output, dgelu_output_shape,
                                                           dgelu_output_type, amax, scale,
                                                           scale_inv);
