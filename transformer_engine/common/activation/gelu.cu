@@ -106,24 +106,23 @@ __global__ void fp8_gelu_kernel(const InputType *input,
     for (int i = 0; i < nvec; ++i) {
       const ComputeType val = static_cast<ComputeType>(loader.separate()[i]) * (*(p.scale_inv));
       // ComputeType temp = OP(val, p);
-      ComputeType t0 = 0.79788456F + 0.03567741F * val * val;
-      ComputeType tanh = tanhf(val * t0);
-      ComputeType temp = val * (0.5F + 0.5F * tanh);
+      ComputeType t0 = 0.03567741F * val * val;
+      ComputeType tanh = tanhf(val * (0.79788456F + t0));
+      ComputeType t1 = 0.5F * (1.F + tanh);
+      ComputeType temp = val * t1;
+
+      ComputeType t2 = 0.79788456F + 3.F * t0;
+      ComputeType temp1 = temp * (1.F - tanh) * t2 + t1;
+
       __builtin_assume(max >= 0);
       max = fmaxf(fabsf(temp), max);
-
       temp = temp * s;
-
       storer.separate()[i] = static_cast<OutputType>(temp);
 
-      t0 += 2.f * 0.03567741F * val * val;
-      temp = 0.5F * val * ((1.F - tanh * tanh) * t0) + 0.5F * (1.F + tanh);
       __builtin_assume(d_max >= 0);
-      d_max = fmaxf(fabsf(temp), d_max);
-
-      temp = temp * d_s;
-
-      storer2.separate()[i] = static_cast<OutputType>(temp);
+      d_max = fmaxf(fabsf(temp1), d_max);
+      temp1 = temp1 * d_s;
+      storer2.separate()[i] = static_cast<OutputType>(temp1);
     }
     storer.store(tid, N);
     storer2.store(tid, N);
