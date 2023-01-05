@@ -65,14 +65,14 @@ template <int nvec, bool aligned,
           typename ComputeType,
           typename Param,
           typename InputType,
-          typename OutputType>
+          typename OutputType, typename OutputType2>
 __launch_bounds__(gelu_kernel_threads)
 __global__ void fp8_gelu_kernel(const InputType *input,
                              OutputType *output,
                              const ComputeType *scale,
                              ComputeType *scale_inv,
                              ComputeType *amax,
-                             OutputType *dgelu_output,
+                             OutputType2 *dgelu_output,
                              const ComputeType *dgelu_scale,
                              ComputeType *dgelu_scale_inv,
                              ComputeType *dgelu_amax,
@@ -81,7 +81,7 @@ __global__ void fp8_gelu_kernel(const InputType *input,
                              const size_t num_aligned_elements) {
   VectorizedLoader<InputType, nvec, aligned> loader(input, N);
   VectorizedStorer<OutputType, nvec, aligned> storer(output, N);
-  VectorizedStorer<OutputType, nvec, aligned> storer2(dgelu_output, N);
+  VectorizedStorer<OutputType2, nvec, aligned> storer2(dgelu_output, N);
   ComputeType max = 0;
   ComputeType s = 0;
   ComputeType d_max = 0;
@@ -122,7 +122,7 @@ __global__ void fp8_gelu_kernel(const InputType *input,
       __builtin_assume(d_max >= 0);
       d_max = fmaxf(fabsf(temp1), d_max);
       temp1 = temp1 * d_s;
-      storer2.separate()[i] = static_cast<OutputType>(temp1);
+      storer2.separate()[i] = static_cast<OutputType2>(temp1);
     }
     storer.store(tid, N);
     storer2.store(tid, N);
@@ -140,13 +140,13 @@ __global__ void fp8_gelu_kernel(const InputType *input,
 
 template <int nvec, typename Param,
           typename InputType,
-          typename OutputType>
+          typename OutputType, typename OutputType2>
 void fp8_gelu_fp8input(const InputType *input,
                        OutputType *output,
                        const fp32 *scale,
                        fp32 *scale_inv,
                        fp32 *amax,
-                       OutputType *dgelu_output,
+                       OutputType2 *dgelu_output,
                        const fp32 *dgelu_scale,
                        fp32 *dgelu_scale_inv,
                        fp32 *dgelu_amax,
@@ -197,22 +197,24 @@ void gelu_cast_fp8input(const Tensor &input,
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(input.data.dtype, IType,
     TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(output->data.dtype, OType,
-      constexpr int nvec = 32 / sizeof(IType);
-      detail::GELUParam p;
-      p.scale_inv = reinterpret_cast<fp32*>(input.scale_inv.dptr);
-      fp8_gelu_fp8input<nvec, detail::GELUParam>(
-        reinterpret_cast<const IType*>(input.data.dptr),
-        reinterpret_cast<OType*>(output->data.dptr),
-        reinterpret_cast<const fp32*>(output->scale.dptr),
-        reinterpret_cast<fp32*>(output->scale_inv.dptr),
-        reinterpret_cast<fp32*>(output->amax.dptr),
-        reinterpret_cast<OType*>(dgelu_output->data.dptr),
-        reinterpret_cast<const fp32*>(dgelu_output->scale.dptr),
-        reinterpret_cast<fp32*>(dgelu_output->scale_inv.dptr),
-        reinterpret_cast<fp32*>(dgelu_output->amax.dptr),
-        tot_elts,
-        p,
-        stream);
+      TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(dgelu_output->data.dtype, OType2,
+        constexpr int nvec = 32 / sizeof(IType);
+        detail::GELUParam p;
+        p.scale_inv = reinterpret_cast<fp32*>(input.scale_inv.dptr);
+        fp8_gelu_fp8input<nvec, detail::GELUParam>(
+          reinterpret_cast<const IType*>(input.data.dptr),
+          reinterpret_cast<OType*>(output->data.dptr),
+          reinterpret_cast<const fp32*>(output->scale.dptr),
+          reinterpret_cast<fp32*>(output->scale_inv.dptr),
+          reinterpret_cast<fp32*>(output->amax.dptr),
+          reinterpret_cast<OType2*>(dgelu_output->data.dptr),
+          reinterpret_cast<const fp32*>(dgelu_output->scale.dptr),
+          reinterpret_cast<fp32*>(dgelu_output->scale_inv.dptr),
+          reinterpret_cast<fp32*>(dgelu_output->amax.dptr),
+          tot_elts,
+          p,
+          stream);
+      );  // NOLINT(*)
     );  // NOLINT(*)
   );  // NOLINT(*)
 }

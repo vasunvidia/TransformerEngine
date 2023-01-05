@@ -299,7 +299,9 @@ def fp8_gelu(
     fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
     otype: tex.DType,
     fp8_input_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors] = None,
+    fp8_bwd_meta_tensor: tex.FP8TensorMeta = None,
     dgelu_output_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors] = None,
+    dgelu_output_type: tex.DType = None,
 ) -> torch.Tensor:
     """GeLU with FP8 output"""
     if fp8_input_tensor is not None:
@@ -312,10 +314,11 @@ def fp8_gelu(
             fp8_meta_tensor.scale[fp8_tensor],
             fp8_meta_tensor.amax_history[0][fp8_tensor],
             fp8_meta_tensor.scale_inv[fp8_tensor],
-            fp8_meta_tensor.scale[dgelu_output_tensor],
-            fp8_meta_tensor.amax_history[0][dgelu_output_tensor],
-            fp8_meta_tensor.scale_inv[dgelu_output_tensor],
             otype,
+            fp8_bwd_meta_tensor.scale[dgelu_output_tensor],
+            fp8_bwd_meta_tensor.amax_history[0][dgelu_output_tensor],
+            fp8_bwd_meta_tensor.scale_inv[dgelu_output_tensor],
+            dgelu_output_type,
         )
     assert dgelu_output_tensor is None
     return tex.fp8_gelu(

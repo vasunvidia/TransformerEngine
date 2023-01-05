@@ -121,10 +121,11 @@ std::vector<at::Tensor> fp8_gelu_fp8input(at::Tensor input,
                     at::Tensor output_scale,
                     at::Tensor output_amax,
                     at::Tensor output_scale_inv,
+                    transformer_engine::DType otype,
                     at::Tensor dgelu_output_scale,
                     at::Tensor dgelu_output_amax,
                     at::Tensor dgelu_output_scale_inv,
-                    transformer_engine::DType otype
+                    transformer_engine::DType dgelu_otype
 );
 
 
