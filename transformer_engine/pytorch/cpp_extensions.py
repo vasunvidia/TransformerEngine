@@ -20,6 +20,7 @@ def fp8_gemm(
     B_dtype: tex.DType,
     out_dtype: torch.dtype,
     workspace: torch.Tensor,
+    gelu: bool = False,
     accumulate: bool = False,
     out: Optional[torch.Tensor] = None,
     out_index = None,
@@ -45,10 +46,15 @@ def fp8_gemm(
             device="cuda",
         )
         return_output = True
+    # Use bfloat16 as default bias_dtype
+    bias_dtype = torch.bfloat16 if bias is None else bias.dtype
+    if gelu:
+        gelu_input = torch.empty_like(out, dtype=bias_dtype)
+    else:
+        gelu_input = empty_tensor
+    bias_dtype = TE_DType[bias_dtype]
 
     out_dtype = tex.DType.kFloat32 if fp32_output else TE_DType[out_dtype]
-    # Use bfloat16 as default bias_dtype
-    bias_dtype = tex.DType.kBFloat16 if bias is None else TE_DType[bias.dtype]
     out_dtype = D_dtype if D_dtype is not None else out_dtype
 
     _ = torch.ops.tex_ts.te_gemm_ts(
@@ -68,7 +74,7 @@ def fp8_gemm(
         empty_tensor if out_index is None else fp8_meta_tensor.amax_history[0][out_index],
         bias if use_bias else empty_tensor,
         bias_dtype,
-        empty_tensor,  # this is pre_gelu_out
+        gelu_input,  # this is pre_gelu_out
         False,  # grad
         workspace,
         workspace.shape[0],
@@ -77,7 +83,11 @@ def fp8_gemm(
     )
 
     if return_output:
+        if gelu:
+            return out, gelu_input
         return out
+    if gelu:
+        return gelu_input
     return None
 
 
