@@ -49,7 +49,8 @@ void nvte_cublas_gemm(const NVTETensor A,
                       NVTETensor workspace,
                       bool accumulate,
                       bool use_split_accumulator,
-                      cudaStream_t stream
+                      cudaStream_t stream,
+		      const std::string &name
 );
 
 #ifdef __cplusplus

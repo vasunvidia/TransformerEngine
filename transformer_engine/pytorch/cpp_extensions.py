@@ -30,6 +30,7 @@ def fp8_gemm(
     fp32_output: bool = False,
     use_split_accumulator: bool = False,
     D_dtype: tex.DType = None,
+    name: str = None,
 ) -> torch.Tensor:
     """TN layout GEMM with fp8 inputs."""
 
@@ -80,6 +81,7 @@ def fp8_gemm(
         workspace.shape[0],
         accumulate,
         use_split_accumulator,
+        name
     )
 
     if return_output:
@@ -164,7 +166,8 @@ def gemm(
         workspace,
         workspace.shape[0],
         accumulate,
-        False,  # use_split_accumulator
+        False,  # use_split_accumulator,
+        "vasu"
     )
 
     if return_output:

@@ -6,6 +6,7 @@
 
 #include <torch/script.h>
 #include "extensions.h"
+#include <iostream>
 
 namespace {
   transformer_engine::DType reverse_map_dtype(int64_t dtype) {
@@ -83,7 +84,8 @@ at::Tensor te_gemm_ts(at::Tensor A,
                       at::Tensor workspace,
                       int64_t workspaceSize,
                       int64_t accumulate,
-                      int64_t use_split_accumulator) {
+                      int64_t use_split_accumulator,
+		      const std::string &name) {
   // cast inputs to types accepted by te_gemm
   transformer_engine::DType A_type_arg = reverse_map_dtype(A_type);
   bool transa_arg = static_cast<bool>(transa);
@@ -121,7 +123,7 @@ at::Tensor te_gemm_ts(at::Tensor A,
           workspace,
           workspaceSize_arg,
           accumulate_arg,
-          use_split_accumulator_arg);
+          use_split_accumulator_arg, name);
   return D;
 }
 
