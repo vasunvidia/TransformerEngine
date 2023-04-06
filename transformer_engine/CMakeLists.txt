@@ -25,6 +25,7 @@ find_package(CUDAToolkit REQUIRED cublas nvToolsExt)
 find_package(CUDNN REQUIRED cudnn)
 find_package(CUDNN_FRONTEND REQUIRED cudnn_frontend)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
+set(CMAKE_VERBOSE_MAKEFILE TRUE)
 
 include_directories(${PROJECT_SOURCE_DIR})
 
