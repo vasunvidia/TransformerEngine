@@ -7,6 +7,7 @@ find_path(
     PATH_SUFFIXES include
 )
 
+message(STATUS "cuDNN_frontend1: ${CUDNN_FRONTEND_INCLUDE_DIR}")
 include (FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
     LIBRARY REQUIRED_VARS
