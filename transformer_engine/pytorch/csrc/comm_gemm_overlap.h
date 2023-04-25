@@ -134,7 +134,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     assert(pre_gelu_out.numel() == 0);
     te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
             D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
-            accumulate, use_split_accumulator, _math_sms);
+            accumulate, use_split_accumulator, _math_sms, "");
 
     CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
     CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
@@ -199,7 +199,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
       at::cuda::setCurrentCUDAStream(_stream_compute[0]);
       te_gemm(input_a_chunk, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb,
               output_chunk, D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
-              workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator, _math_sms);
+              workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator, _math_sms, "");
 
       for (int i = 1; i < _num_splits; i++) {
         input_a_chunk_ptr += input_a_chunk_size * B.element_size();
@@ -216,7 +216,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
         te_gemm(input_a_chunk, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb,
                 output_chunk, D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
                 workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator,
-                _math_sms);
+                _math_sms, "");
 
         CHECK_CUDA(cudaEventRecord(
             _start_comm, (cudaStream_t)_stream_compute[(i - 1) % _stream_compute.size()]));
@@ -252,7 +252,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
         te_gemm(input_a_chunk, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb,
                 output_chunk, D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
                 workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator,
-                _math_sms);
+                _math_sms, "");
 
         CHECK_CUDA(cudaEventRecord(_start_comm,
                                    (cudaStream_t)_stream_compute[i % _stream_compute.size()]));
@@ -471,7 +471,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder {
         te_gemm(A, A_scale_inverse, A_type, transa, input_b_chunk, B_scale_inverse, B_type, transb,
                 output_chunk, D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
                 workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator,
-                _math_sms);
+                _math_sms, "");
 
         if (i < num_steps - 1) {
           // P2P communication
@@ -519,7 +519,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder {
         te_gemm(A, A_scale_inverse, A_type, transa, _ubufs[send_chunk_id], B_scale_inverse, B_type,
                 transb, output_chunk, D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
                 workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator,
-                _math_sms);
+                _math_sms, "");
 
         if (i < _tp_size - 1) {
           // P2P communication

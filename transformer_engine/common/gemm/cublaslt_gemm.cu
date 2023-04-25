@@ -10,6 +10,8 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include "../common.h"
+#include <iostream>
+#include <string>
 
 namespace {
 
@@ -34,6 +36,85 @@ cudaDataType_t get_cuda_dtype(const transformer_engine::DType t) {
 }  // namespace
 
 namespace transformer_engine {
+/* CAUTION : must match cublasLtMatmulTile_t */
+const char * const matmulTileName[] = {
+    "UNDEF",
+    "8x8",
+    "8x16",
+    "16x8"   ,
+    "8x32"   ,
+    "16x16"  ,
+    "32x8"   ,
+    "8x64"   ,
+    "16x32"  ,
+    "32x16"  ,
+    "64x8"   ,
+    "32x32"  ,
+    "32x64"  ,
+    "64x32"  ,
+    "32x128" ,
+    "64x64"  ,
+    "128x32" ,
+    "64x128" ,
+    "128x64" ,
+    "64x256" ,
+    "128x128",
+    "256x64" ,
+    "64x512" ,
+    "128x256",
+    "256x128",
+    "512x64" ,
+};
+
+const char * const matmulClusterShape[] = {
+    "AUTO", "na", "1x1x1", "2x1x1", "4x1x1",
+    "1x2x1", "2x2x1", "4x2x1", "1x4x1", "2x4x1",
+    "4x4x1", "8x1x1", "1x8x1", "8x2x1", "2x8x1",
+    "16x1x1", "1x16x1", "3x1x1", "5x1x1", "6x1x1",
+    "7x1x1", "9x1x1", "10x1x1", "11x1x1", "12x1x1",
+    "13x1x1", "14x1x1", "15x1x1", "3x2x1", "5x2x1",
+    "6x2x1", "7x2x1", "1x3x1", "2x3x1", "3x3x1",
+    "4x3x1", "5x3x1", "3x4x1", "1x5x1", "2x5x1",
+    "3x5x1", "1x6x1", "2x6x1", "1x7x1", "2x7x1",
+    "1x9x1", "1x10x1", "1x11x1", "1x12x1", "1x13x1",
+    "1x14x1", "1x15x1"
+};
+
+// Utility function to print customMatmulPerf_t structure
+static bool printPerfStructure(const std::string &name, const cublasLtMatmulAlgo_t &algo, bool findLargeTileCga2, int m, int n, int k) {
+    int algoId, tile, swizzle, customOption, numSplitsK, reductionScheme, stages;
+    uint16_t cga;
+
+    const cublasLtMatmulAlgo_t *matmulAlgo = &algo;
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_ID, &algoId, sizeof(algoId), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &numSplitsK, sizeof(numSplitsK), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reductionScheme, sizeof(reductionScheme), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &customOption, sizeof(customOption), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute( matmulAlgo,  CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cga, sizeof(cga), NULL);
+
+    if (findLargeTileCga2) {
+        if (tile>=20 && (cga==3 || cga==5 || (m==1024 && n==1024 && k==1024))) {
+              printf("T %s [%dx%dx%d]: algo={ Id=%d, tileIdx=%d (%s) splitK=%d reduc=%d swizzle=%d custom=%d stages=%d cluster_shape=%u (%s)}\n",
+                name.c_str(), m, n, k, algoId, tile, matmulTileName[tile],
+                numSplitsK, reductionScheme,
+                swizzle, customOption, stages, cga, matmulClusterShape[cga]);
+              return true;
+        }
+              printf(" %s -----x----- [%dx%dx%d]: algo={ Id=%d, tileIdx=%d (%s) splitK=%d reduc=%d swizzle=%d custom=%d stages=%d cluster_shape=%u (%s)}\n",
+                name.c_str(), m, n, k, algoId, tile, matmulTileName[tile],
+                numSplitsK, reductionScheme,
+                swizzle, customOption, stages, cga, matmulClusterShape[cga]);
+        return false;
+    }
+    printf("F %s: [%dx%dx%d]: algo={ Id=%d, tileIdx=%d (%s) splitK=%d reduc=%d swizzle=%d custom=%d stages=%d cluster_shape=%u (%s)}\n",
+        name.c_str(), m, n, k, algoId, tile, matmulTileName[tile],
+        numSplitsK, reductionScheme,
+        swizzle, customOption, stages, cga, matmulClusterShape[cga]);
+    return true;
+}
 
 void cublas_gemm(const Tensor *inputA,
                  const Tensor *inputB,
@@ -50,8 +131,10 @@ void cublas_gemm(const Tensor *inputA,
                  bool accumulate,
                  bool use_split_accumulator,
                  int math_sm_count,
-                 cudaStream_t stream
+                 cudaStream_t stream,
+                 const std::string &name
 ) {
+  int num_heuristics = (math_sm_count > 0) ? 10 : 1;
   void *A = inputA->data.dptr;
   void *A_scale_inverse = inputA->scale_inv.dptr;
   void *B = inputB->data.dptr;
@@ -99,7 +182,7 @@ void cublas_gemm(const Tensor *inputA,
   cublasLtMatrixLayout_t     Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr, Ddesc = nullptr;
   cublasLtMatmulPreference_t preference = nullptr;
   int                             returnedResults = 0;
-  cublasLtMatmulHeuristicResult_t heuristicResult = {};
+  cublasLtMatmulHeuristicResult_t heuristicResult[10];
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
 
   int64_t ld_gelumat = (int64_t) ldd;
@@ -125,13 +208,6 @@ void cublas_gemm(const Tensor *inputA,
                                                    &transa, sizeof(transa)));
   NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                    &transb, sizeof(transb)));
-  // Set math SM count
-  if (math_sm_count != 0) {
-      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
-          operationDesc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
-          &math_sm_count, sizeof(math_sm_count)));
-  }
-
 
   // set fp8 attributes -- input and output types should already be set to fp8 as appropriate
   // Note: gelu fusion isn't available right now, and we don't need
@@ -229,10 +305,26 @@ void cublas_gemm(const Tensor *inputA,
           &workspaceSize, sizeof(workspaceSize)));
 
   NVTE_CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, Adesc, Bdesc, Cdesc,
-                                                   Ddesc, preference, 1, &heuristicResult,
+                                                   Ddesc, preference, num_heuristics, heuristicResult,
                                                    &returnedResults));
+  // Set math SM count
+  if (math_sm_count != 0) {
+      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
+          operationDesc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+          &math_sm_count, sizeof(math_sm_count)));
+  }
+
 
   if (returnedResults == 0) throw std::runtime_error("Unable to find any suitable algorithms");
+  int i=0;
+  for (; i<returnedResults; i++) {
+    if (printPerfStructure(name, heuristicResult[i].algo, true, m, n, k))
+      break;
+  }
+  if (i==returnedResults) {
+    i=0;
+    printPerfStructure(name, heuristicResult[i].algo, false, m, n, k);
+  }  
 
   // D = alpha * (A * B) + beta * C
 
@@ -248,7 +340,7 @@ void cublas_gemm(const Tensor *inputA,
                                    Cdesc,
                                    D,                                      /* D */
                                    Ddesc,
-                                   &heuristicResult.algo,                  /* algo */
+                                   &(heuristicResult[i].algo),                  /* algo */
                                    workspace,                              /* workspace */
                                    workspaceSize,
                                    stream));                               /* stream */
@@ -276,7 +368,8 @@ void nvte_cublas_gemm(const NVTETensor A,
                       bool accumulate,
                       bool use_split_accumulator,
                       int math_sm_count,
-                      cudaStream_t stream) {
+                      cudaStream_t stream,
+                      const std::string &name) {
   NVTE_API_CALL(nvte_cublas_gemm);
   using namespace transformer_engine;
   const Tensor *inputA = reinterpret_cast<const Tensor*>(A);
@@ -319,5 +412,5 @@ void nvte_cublas_gemm(const NVTETensor A,
               wspace->data.shape[0],
               accumulate, use_split_accumulator,
               math_sm_count,
-              stream);
+              stream, name);
 }
