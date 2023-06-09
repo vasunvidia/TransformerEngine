@@ -223,7 +223,7 @@ class _LayerNormMLP(torch.autograd.Function):
                         fp8_dtype_forward,
                     )
 
-            fc1_out = tex.fp8_gemm(
+            gelu_out, fc1_out = fp8_gemm(
                 fc1_weight_fp8,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
@@ -232,21 +232,18 @@ class _LayerNormMLP(torch.autograd.Function):
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_INPUT,
                 fp8_dtype_forward,
-                activation_dtype,
+                torch.uint8,
                 get_workspace(),
+                gelu=True,
+                fp8_meta_tensor=fp8_meta["scaling_fwd"],
+                out_index=tex.FP8FwdTensors.GEMM2_INPUT,
+                D_dtype=fp8_dtype_forward,
                 bias=fc1_bias,
                 use_bias=use_fc1_bias,
                 use_split_accumulator=_2X_ACC_FPROP,
                 ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ub_split_ag else None,
                 ub=ub_obj_lnout if ub_split_ag else None,
                 extra_output_tensor=ln_out if ub_split_ag else None,
-            )
-
-            gelu_out = activation_func(
-                fc1_out,
-                fp8_meta["scaling_fwd"],
-                tex.FP8FwdTensors.GEMM2_INPUT,
-                fp8_dtype_forward,
             )
 
             if ub_split_rs:
