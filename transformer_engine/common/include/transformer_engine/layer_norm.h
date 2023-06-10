@@ -17,6 +17,13 @@
 extern "C" {
 #endif
 
+void nvte_dropout_add(const NVTETensor input,
+		      const NVTETensor residual,
+		      const float p_dropout,
+		      NVTETensor output,
+		      NVTETensor output_mask,
+		      cudaStream_t stream,
+		      const NVTETensor rng_state);
 /*! \brief Compute LayerNorm on the input.
  *
  * The formula used:

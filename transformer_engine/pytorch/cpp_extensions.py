@@ -1047,6 +1047,27 @@ def fp8_cast_transpose_bgrad_dgelu_fused(
     )
 
 
+def fp8_dropout_add(
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    itype: tex.DType,
+    fp8_meta_tensor: tex.FP8TensorMeta,
+    fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
+    p_dropout: float,
+    rng_gen: torch.Generator = None
+) -> torch.Tensor:
+    """GeLU with FP8 output"""
+    out = tex.fp8_dropout_add(
+        inp,
+        residual,
+        itype,
+        fp8_meta_tensor.scale_inv[fp8_tensor],
+        p_dropout,
+        rng_gen
+    )
+    return out
+
+
 def fp8_gelu(
     inp: torch.Tensor,
     fp8_meta_tensor: tex.FP8TensorMeta,

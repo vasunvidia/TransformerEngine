@@ -1131,6 +1131,50 @@ at::Tensor fp8_transpose(at::Tensor input,
 }
 
 
+std::vector<at::Tensor> fp8_dropout_add(const at::Tensor &input,
+                                        const at::Tensor &residual,
+					transformer_engine::DType itype,
+                                        const at::Tensor &scale_inv,
+                                        float p_dropout,
+					const c10::optional<at::Generator> rng_gen
+) {
+  using namespace transformer_engine;
+
+  auto input_shape = input.sizes().vec();
+  std::vector<size_t> shape{input_shape.begin(), input_shape.end()};
+
+  auto output = at::empty_like(input);
+  auto output_cu = makeTransformerEngineTensor(output);
+  auto output_mask = at::empty_like(input);
+  auto output_mask_cu = makeTransformerEngineTensor(output_mask);
+
+  //  auto output =
+  //            allocateTorchTensor(input.size(0),
+  //                                input.size(1),
+  //                                DType::kByte);
+
+  auto input_cu = makeTransformerEngineTensor(input);
+  auto residual_cu = makeTransformerEngineTensor(residual.data_ptr(), shape, itype,
+                                                    nullptr, nullptr, scale_inv.data_ptr());
+  // extract random number generator seed and offset
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+                  rng_gen, at::cuda::detail::getDefaultCUDAGenerator());
+  size_t threads_per_cta = 128;
+  float elements = std::ceil(std::sqrt(static_cast<float>(input.size(1))));
+  at::PhiloxCudaState philox_args = init_philox_state(gen, static_cast<size_t>(elements), threads_per_cta);
+  auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  auto rng_state = torch::empty({2}, options);
+  unpack<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+                  philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+  auto te_rng_state = makeTransformerEngineTensor(rng_state);
+
+  nvte_dropout_add(input_cu.data(), residual_cu.data(), p_dropout, output_cu.data(), output_mask_cu.data(),
+		   at::cuda::getCurrentCUDAStream(), te_rng_state.data());
+
+  return {output, output_mask};
+}
+
+
 at::Tensor fp8_gelu(at::Tensor input,
                     at::Tensor scale,
                     at::Tensor amax,
@@ -1982,6 +2026,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_attn_bwd_kvpacked", &fused_attn_bwd_kvpacked,
                   "Fused Attention FP8/BF16/FP16 BWD with packed KV");
   m.def("fp8_transpose", &fp8_transpose, "Transpose with FP8 I/O");
+  m.def("fp8_dropout_add", &fp8_dropout_add, "Fused FP8 Dropout+Add");
   m.def("fp8_gelu", &fp8_gelu, "GeLU with FP8 output");
   m.def("fa_prepare_fwd", &fa_prepare_fwd, "Prepare QKV for Flash Attention");
   m.def("fa_prepare_bwd", &fa_prepare_bwd, "Backward of QKV preparation for Flash Attention");

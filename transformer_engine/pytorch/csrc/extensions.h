@@ -168,6 +168,15 @@ at::Tensor fp8_transpose(at::Tensor input,
 );
 
 
+std::vector<at::Tensor> fp8_dropout_add(const at::Tensor &input,
+		                        const at::Tensor &residual,
+					transformer_engine::DType itype,
+					const at::Tensor &scale_inv,
+					float p_dropout,
+					const c10::optional<at::Generator> rng_gen
+);
+
+
 at::Tensor fp8_gelu(at::Tensor input,
                     at::Tensor scale,
                     at::Tensor amax,
