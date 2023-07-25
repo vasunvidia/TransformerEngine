@@ -94,6 +94,40 @@ struct UbufCommOverlap : torch::CustomClassHolder {
   }
 
   /*
+  ** in-place reduce-scatter
+  ** This function assumes the communication input is pre-copied to _ubuf
+  */
+  void rs_ag_inplace(int comm_type) {//vasu
+    // Get the current userbuf offset
+    char *ubuf_wt_ptr = reinterpret_cast<char *>(_ubuf.data_ptr());
+    int comm_elements = (_ubuf.numel() / 2) * _ubuf.element_size();  // UBUF uses 2Byte element size
+    COMM_TYPE _comm_type = static_cast<COMM_TYPE>(comm_type);
+    if (_comm_type == COMM_TYPE::RS) {
+      ubuf_wt_ptr += _ubuf.numel() / _tp_size * _tp_id * _ubuf.element_size();
+    }
+
+    // Catch up the default torch stream
+    at::cuda::CUDAStream stream_comm = at::cuda::getCurrentCUDAStream();
+
+    // Communication: AG and RS
+    if (_comm_type == COMM_TYPE::AG) {
+      allgather2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm, (cudaStream_t)stream_comm);
+    } else if (_comm_type == COMM_TYPE::RS) {
+      reducescatter2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm,
+                                      (cudaStream_t)stream_comm);
+    } else {
+      NVTE_ERROR("Not supported communication type.");
+    }
+
+    // Generate output tensor from userbuf data pointer
+    // int output_c_dim0 = (_comm_type == COMM_TYPE::AG) ? _ubuf.size(0) : _ubuf.size(0) / _tp_size;
+    // int output_c_dim1 = _ubuf.size(1);
+    // output_tensor = torch::from_blob(ubuf_wt_ptr, {output_c_dim0, output_c_dim1}, _ubuf.options());
+
+    // return output_tensor;
+    return;
+  }  // bulk_overlap
+  /*
   ** Bulk GEMM + COMM
   ** This function assumes the communication input is pre-copied to _ubuf
   */
@@ -301,11 +335,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
       }
     }
 
-    at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
-    CHECK_CUDA(cudaEventRecord(_start_d2dcopy, (cudaStream_t)stream_main));
-    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_d2dcopy, 0));
+    at::cuda::CUDAStream stream_comm = at::cuda::getCurrentCUDAStream();
     CHECK_CUDA(cudaMemcpyAsync(ubuf_ptr, input.data_ptr(), input.numel() * input.element_size(),
-                               cudaMemcpyDeviceToDevice, (cudaStream_t)_stream_comm));
+                               cudaMemcpyDeviceToDevice, (cudaStream_t)stream_comm));
   }
 
   torch::Tensor &get_ubuf_output(int comm_type) {

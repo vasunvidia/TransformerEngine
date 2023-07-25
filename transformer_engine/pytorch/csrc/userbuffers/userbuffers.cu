@@ -6,12 +6,12 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-#if __CUDA_ARCH__ >= 800
-#include <cuda_bf16.h>
-#define half nv_bfloat16
-#else
+//#if __CUDA_ARCH__ >= 800
+//#include <cuda_bf16.h>
+//#define half nv_bfloat16
+//#else
 #include <cuda_fp16.h>
-#endif
+//#endif
 #include <assert.h>
 #include <stdio.h>
 #include "userbuffers.h"

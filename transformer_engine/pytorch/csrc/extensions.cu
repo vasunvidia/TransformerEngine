@@ -7,7 +7,7 @@
 #include "extensions.h"
 #ifdef NVTE_WITH_USERBUFFERS
 #include "comm_gemm_overlap.h"
-#endif  // NVTE_WITH_USERBUFFERS
+#endif  // NVTE_WITH_USERBUFFER
 
 constexpr int block_size = 512;
 constexpr int ctas_per_sm = 4;
@@ -2006,6 +2006,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   py::class_<ubuf::UbufCommOverlap>(m, "UbufCommOverlap")
     .def(py::init<torch::Tensor&, int, int, int, int, int, bool, int>())
+    .def("rs_ag_inplace", &ubuf::UbufCommOverlap::rs_ag_inplace)
     .def("bulk_overlap", &ubuf::UbufCommOverlap::bulk_overlap)
     .def("split_overlap_rs", &ubuf::UbufCommOverlap::split_overlap_rs)
     .def("copy_input_to_ubuf", &ubuf::UbufCommOverlap::copy_input_to_ubuf)
