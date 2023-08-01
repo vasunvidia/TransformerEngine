@@ -765,7 +765,8 @@ void te_gemm(at::Tensor A,
              size_t workspaceSize,
              bool accumulate,
              bool use_split_accumulator,
-             int math_sm_count
+             int64_t math_sm_count,
+             const std::string &name
 ) {
   using namespace transformer_engine;
   auto te_A = makeTransformerEngineTensor(A.data_ptr(),
@@ -810,7 +811,8 @@ void te_gemm(at::Tensor A,
                    accumulate,
                    use_split_accumulator,
                    math_sm_count,
-                   at::cuda::getCurrentCUDAStream());
+                   at::cuda::getCurrentCUDAStream(),
+                   name);
 }
 
 

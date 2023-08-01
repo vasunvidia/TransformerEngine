@@ -12,6 +12,7 @@
 #define TRANSFORMER_ENGINE_GEMM_H_
 
 #include "transformer_engine.h"
+#include<string>
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,7 +52,8 @@ void nvte_cublas_gemm(const NVTETensor A,
                       bool accumulate,
                       bool use_split_accumulator,
                       int math_sm_count,
-                      cudaStream_t stream
+                      cudaStream_t stream,
+                      const std::string &name
 );
 
 #ifdef __cplusplus

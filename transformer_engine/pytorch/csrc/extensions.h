@@ -115,7 +115,8 @@ void te_gemm(at::Tensor A,
              size_t workspaceSize,
              bool accumulate,
              bool use_split_accumulator,
-             int math_sm_count
+             int64_t math_sm_count,
+             const std::string &name
 );
 
 

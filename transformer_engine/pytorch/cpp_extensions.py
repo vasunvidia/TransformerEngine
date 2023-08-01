@@ -756,6 +756,8 @@ def fp8_gemm(
     ub_algo: tex.UbufOverlapAlgo = None,
     ub: Union[tex.UbufCommOverlap, tex.UbufP2PCommOverlap] = None,
     extra_output_tensor: torch.Tensor = None,
+    sm_margin: int = 0,
+    name: str = "gemm",
 ) -> torch.Tensor:
     """TN layout GEMM with fp8 inputs."""
 
@@ -826,6 +828,8 @@ def fp8_gemm(
                 extra_output_tensor is not None
             ), 'SPLIT_PIPELINED_RS requires extra output tensor'
             args = tuple(args + (True, extra_output_tensor,))
+    else:
+        args = tuple(args + (sm_margin, name,))
     _ = fn(*args)
 
     if return_output:
@@ -853,6 +857,8 @@ def gemm(
     ub_algo: tex.UbufOverlapAlgo = None,
     ub: tex.UbufCommOverlap = None,
     extra_output_tensor: torch.Tensor = None,
+    sm_margin: int = 0,
+    name: str = "gemm",
 ) -> Tuple[Union[torch.Tensor, None], ...]:
     """Non FP8 GEMM."""
 
@@ -938,6 +944,8 @@ def gemm(
                 extra_output_tensor is not None
             ), 'SPLIT_PIPELINED_RS requires extra output tensor'
             args = tuple(args + (False, extra_output_tensor,))
+    else:
+        args = tuple(args + (sm_margin, name,))
     _ = fn(*args)
 
     if return_output:
