@@ -1471,7 +1471,7 @@ void reducescatter2_userbuff(void *output, const int handler, const int offset, 
 }
 
 __global__ void kuserbuffers_pullsend(int myrank, int peer, int *send_id, int *flagptr) {
-  atomicAdd(flagptr, 1);
+  atomicAdd_system(flagptr, 1);
 }
 
 __global__ void kuserbuffers_inc(int *id) {
@@ -1549,7 +1549,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     __syncthreads();
     if (threadIdx.x) return;
     __threadfence_system();
-    atomicAdd(flagptr, 1);  // otherwise need local SM sync before sending flag
+    atomicAdd_system(flagptr, 1);  // otherwise need local SM sync before sending flag
   } else {                  // 0 bytes and 1 SM only
     atomicAdd_system(flagptr, 1);
   }
@@ -1561,7 +1561,7 @@ __global__ void kuserbuffers_pushrecv(int myrank, int peer, int *recv_id, int *f
   volatile int *flag = (volatile int *)flagptr;
   if (*flag >= signal_id) return;
   clock_t s = clock64();
-  while (atomicAdd_system(flagptr, 0) < signal_id) {
+  while(*flag<signal_id) {
     if (clock64() - s > TIMEOUT) {
       printf("%d from %d] pushrecv: expected %d, stuck with %d\n", myrank, peer, signal_id, *flag);
       return;
@@ -1661,10 +1661,10 @@ __global__ void __launch_bounds__(MAX_THREADS)
     __syncthreads();
     if (threadIdx.x) return;
     __threadfence_system();
-    atomicAdd(flagptr, 1);
+    atomicAdd_system(flagptr, 1);
 
   } else {
-    atomicAdd(flagptr, 1);
+    atomicAdd_system(flagptr, 1);
   }
 }
 

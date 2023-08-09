@@ -34,6 +34,10 @@
 #define NVTE_REG0_FLAGS (NVTE_REG0_RECV + NVTE_MAX_PEERS * NVTE_MAX_REGIONS)
 #define NVTE_REG0_IBRS 32
 #define NVTE_REG0_IBAG 512
+#if defined(UCP) || !defined(NOSHARP)
+#undef REG0_COMMBUFFER
+#define REG0_COMMBUFFER (1024*1024*16)
+#endif
 
 // gpuflags map offsets
 #define NVTE_GF_STATE 16000
