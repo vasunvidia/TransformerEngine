@@ -195,6 +195,11 @@ void reducescatter2_userbuff_stridedoutput(void *output, const int handler, cons
                                            const int rowelements, const int colelements,
                                            const int strideelements, communicator *comm,
                                            cudaStream_t stream = 0);
+void reducescatter2_userbuff_stridedoutput_fp8(void* output, float* scale, const int handler,const int offset,const int rowelements, const int colelements, const int strideelements, communicator* comm, cudaStream_t stream=0);
+#if __CUDA_ARCH__ >= 900
+void reducescatter2_userbuff_fp8(void* output, float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream=0);
+#endif
+
 /* everything should be 16byte aligned = 8 elts aligned
 output is strided: row starts separated by stride elements*/
 

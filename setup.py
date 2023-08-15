@@ -200,6 +200,20 @@ def with_userbuffers() -> bool:
     return False
 
 @lru_cache(maxsize=1)
+def userbuffers_fp16() -> bool:
+    """Check FP16 dtype for userbuffers"""
+    if int(os.getenv("NVTE_USERBUFFER_FP16", "0")):
+        return True
+    return False
+
+@lru_cache(maxsize=1)
+def userbuffers_e5m2() -> bool:
+    """Check FP16 dtype for userbuffers"""
+    if int(os.getenv("NVTE_USERBUFFER_E5M2", "0")):
+        return True
+    return False
+
+@lru_cache(maxsize=1)
 def frameworks() -> List[str]:
     """DL frameworks to build support for"""
     _frameworks: List[str] = []
@@ -339,6 +353,7 @@ class CMakeExtension(setuptools.Extension):
             "-B",
             build_dir,
             f"-DCMAKE_BUILD_TYPE={build_type}",
+            f"-DCMAKE_VERBOSE_MAKEFILE=ON",
             f"-DCMAKE_INSTALL_PREFIX={install_dir}",
         ]
         configure_command += self.cmake_flags
@@ -455,6 +470,10 @@ def setup_common_extension() -> CMakeExtension:
         cmake_flags.append("-DENABLE_TENSORFLOW=ON")
     if with_userbuffers():
         cmake_flags.append("-DNVTE_WITH_USERBUFFERS=ON")
+        if userbuffers_fp16():
+            cmake_flags.append("-DNVTE_UB_FP16=ON")
+        if userbuffers_e5m2():
+            cmake_flags.append("-DNVTE_UB_E5M2=ON")
     return CMakeExtension(
         name="transformer_engine",
         cmake_path=root_path / "transformer_engine",
