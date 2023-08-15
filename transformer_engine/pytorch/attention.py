@@ -1357,6 +1357,7 @@ class MultiheadAttention(torch.nn.Module):
         ub_split_rs: bool = False,
         ub_split_ag: bool = False,
         ub_atomic_gemm_rs: bool = False,
+        ub_atomic_gemm_ag: bool = False,
         bias: bool = True,
         normalization: str = "LayerNorm",
         device: Union[torch.device, str] = "cuda",
@@ -1441,6 +1442,7 @@ class MultiheadAttention(torch.nn.Module):
                     ub_bulk_dgrad=ub_bulk_dgrad,
                     ub_split_ag=ub_split_ag,
                     normalization=normalization,
+                    ub_atomic_gemm_ag=ub_atomic_gemm_ag,
                     **common_gemm_kwargs,
                 )
             else:
@@ -1472,6 +1474,7 @@ class MultiheadAttention(torch.nn.Module):
                     ub_bulk_dgrad=ub_bulk_dgrad,
                     ub_split_ag=ub_split_ag,
                     normalization=normalization,
+                    ub_atomic_gemm_ag=ub_atomic_gemm_ag,
                     **common_gemm_kwargs,
                 )
             else:
@@ -1519,6 +1522,7 @@ class MultiheadAttention(torch.nn.Module):
             ub_split_rs=ub_split_rs,
             ub_split_ag=ub_split_ag,
             ub_atomic_gemm_rs=ub_atomic_gemm_rs,
+            ub_atomic_gemm_ag=ub_atomic_gemm_ag,
             **common_gemm_kwargs,
         )
 
