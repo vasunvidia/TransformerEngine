@@ -223,7 +223,7 @@ class _LayerNormMLP(torch.autograd.Function):
                         fp8_dtype_forward,
                     )
 
-            gelu_out, fc1_out = fp8_gemm(
+            gelu_out, fc1_out = tex.fp8_gemm(
                 fc1_weight_fp8,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
