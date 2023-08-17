@@ -195,7 +195,7 @@ class _Linear(torch.autograd.Function):
                 extra_output_tensor=rs_out if ub_split_rs else None,
                 out_index=proj_out_index,
                 fp8_meta_tensor = meta_tensor,
-                D_dtype = proj_out_te_type,
+                D_dtype = proj_out_tetype,
             )
         else:
             # Cast for native AMP
