@@ -6,6 +6,7 @@
 import warnings
 from typing import Union, Optional, Callable, Tuple, List, Dict, Any
 
+import os
 import torch
 from torch.nn.parameter import Parameter
 
@@ -155,6 +156,7 @@ class _Linear(torch.autograd.Function):
                         fp8_dtype_forward,
                     )
 
+            proj_out_index, meta_tensor, proj_out_tetype, proj_out_pttype = None, None, None, activation_dtype
             if ub_split_rs:
                 ub_obj_projout = get_ub("proj_fprop")
                 out = ub_obj_projout.get_ubuf_output(1)
@@ -162,6 +164,12 @@ class _Linear(torch.autograd.Function):
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
+
+                if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                    proj_out_index = tex.FP8FwdTensors.GEMM1_OUTPUT
+                    meta_tensor = fp8_meta["scaling_fwd"]
+                    proj_out_tetype = fp8_dtype_forward
+                    proj_out_pttype = torch.uint8
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)
@@ -176,7 +184,7 @@ class _Linear(torch.autograd.Function):
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_INPUT,
                 fp8_dtype_forward,
-                activation_dtype,
+                proj_out_pttype,
                 get_workspace(),
                 bias=bias,
                 use_bias=use_bias,
@@ -185,6 +193,9 @@ class _Linear(torch.autograd.Function):
                 ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS if ub_split_rs else None,
                 ub=ub_obj_projout if ub_split_rs else None,
                 extra_output_tensor=rs_out if ub_split_rs else None,
+                out_index=proj_out_index,
+                fp8_meta_tensor = meta_tensor,
+                D_dtype = proj_out_te_type,
             )
         else:
             # Cast for native AMP

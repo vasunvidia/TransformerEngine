@@ -249,6 +249,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 fp8_dtype_forward,
             )
 
+            fc2_out_index, fc2_meta_tensor, fc2_te_type, out_type = None, None, None, activation_dtype
             if ub_split_rs:
                 ub_obj_fc2out = get_ub("fc2_fprop")
                 fc2_out = ub_obj_fc2out.get_ubuf_output(1)
@@ -256,6 +257,12 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = fc2_weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
+
+                if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                    fc2_out_index = tex.FP8FwdTensors.GEMM2_OUTPUT
+                    fc2_meta_tensor = fp8_meta["scaling_fwd"]
+                    fc2_te_type = fp8_dtype_forward
+                    out_type = torch.uint8
             else:
                 dim_size = list(gelu_out.size())
                 dim_size[1] = fc2_weight.size(0)
@@ -270,7 +277,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM2_INPUT,
                 fp8_dtype_forward,
-                activation_dtype,
+                out_type,
                 get_workspace(),
                 bias=fc2_bias,
                 use_bias=use_fc2_bias,
@@ -279,6 +286,9 @@ class _LayerNormMLP(torch.autograd.Function):
                 ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS if ub_split_rs else None,
                 ub=ub_obj_fc2out if ub_split_rs else None,
                 extra_output_tensor=rs_out if ub_split_rs else None,
+                out_index=fc2_out_index,
+                fp8_meta_tensor = fc2_meta_tensor,
+                D_dtype = fc2_te_type,
             )
         else:
             # Cast for native AMP

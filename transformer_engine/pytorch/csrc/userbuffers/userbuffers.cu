@@ -1554,7 +1554,6 @@ void reducescatter2_userbuff(void *output, const int handler, const int offset, 
   reducescatter2_userbuff_stridedoutput(output, handler, offset, elements, 1, 0, comm, stream);
 }
 
-#if __CUDA_ARCH__ >= 900
 void reducescatter2_userbuff_stridedoutput_fp8(void* output,float *scale, const int handler,const int offset,const int rowelements, const int colelements, const int strideelements, communicator* comm, cudaStream_t stream) {
   const int elements = rowelements*colelements;
   const int op=userbuffers_allreduceop_nonsharp2;
@@ -1578,7 +1577,6 @@ void reducescatter2_userbuff_stridedoutput_fp8(void* output,float *scale, const 
 void reducescatter2_userbuff_fp8(void* output,float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream) {
   reducescatter2_userbuff_stridedoutput_fp8(output,scale,handler,offset,elements,1,0,comm,stream);
 }
-#endif
 
 __global__ void kuserbuffers_pullsend(int myrank, int peer, int *send_id, int *flagptr) {
   atomicAdd_system(flagptr, 1);
