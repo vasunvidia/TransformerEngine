@@ -389,7 +389,25 @@ userbuffers_fp16_sum_inplace_gpu_mc(const int op,const int flagoffset,const int 
     reduce_id++;
   }
   __syncthreads();
-       for (int line=threadIdx.x+blockDim.x*(myrank+RANKS*blockIdx.x);line<numlines;line+=blockDim.x*gridDim.x*RANKS) {
+  #define UNROLL_MC 8
+  const int loop_step0 = blockDim.x * gridDim.x * RANKS;
+  const int loop_step = loop_step0 * UNROLL_MC;
+  const int start_elem = threadIdx.x+blockDim.x*(myrank+RANKS*blockIdx.x);
+  const int end_elem = max(start_elem,numlines);
+  const int aligned_elem = ((end_elem - start_elem) / loop_step) * loop_step;
+  const int end_aligned = start_elem + aligned_elem;
+
+       for (int line=start_elem;line<end_aligned;line+=loop_step) {
+        uint4 val[UNROLL_MC];
+        #pragma unroll
+        for(int i=0;i<UNROLL_MC;i++)
+        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(lineoffset+line+i*loop_step0)):"memory");
+        #pragma unroll
+        for(int i=0;i<UNROLL_MC;i++)
+        asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line+i*loop_step0)), "r"(val[i].x), "r"(val[i].y), "r"(val[i].z), "r"(val[i].w)  : "memory");
+      }
+      for (int line=end_aligned;line<end_elem;line+=loop_step0) {
+
         uint4 val;
         asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(lineoffset+line)):"memory");
         asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  : "memory");
@@ -432,7 +450,23 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const i
     while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
   }
   __syncthreads();
-       for (int line=threadIdx.x+blockDim.x*blockIdx.x;line<totallines;line+=blockDim.x*gridDim.x) {
+   const int loop_step0 = blockDim.x * gridDim.x;
+  const int loop_step = loop_step0 * UNROLL_MC;
+  const int start_elem = threadIdx.x+blockDim.x*blockIdx.x;
+  const int end_elem = max(start_elem,totallines);
+  const int aligned_elem = ((end_elem - start_elem) / loop_step) * loop_step;
+  const int end_aligned = start_elem + aligned_elem;
+
+  for (int line=start_elem;line<end_aligned;line+=loop_step) {
+    uint4 val[UNROLL_MC];
+    #pragma unroll
+    for(int i=0;i<UNROLL_MC;i++)
+      asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+    #pragma unroll
+    for(int i=0;i<UNROLL_MC;i++)
+      localptr[mylineoffset+line+i*loop_step0]=val[i];
+  }
+      for (int line=end_aligned;line<end_elem;line+=loop_step0) {
         uint4 val;
         asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
         localptr[mylineoffset+line]=val;
@@ -465,11 +499,27 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,con
   }
   __syncthreads();
 
-       for (int line=threadIdx.x+blockDim.x*blockIdx.x;line<totallines;line+=blockDim.x*gridDim.x) {
-        uint4 val;
-        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
-        ((uint4*)outbuf)[(line/rowlines)*skiplines+(line%rowlines)]=val;
-      }
+  const int loop_step0 = blockDim.x * gridDim.x;
+  const int loop_step = loop_step0 * UNROLL_MC;
+  const int start_elem = threadIdx.x+blockDim.x*blockIdx.x;
+  const int end_elem = max(start_elem,totallines);
+  const int aligned_elem = ((end_elem - start_elem) / loop_step) * loop_step;
+  const int end_aligned = start_elem + aligned_elem;
+  for (int line=start_elem;line<end_aligned;line+=loop_step) {
+    uint4 val[UNROLL_MC];
+    #pragma unroll
+    for(int i=0;i<UNROLL_MC;i++)
+    asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+    #pragma unroll
+    for(int i=0;i<UNROLL_MC;i++)
+    ((uint4*)outbuf)[((line+i*loop_step0)/rowlines)*skiplines+((line+i*loop_step0)%rowlines)]=val[i];
+  }
+  for (int line=end_aligned;line<end_elem;line+=loop_step0) {
+
+    uint4 val;
+    asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+    ((uint4*)outbuf)[(line/rowlines)*skiplines+(line%rowlines)]=val;
+  }
 
   if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
 } //fp16 reduce-scatter kernel (out of place) fp16 MC
@@ -495,23 +545,37 @@ userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const i
   }
   __syncthreads();
 
-      for (int line=threadIdx.x + blockDim.x * blockIdx.x;line<totallines;line+=blockDim.x * gridDim.x) {
-          //mc_ptr[mylineoffset+line]=localptr[mylineoffset+line];
-          uint4 val = localptr[mylineoffset+line];
-          asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(mylineoffset+line)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  : "memory");
-      }
+  const int loop_step0 = blockDim.x * gridDim.x;
+  const int loop_step = loop_step0 * UNROLL_MC;
+  const int start_elem = threadIdx.x+blockDim.x*blockIdx.x;
+  const int end_elem = max(start_elem,totallines);
+  const int aligned_elem = ((end_elem - start_elem) / loop_step) * loop_step;
+  const int end_aligned = start_elem + aligned_elem;
+  for (int line=start_elem;line<end_aligned;line+=loop_step) {
+      uint4 val[UNROLL_MC];
+      #pragma unroll
+      for(int i=0;i<UNROLL_MC;i++)
+      val[i] = localptr[mylineoffset+line+i*loop_step0];
+      #pragma unroll
+      for(int i=0;i<UNROLL_MC;i++)
+      asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(mylineoffset+line+i*loop_step0)), "r"(val[i].x), "r"(val[i].y), "r"(val[i].z), "r"(val[i].w)  : "memory");
+  }
+  for (int line=end_aligned;line<end_elem;line+=loop_step0) {
+      uint4 val = localptr[mylineoffset+line];
+      asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(mylineoffset+line)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  : "memory");
+  }
 
-      __syncthreads();
-      if(threadIdx.x==0) __threadfence_system();
-      __syncthreads();
+  __syncthreads();
+  if(threadIdx.x==0) __threadfence_system();
+  __syncthreads();
 
-      if(threadIdx.x<RANKS) {
-        flagptr[physgpu]=reduce_id;
-        volatile int* flag = (volatile int*)&myptr[targetgpu];
-        clock_t s = clock64();
-        while(*flag<reduce_id) { if(clock64()-s>2ull*TIMEOUT) {printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;} }
-      }
-    if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+  if(threadIdx.x<RANKS) {
+    flagptr[physgpu]=reduce_id;
+    volatile int* flag = (volatile int*)&myptr[targetgpu];
+    clock_t s = clock64();
+    while(*flag<reduce_id) { if(clock64()-s>2ull*TIMEOUT) {printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;} }
+  }
+  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
 } //fp16 inplace allgather kernel (Hopper) MC
 
 #else
