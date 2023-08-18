@@ -24,6 +24,10 @@
 #define NVTE_LAUNCH_CPU 2
 #define NVTE_MAX_NVLINK 8
 
+#define UB_MEM_UC_CONTIG 1
+#define UB_MEM_MC_CREATED 2
+#define UB_MEM_ALLOCATED 4
+
 // region 0 flag offsets
 #define NVTE_REG0_OPFLAGS 1024
 #define NVTE_REG0_RECV (NVTE_REG0_OPFLAGS * userbuffers_op_types)
@@ -85,6 +89,19 @@ struct communicator {
 
   void *mem_ptr[NVTE_MAX_REGIONS];
   void **peer_ptr[NVTE_MAX_REGIONS];
+
+  int memflags[NVTE_MAX_REGIONS]; //UC,MC, user/lib allocated
+
+  CUmemGenericAllocationHandle *uchandles[NVTE_MAX_REGIONS];
+  void* ucbase_ptr[NVTE_MAX_REGIONS]; //only for cuMem allocated memory
+  size_t mem_size[NVTE_MAX_REGIONS];
+
+  void* mc_ptr[NVTE_MAX_REGIONS];
+  void* mc_baseptr;
+  CUmemGenericAllocationHandle mc_handle;
+  size_t mc_offset,mc_maxsize;
+  int use_mc; //1: use MC if available, 0: override not to use MC
+
   int ar_nvsize, ar_firstgpu,
       ar_nvrank;  // number of gpus(and first gpu in a group) of gpus per node in reduction subgroup
                   // (_splitar init used) would be equal to (nvsize,0) for regular comm_create
