@@ -364,6 +364,83 @@ __global__ void __launch_bounds__(MAX_THREADS)
 
 //#if __CUDA_ARCH__ >= 900
 #if __CUDA_ARCH__ >= 900
+//All MC kernels here
+template<int RANKS>
+__global__ void
+__launch_bounds__(MAX_THREADS)
+userbuffers_fp16_sum_inplace_gpu_mc(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int lineoffset,const int numlines, void **commbuff,const int handleridx,float4* mc_ptr) {
+  int *flagptr, physgpu, targetgpu, *myptr;
+  int *reduceidptr, reduce_id;
+  //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
+  if(threadIdx.x<RANKS) {
+    physgpu = myrank*gpustep+firstrank;
+    targetgpu = threadIdx.x*gpustep+firstrank;
+    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
+    myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
+    reduceidptr = myptr-NVTE_MAX_OPS;//+op;
+    reduce_id=(*reduceidptr)+1;
+    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
+    myptr+=blockflagoffset;
+
+    flagptr[physgpu]=reduce_id;
+    volatile int* flag = (volatile int*)&(myptr[targetgpu]);
+    clock_t s = clock64();
+    while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
+    reduce_id++;
+  }
+  __syncthreads();
+       for (int line=threadIdx.x+blockDim.x*(myrank+RANKS*blockIdx.x);line<numlines;line+=blockDim.x*gridDim.x*RANKS) {
+        uint4 val;
+        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(lineoffset+line)):"memory");
+        asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  : "memory");
+      }
+
+      __syncthreads();
+      if(threadIdx.x==0) __threadfence_system();
+      __syncthreads();
+
+      if(threadIdx.x<RANKS) {
+        flagptr[physgpu]=reduce_id;
+        volatile int* flag = (volatile int*)&myptr[targetgpu];
+        clock_t s = clock64();
+        while(*flag<reduce_id) { if(clock64()-s>2ull*TIMEOUT) {printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;} }
+      }
+    if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+} //fp16 inplace reduce kernel (Hopper) MC
+
+template<int RANKS>
+__global__ void
+__launch_bounds__(MAX_THREADS)
+userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx,float4* mc_ptr) {
+  int *flagptr, physgpu, targetgpu, *myptr;
+  int *reduceidptr, reduce_id;
+  uint4* localptr=reinterpret_cast<uint4*>(commbuff[myrank*gpustep+firstrank+handleridx]);
+  //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
+  if(threadIdx.x<RANKS) {
+    physgpu = myrank*gpustep+firstrank;
+    targetgpu = threadIdx.x*gpustep+firstrank;
+    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
+    myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
+    reduceidptr = myptr-NVTE_MAX_OPS;//+op;
+    reduce_id=(*reduceidptr)+1;
+    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
+    myptr+=blockflagoffset;
+
+    flagptr[physgpu]=reduce_id;
+    volatile int* flag = (volatile int*)&(myptr[targetgpu]);
+    clock_t s = clock64();
+    while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
+  }
+  __syncthreads();
+       for (int line=threadIdx.x+blockDim.x*blockIdx.x;line<totallines;line+=blockDim.x*gridDim.x) {
+        uint4 val;
+        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+        localptr[mylineoffset+line]=val;
+      }
+
+  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+} //fp16 inplace reduce-scatter kernel MC
+
 template<int RANKS>
 __global__ void
 __launch_bounds__(MAX_THREADS)
@@ -403,7 +480,7 @@ __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx, uint4* mc_ptr) {
   int *flagptr, physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
-  uint4* localptr=reinterpret_cast<uint4*>(commbuff[myrank*gpustep+firstrank+handleridx]);;
+  uint4* localptr=reinterpret_cast<uint4*>(commbuff[myrank*gpustep+firstrank+handleridx]);
   //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
   if(threadIdx.x<RANKS) {
     physgpu = myrank*gpustep+firstrank;
@@ -439,13 +516,14 @@ userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const i
 
 #else
 template<int RANKS>
-__global__ void
-__launch_bounds__(MAX_THREADS)
+__global__ void __launch_bounds__(MAX_THREADS)
+userbuffers_fp16_sum_inplace_gpu_mc(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int lineoffset,const int numlines, void **commbuff,const int handleridx,float4* mc_ptr) {}
+template<int RANKS> __global__ void __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, const int rowlines, const int skiplines, void **commbuff,const int handleridx,void* outbuf,float4* mc_ptr) {}
-template<int RANKS>
-__global__ void
-__launch_bounds__(MAX_THREADS)
+template<int RANKS> __global__ void __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx, uint4* mc_ptr) {}
+template<int RANKS> __global__ void __launch_bounds__(MAX_THREADS)
+userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx,float4* mc_ptr) {}
 #endif
 
 template<int RANKS>
@@ -1373,6 +1451,28 @@ __global__ void userbuffers_fp16_sum_inplace_gpu_null(const int op, int *hostfla
         kernelArgs));                                                                           \
   }
 
+#define callranksMC(x)                                                                          \
+  if(ar_nvsize == x) {                                                                          \
+    int arg1 = op - NVTE_MAX_OPS,                                                               \
+        arg2 = NVTE_REG0_OFFSET(comm) -                                                         \
+               (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +        \
+               NVTE_MAX_OPS,                                                                    \
+        arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg6 = offset / 8,                \
+        arg7 = elements / 8;                                                                    \
+    void **arg8 = reinterpret_cast<void **>(comm->gpu_ptrs);                                    \
+    int arg9 = handler * comm->nvsize;                                                          \
+    void *arg10 = comm->mc_ptr[handler];                                                        \
+    void *kernelArgs[] = {reinterpret_cast<void *>(&arg1), reinterpret_cast<void *>(&arg2),     \
+                          reinterpret_cast<void *>(&arg3), reinterpret_cast<void *>(&arg4),     \
+                          reinterpret_cast<void *>(&arg5), reinterpret_cast<void *>(&arg6),     \
+                          reinterpret_cast<void *>(&arg7), reinterpret_cast<void *>(&arg8),     \
+                          reinterpret_cast<void *>(&arg9), reinterpret_cast<void *>(&arg10)};   \
+    CUDACHECK(cudaLaunchKernelExC(                                                              \
+        &cfg,                                                                                   \
+        reinterpret_cast<void *>(userbuffers_fp16_sum_inplace_gpu_mc<x>),                       \
+        kernelArgs));                                                                           \
+  }
+
 #define SETUP_LAUNCH_CONFIG(sms, threads, stream)                                    \
   cudaLaunchConfig_t cfg = {sms, threads, 0, stream, NULL, 0};                       \
   cudaLaunchAttribute attribute_ub[2];                                               \
@@ -1429,7 +1529,15 @@ int allreduce2_userbuff_inplace_gpu(const int maxcredit, const int handler, cons
     callranks2_block(1) callranks2_block(2) callranks2_block(4) callranks2_block(8)
   } else {
     SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
-    callranks(2) callranks(4) callranks(8)
+    if(op==userbuffers_allreduceop_nonsharp2 && comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+      callranksMC(2)
+      callranksMC(4)
+      callranksMC(8)
+    } else {
+      callranks(2)
+      callranks(4)
+      callranks(8)
+    }
   }
   return sms;
 }
@@ -1488,6 +1596,26 @@ int allreduce2_userbuff_inplace_gpu(const int maxcredit, const int handler, cons
                           reinterpret_cast<void *>(&arg9)};                                      \
     CUDACHECK(cudaLaunchKernelExC(                                                               \
         &cfg, reinterpret_cast<void *>(userbuffers_fp16_sum_inplace_gpu_rr_rs<x>), kernelArgs)); \
+  }
+
+#define callranks_rsMC(x)                                                                        \ 
+  if (ar_nvsize == x) {                                                                          \
+    int arg1 = op - NVTE_MAX_OPS,                                                                \
+        arg2 = NVTE_REG0_OFFSET(comm) -                                                          \
+               (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +         \
+               NVTE_MAX_OPS,                                                                     \
+        arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,           \
+        arg6 = offset / 8 + arg4 * arg7;                                                         \
+    void **arg8 = reinterpret_cast<void **>(comm->gpu_ptrs);                                     \
+    int arg9 = handler * comm->nvsize;                                                           \
+    void* arg10 = comm->mc_ptr[handler];                                                         \
+    void *kernelArgs[] = {reinterpret_cast<void *>(&arg1), reinterpret_cast<void *>(&arg2),      \
+                          reinterpret_cast<void *>(&arg3), reinterpret_cast<void *>(&arg4),      \
+                          reinterpret_cast<void *>(&arg5), reinterpret_cast<void *>(&arg6),      \
+                          reinterpret_cast<void *>(&arg7), reinterpret_cast<void *>(&arg8),      \
+                          reinterpret_cast<void *>(&arg9), reinterpret_cast<void *>(&arg10)};    \
+    CUDACHECK(cudaLaunchKernelExC(                                                               \
+        &cfg, reinterpret_cast<void *>(userbuffers_fp16_sum_inplace_gpu_mc_rs<x>), kernelArgs)); \
   }
 
 #define callranks_rs_oop(x)                                                                    \
@@ -1551,8 +1679,16 @@ int reducescatter2_userbuff_inplace_gpu(const int maxcredit, const int handler, 
     callranks2_block_rs(1) callranks2_block_rs(2) callranks2_block_rs(4) callranks2_block_rs(8)
   } else {
     SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
-    callranks_rs(2) callranks_rs(4) callranks_rs(8)
-  }
+    if(comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+      callranks_rsMC(2)
+      callranks_rsMC(4)
+      callranks_rsMC(8)
+    } else {
+      callranks_rs(2)
+      callranks_rs(4)
+      callranks_rs(8)
+    }
+}
   return sms;
 }
 
