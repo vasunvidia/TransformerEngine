@@ -255,61 +255,61 @@ int create_communicator_grouped2(communicator **comm, int pipegpus, int pipenode
   (*comm)->ibnvsize = (*comm)->nvsize;
 
 #define NBUF 2
-if((*comm)->sm_arch>=9 && (*comm)->ar2_nvsize>1) { //multicast init only for TP ops (____2 operations)
-  size_t mc_maxsize=MULTICAST_GB_TOTAL*(1ull<<30);
-  (*comm)->mc_offset=0;
-  (*comm)->use_mc=1;
-  size_t gran;
-  CUmulticastObjectProp mcProp = {};
-  mcProp.numDevices = (*comm)->ar2_nvsize;
-  mcProp.size = (*comm)->mc_maxsize;
-  mcProp.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  if((*comm)->sm_arch>=9 && (*comm)->ar2_nvsize>1  && !getenv("UB_SKIPMC")) { //multicast init only for TP ops (____2 operations)
+    size_t mc_maxsize=MULTICAST_GB_TOTAL*(1ull<<30);
+    (*comm)->mc_offset=0;
+    (*comm)->use_mc=1;
+    size_t gran;
+    CUmulticastObjectProp mcProp = {};
+    mcProp.numDevices = (*comm)->ar2_nvsize;
+    mcProp.size = (*comm)->mc_maxsize;
+    mcProp.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
-  CUCHECK(cuMulticastGetGranularity(&gran, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
-  mc_maxsize = ((mc_maxsize+gran-1)/gran)*gran;
-  mcProp.size = mc_maxsize;
-  (*comm)->mc_maxsize=mc_maxsize;
+    CUCHECK(cuMulticastGetGranularity(&gran, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
+    mc_maxsize = ((mc_maxsize+gran-1)/gran)*gran;
+    mcProp.size = mc_maxsize;
+    (*comm)->mc_maxsize=mc_maxsize;
 
-  int fd;
-  volatile uint32_t abortFlag = 0;
-  struct ncclIpcSocket ipcSock = { 0 };
-  uint64_t opId=0xdeadcafeb000+(*comm)->ar2_firstgpu;
-  ncclResult_t ret = ncclSuccess;
-  NCCLCHECK(ncclIpcSocketInit(&ipcSock, (*comm)->ar2_nvrank, (uint64_t)opId, &abortFlag));
+    int fd;
+    volatile uint32_t abortFlag = 0;
+    struct ncclIpcSocket ipcSock = { 0 };
+    uint64_t opId=0xdeadcafeb000+(*comm)->ar2_firstgpu;
+    ncclResult_t ret = ncclSuccess;
+    NCCLCHECK(ncclIpcSocketInit(&ipcSock, (*comm)->ar2_nvrank, (uint64_t)opId, &abortFlag));
 
-  if((*comm)->ar2_nvrank==0) {
-    CUCHECK(cuMulticastCreate(&(*comm)->mc_handle, &mcProp));
-    CUCHECK(cuMemExportToShareableHandle(&fd, (*comm)->mc_handle , CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
-    for(int p=1;p<(*comm)->ar2_nvsize;p++) {
-      NCCLCHECKGOTO(ncclIpcSocketSendFd(&ipcSock, fd, p, (uint64_t)opId), ret, error);
+    if((*comm)->ar2_nvrank==0) {
+      CUCHECK(cuMulticastCreate(&(*comm)->mc_handle, &mcProp));
+      CUCHECK(cuMemExportToShareableHandle(&fd, (*comm)->mc_handle , CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
+      for(int p=1;p<(*comm)->ar2_nvsize;p++) {
+        NCCLCHECKGOTO(ncclIpcSocketSendFd(&ipcSock, fd, p, (uint64_t)opId), ret, error);
+      }
+    } else {
+      NCCLCHECKGOTO(ncclIpcSocketRecvFd(&ipcSock, &fd), ret, error);
+      CUCHECK(cuMemImportFromShareableHandle(&(*comm)->mc_handle, (void *)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
     }
+    error:
+    NCCLCHECK(ncclIpcSocketClose(&ipcSock));
+    close(fd);
+    CUCHECK(cuMulticastAddDevice((*comm)->mc_handle, (*comm)->mydev));
+
+    CUdeviceptr mc_va;
+    CUCHECK(cuMemAddressReserve(&mc_va, mc_maxsize, 0, 0U, 0));
+    CUCHECK(cuMemMap(mc_va, mc_maxsize, 0, (*comm)->mc_handle, 0));
+
+    CUmemAccessDesc accessDesc = {};
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = (*comm)->mydev;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CUCHECK(cuMemSetAccess(mc_va, mc_maxsize, &accessDesc, 1));
+
+    (*comm)->mc_baseptr=reinterpret_cast<void *>(mc_va);
+    if(!(*comm)->myrank) printf ("MC initialized succesfully, window size = %ld\n",mc_maxsize);
   } else {
-    NCCLCHECKGOTO(ncclIpcSocketRecvFd(&ipcSock, &fd), ret, error);
-    CUCHECK(cuMemImportFromShareableHandle(&(*comm)->mc_handle, (void *)fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+    if(!(*comm)->myrank) printf ("MC NOT initialized and used\n");
+    (*comm)->mc_maxsize=0;
+    (*comm)->mc_offset=0;
+    (*comm)->use_mc=0;
   }
-  error:
-  NCCLCHECK(ncclIpcSocketClose(&ipcSock));
-  close(fd);
-  CUCHECK(cuMulticastAddDevice((*comm)->mc_handle, (*comm)->mydev));
-
-  CUdeviceptr mc_va;
-  CUCHECK(cuMemAddressReserve(&mc_va, mc_maxsize, 0, 0U, 0));
-  CUCHECK(cuMemMap(mc_va, mc_maxsize, 0, (*comm)->mc_handle, 0));
-
-  CUmemAccessDesc accessDesc = {};
-  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-  accessDesc.location.id = (*comm)->mydev;
-  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  CUCHECK(cuMemSetAccess(mc_va, mc_maxsize, &accessDesc, 1));
-
-  (*comm)->mc_baseptr=reinterpret_cast<void *>(mc_va);
-  if(!(*comm)->myrank) printf ("MC initialized succesfully, window size = %ld\n",mc_maxsize);
-} else {
-  if(!(*comm)->myrank) printf ("MC NOT initialized and used\n");
-  (*comm)->mc_maxsize=0;
-  (*comm)->mc_offset=0;
-  (*comm)->use_mc=0;
-}
 
 #define LOCALSIZE 4 * (NVTE_REG0_OFFSET(*comm) + NVTE_REG0_FLAGS + NVTE_REG0_COMMBUFFER * NBUF)
   // peer pointers + op flags + comm buffer
