@@ -7,7 +7,7 @@
 #include "extensions.h"
 #ifdef NVTE_WITH_USERBUFFERS
 #include "comm_gemm_overlap.h"
-#endif  // NVTE_WITH_USERBUFFERS
+#endif  // NVTE_WITH_USERBUFFER
 
 size_t get_cublasLt_version() {
     return cublasLtGetVersion();

@@ -170,6 +170,7 @@ class _Linear(torch.autograd.Function):
                     meta_tensor = fp8_meta["scaling_fwd"]
                     proj_out_tetype = fp8_dtype_forward
                     proj_out_pttype = torch.uint8
+                    ub_obj_projout.set_ubuf_scale_inv(meta_tensor.scale_inv[proj_out_index])
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)

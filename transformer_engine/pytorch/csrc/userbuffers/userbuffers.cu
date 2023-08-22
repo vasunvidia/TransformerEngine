@@ -6,24 +6,14 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-#if (__CUDA_ARCH__ < 800) or defined(NVTE_UB_FP16)
+#if defined(NVTE_UB_FP16)
 #include <cuda_fp16.h>
 #else
 #include <cuda_bf16.h>
 #define half nv_bfloat16
 #endif
 
-#if __CUDA_ARCH__ >= 900
 #include <cuda_fp8.h>
-#if defined (NVTE_UB_E5M2)
-#define fp8type __nv_fp8_e5m2
-#else
-#define fp8type __nv_fp8_e4m3
-#endif
-#else
-#define fp8type half
-#endif
-
 #include <assert.h>
 #include <stdio.h>
 #include "userbuffers.h"
@@ -362,7 +352,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
   if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
 }  // fp16 reduce-scatter kernel (out of place)
 
-//#if __CUDA_ARCH__ >= 900
 #if __CUDA_ARCH__ >= 900
 //All MC kernels here
 template<int RANKS>
@@ -590,7 +579,7 @@ template<int RANKS> __global__ void __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx,float4* mc_ptr) {}
 #endif
 
-template<int RANKS>
+template<int RANKS,typename fp8type>
 __global__ void
 __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, const int rowlines, const int skiplines, void **commbuff,const int handleridx,void* outbuf, float* scale) {
@@ -650,7 +639,6 @@ userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8(const int op,const int flagoffset
 
   if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
 } //fp16 reduce-scatter kernel (out of place) (fp8->fp16)
-//#endif
 
 
 template <int RANKS>
@@ -1709,7 +1697,7 @@ int allreduce2_userbuff_inplace_gpu(const int maxcredit, const int handler, cons
       arg3=ar_firstgpu,arg4=ar_nvrank,arg5=ar_step,arg7=elements/16/x,arg6=offset/16+arg4*arg7,arg8=rowelements/8,arg9=strideelements/8;\
   void **arg10=(void**)(comm->gpu_ptrs);int arg11=handler*comm->nvsize;void* arg12=output; float* arg13=scale;\
   void *kernelArgs[] = { (void*)&arg1,(void*)&arg2,(void*)&arg3,(void*)&arg4,(void*)&arg5,(void*)&arg6,(void*)&arg7,(void*)&arg8,(void*)&arg9,(void*)&arg10,(void*)&arg11,(void*)&arg12,(void*)&arg13}; \
-  CUDACHECK(cudaLaunchKernelExC(&cfg, (void*)userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8<x>, kernelArgs)); \
+  CUDACHECK(cudaLaunchKernelExC(&cfg, (void*)userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8<x, fp8type>, kernelArgs)); \
 }
 
 #define callranks_rs_oopMC(x)   if(ar_nvsize==x) { \
@@ -1878,6 +1866,7 @@ void reducescatter2_userbuff(void *output, const int handler, const int offset, 
   reducescatter2_userbuff_stridedoutput(output, handler, offset, elements, 1, 0, comm, stream);
 }
 
+template<typename fp8type>
 void reducescatter2_userbuff_stridedoutput_fp8(void* output,float *scale, const int handler,const int offset,const int rowelements, const int colelements, const int strideelements, communicator* comm, cudaStream_t stream) {
   const int elements = rowelements*colelements;
   const int op=userbuffers_allreduceop_nonsharp2;
@@ -1898,9 +1887,13 @@ void reducescatter2_userbuff_stridedoutput_fp8(void* output,float *scale, const 
   callranks_rs_oop_fp8(8)
 }
 
+template<typename fp8type>
 void reducescatter2_userbuff_fp8(void* output,float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream) {
-  reducescatter2_userbuff_stridedoutput_fp8(output,scale,handler,offset,elements,1,0,comm,stream);
+  reducescatter2_userbuff_stridedoutput_fp8<fp8type>(output,scale,handler,offset,elements,1,0,comm,stream);
 }
+
+template void reducescatter2_userbuff_fp8<__nv_fp8_e5m2>(void* output, float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream=0);
+template void reducescatter2_userbuff_fp8<__nv_fp8_e4m3>(void* output, float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream=0);
 
 __global__ void kuserbuffers_pullsend(int myrank, int peer, int *send_id, int *flagptr) {
   atomicAdd_system(flagptr, 1);

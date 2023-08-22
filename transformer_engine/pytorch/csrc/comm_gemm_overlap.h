@@ -15,6 +15,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 #include "userbuffers/userbuffers.h"
+#include <cuda_fp8.h>
 
 #define HALF_BYTES 2
 #define UB_MAX_SM 32
@@ -49,6 +50,8 @@ struct UbufCommOverlap : torch::CustomClassHolder {
   void *_ubuf_ptr;
   torch::Tensor _ubuf;
   torch::Tensor output_tensor;
+  torch::Tensor _ubuf_scale_inv;
+  bool _ubuf_scale_inv_initialized;
   at::cuda::CUDAStream _stream_comm = at::cuda::getStreamFromPool(true);
   std::vector<at::cuda::CUDAStream> _stream_compute;
   cudaEvent_t _start_compute, _stop_compute, _start_d2dcopy, _start_comm, _stop_comm;
@@ -58,6 +61,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     // Initialize userbuf communicator
     create_communicator_grouped2(&_ub_comm, 1, 1, tp_size, 1);
     _ub_comm->use_ce = 0;
+    _ub_comm->use_mc = 0;
     _ub_comm->sms = num_comm_sm;
     _ub_comm->cga_size = comm_cga_size;
 
@@ -78,6 +82,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     _num_splits = num_splits;
     _tp_size = tp_size;
     _tp_id = (rank % tp_size);
+    _ubuf_scale_inv_initialized = false;
 
     // Set the number of SMs for GEMM with margin
     cudaDeviceProp prop;
@@ -158,7 +163,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
                         at::Tensor bias, transformer_engine::DType bias_type,
                         at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
                         size_t workspaceSize, bool accumulate, bool use_split_accumulator,
-                        bool gemm_overlap, at::Tensor rs_output, at::Tensor D_scale_inv) {
+                        bool gemm_overlap, at::Tensor rs_output) {
     // Get GEMM dimensions
     int m = A.size(0);
     int k = A.size(1);
@@ -224,8 +229,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
 
         // Communication chunk
         if (_ubuf.element_size() == 1) {
-            float *d_scale_inv_ptr = reinterpret_cast<float *>(D_scale_inv.data_ptr());
-            reducescatter2_userbuff_stridedoutput_fp8(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
+            assert (_ubuf_scale_inv_initialized);
+            float *d_scale_inv_ptr = reinterpret_cast<float *>(_ubuf_scale_inv.data_ptr());
+            reducescatter2_userbuff_stridedoutput_fp8<__nv_fp8_e4m3>(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
                 (i - 1) * output_chunk_size, m_chunk, n, m, _ub_comm, (cudaStream_t)_stream_comm);
         }
         else {
@@ -244,8 +250,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
       // Last communication chunk with max SM
       _ub_comm->sms = UB_MAX_SM;
       if (_ubuf.element_size() == 1) {
-          float *d_scale_inv_ptr = reinterpret_cast<float *>(D_scale_inv.data_ptr());
-          reducescatter2_userbuff_stridedoutput_fp8(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
+          assert (_ubuf_scale_inv_initialized);
+          float *d_scale_inv_ptr = reinterpret_cast<float *>(_ubuf_scale_inv.data_ptr());
+          reducescatter2_userbuff_stridedoutput_fp8<__nv_fp8_e4m3>(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
               (_num_splits - 1) * output_chunk_size, m_chunk, n, m, _ub_comm, (cudaStream_t)_stream_comm);
       }
       else {
@@ -276,8 +283,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
           _ub_comm->sms = UB_MAX_SM;
         }
         if (_ubuf.element_size() == 1) {
-            float *d_scale_inv_ptr = reinterpret_cast<float *>(D_scale_inv.data_ptr());
-            reducescatter2_userbuff_stridedoutput_fp8(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
+            assert (_ubuf_scale_inv_initialized);
+            float *d_scale_inv_ptr = reinterpret_cast<float *>(_ubuf_scale_inv.data_ptr());
+            reducescatter2_userbuff_stridedoutput_fp8<__nv_fp8_e4m3>(rs_output_ptr, d_scale_inv_ptr, _ub_reg,
                 i * output_chunk_size, m_chunk, n, m, _ub_comm, (cudaStream_t)_stream_comm);
         }
         else {
@@ -303,6 +311,10 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     return;
   }  // split_overlap_rs
 
+  void set_ubuf_scale_inv(const torch::Tensor &scale_inv) {
+    _ubuf_scale_inv = scale_inv;
+    _ubuf_scale_inv_initialized = true;
+  }
   /*
   ** Helper function to copy input to _ubuf
   */
@@ -362,6 +374,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder {
     // Initialize userbuf communicator
     create_communicator_grouped2(&_ub_comm, 1, 1, tp_size, 1);
     _ub_comm->use_ce = 1;
+    _ub_comm->use_mc = 0;
     _ub_comm->sms = 1;
     _ub_comm->cga_size = 1;
 

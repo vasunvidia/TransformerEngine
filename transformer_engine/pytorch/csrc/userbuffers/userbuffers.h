@@ -212,7 +212,9 @@ void reducescatter2_userbuff_stridedoutput(void *output, const int handler, cons
                                            const int rowelements, const int colelements,
                                            const int strideelements, communicator *comm,
                                            cudaStream_t stream = 0);
+template<typename fp8type>
 void reducescatter2_userbuff_stridedoutput_fp8(void* output, float* scale, const int handler,const int offset,const int rowelements, const int colelements, const int strideelements, communicator* comm, cudaStream_t stream=0);
+template<typename fp8type>
 void reducescatter2_userbuff_fp8(void* output, float* scale, const int handler,const int offset,const int elements, communicator* comm, cudaStream_t stream=0);
 
 /* everything should be 16byte aligned = 8 elts aligned

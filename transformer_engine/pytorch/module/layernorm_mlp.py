@@ -263,6 +263,7 @@ class _LayerNormMLP(torch.autograd.Function):
                     fc2_meta_tensor = fp8_meta["scaling_fwd"]
                     fc2_te_type = fp8_dtype_forward
                     out_type = torch.uint8
+                    ub_obj_fc2out.set_ubuf_scale_inv(fc2_meta_tensor.scale_inv[fc2_out_index])
             else:
                 dim_size = list(gelu_out.size())
                 dim_size[1] = fc2_weight.size(0)

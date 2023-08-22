@@ -107,9 +107,7 @@ def fp8_gemm(
             assert (
                 extra_output_tensor is not None
             ), 'SPLIT_PIPELINED_RS requires extra output tensor'
-            args = tuple(args + (True, extra_output_tensor,
-                empty_tensor if out_index is None else fp8_meta_tensor.scale_inv[out_index],
-            ))
+            args = tuple(args + (True, extra_output_tensor,))
     _ = fn(*args)
 
     if return_output:
