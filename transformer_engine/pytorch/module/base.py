@@ -171,6 +171,8 @@ def initialize_ub(
     ) -> None:
         dtype = torch.uint8 if (use_fp8 and name in fp8_buf) else torch.bfloat16
         sample_buffer = torch.empty(shape, dtype=dtype, device='cuda')
+        if (rank_id==0) and (name in ["proj_fprop", "fc2_fprop", "fc1_wgrad", "qkv_wgrad"]):
+            print (f'!!! UB RS-overlap {name}-{dtype}')
         if method == 'ring_exchange':
             ub_obj = tex.UbufP2PCommOverlap(
                     sample_buffer,          # Sample userbuffer
