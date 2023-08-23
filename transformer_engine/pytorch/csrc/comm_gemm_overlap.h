@@ -108,7 +108,8 @@ struct UbufCommOverlap : torch::CustomClassHolder {
       int64_t B_fp8_tensor, transformer_engine::DType B_type, bool transb, at::Tensor D,
       at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax, at::Tensor bias,
       transformer_engine::DType bias_type, at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
-      size_t workspaceSize, bool accumulate, bool use_split_accumulator, int comm_type) {
+      size_t workspaceSize, bool accumulate, bool use_split_accumulator, int comm_type,
+      at::Tensor rs_output) {
     // Get the current userbuf offset
     char *ubuf_wt_ptr = reinterpret_cast<char *>(_ubuf.data_ptr());
     int comm_elements = (_ubuf.numel() / 2) * _ubuf.element_size();  // UBUF uses 2Byte element size
@@ -126,8 +127,21 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     if (_comm_type == COMM_TYPE::AG) {
       allgather2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm, (cudaStream_t)_stream_comm);
     } else if (_comm_type == COMM_TYPE::RS) {
-      reducescatter2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm,
+      if (_ubuf.element_size() == 1) {
+        assert (_ubuf_scale_inv_initialized);
+        comm_elements *= 2;
+        float *scale_inv_ptr = reinterpret_cast<float *>(_ubuf_scale_inv.data_ptr());
+        assert(rs_output.numel() == _ubuf.numel() / _tp_size);
+        assert(rs_output.size(0) == _ubuf.size(0) / _tp_size);
+        assert(rs_output.element_size() == 2);
+        char *rs_output_ptr = reinterpret_cast<char *>(rs_output.data_ptr());
+        reducescatter2_userbuff_fp8<__nv_fp8_e5m2>(rs_output_ptr, scale_inv_ptr, _ub_reg,
+            0, comm_elements, _ub_comm, (cudaStream_t)_stream_comm);
+      }
+      else {
+        reducescatter2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm,
                                       (cudaStream_t)_stream_comm);
+      }
     } else {
       NVTE_ERROR("Not supported communication type.");
     }
