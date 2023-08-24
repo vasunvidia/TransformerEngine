@@ -293,7 +293,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                                const int skiplines, void **commbuff,
                                                const int handleridx, void *outbuf) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
