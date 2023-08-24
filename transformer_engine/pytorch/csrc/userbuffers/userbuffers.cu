@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "userbuffers.h"
+#include <cstdint>
 
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
@@ -27,6 +28,12 @@
       exit(EXIT_FAILURE);                                                                   \
     }                                                                                       \
   } while (0)
+
+__device__ void fence_acquire_gpu() {
+  uintptr_t addr;
+  int32_t v;
+  asm ("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(addr) : "memory");
+}
 
 template <int RANKS>
 __global__ void __launch_bounds__(MAX_THREADS)
@@ -310,6 +317,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
     while (*flag < reduce_id) {
+      fence_acquire_gpu();
       if (clock64() - s > TIMEOUT) {
         printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x, threadIdx.x, reduce_id,
                *flag);
