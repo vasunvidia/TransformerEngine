@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "userbuffers.h"
+#include <cuda/atomic>
 
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
@@ -305,11 +306,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
     flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
     myptr += blockflagoffset;
 
-    flagptr[physgpu] = reduce_id;
-    volatile int *flag = (volatile int *)&(myptr[targetgpu]);
+    cuda::atomic_ref<int,cuda::thread_scope_device>{flagptr[physgpu]}.store(reduce_id, cuda::memory_order_relaxed);
+    /*volatile*/ int* flag = (/*volatile*/int*)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
-    while (*flag < reduce_id) {
+    while(*flag<reduce_id) with while(cuda::atomic_ref<int,cuda::thread_scope_device>{*flag}.load(cuda::memory_order_acquire)<reduce_id) {
       if (clock64() - s > TIMEOUT) {
         printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x, threadIdx.x, reduce_id,
                *flag);
