@@ -390,15 +390,23 @@ userbuffers_fp16_sum_inplace_gpu_mc(const int op,const int flagoffset,const int 
         uint4 val[UNROLL_MC];
         #pragma unroll
         for(int i=0;i<UNROLL_MC;i++)
-        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(lineoffset+line+i*loop_step0)):"memory");
+#if defined(NVTE_UB_FP16)
+          asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(lineoffset+line+i*loop_step0)):"memory");
+#else
+          asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(lineoffset+line+i*loop_step0)):"memory");
+#endif
         #pragma unroll
         for(int i=0;i<UNROLL_MC;i++)
-        asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line+i*loop_step0)), "r"(val[i].x), "r"(val[i].y), "r"(val[i].z), "r"(val[i].w)  : "memory");
+          asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line+i*loop_step0)), "r"(val[i].x), "r"(val[i].y), "r"(val[i].z), "r"(val[i].w)  : "memory");
       }
       for (int line=end_aligned;line<end_elem;line+=loop_step0) {
 
         uint4 val;
+#if defined(NVTE_UB_FP16)
         asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(lineoffset+line)):"memory");
+#else
+        asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(lineoffset+line)):"memory");
+#endif
         asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(mc_ptr+(lineoffset+line)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  : "memory");
       }
 
@@ -450,14 +458,22 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const i
     uint4 val[UNROLL_MC];
     #pragma unroll
     for(int i=0;i<UNROLL_MC;i++)
+#if defined(NVTE_UB_FP16)
       asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+#else
+      asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+#endif
     #pragma unroll
     for(int i=0;i<UNROLL_MC;i++)
       localptr[mylineoffset+line+i*loop_step0]=val[i];
   }
       for (int line=end_aligned;line<end_elem;line+=loop_step0) {
         uint4 val;
+#if defined(NVTE_UB_FP16)
         asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+#else
+        asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+#endif
         localptr[mylineoffset+line]=val;
       }
 
@@ -498,7 +514,11 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,con
     uint4 val[UNROLL_MC];
     #pragma unroll
     for(int i=0;i<UNROLL_MC;i++)
+#if defined(NVTE_UB_FP16)
     asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+#else
+    asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val[i].x),"=r"(val[i].y),"=r"(val[i].z),"=r"(val[i].w) : "l"(mc_ptr+(mylineoffset+line+i*loop_step0)):"memory");
+#endif
     #pragma unroll
     for(int i=0;i<UNROLL_MC;i++)
     ((uint4*)outbuf)[((line+i*loop_step0)/rowlines)*skiplines+((line+i*loop_step0)%rowlines)]=val[i];
@@ -506,7 +526,11 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,con
   for (int line=end_aligned;line<end_elem;line+=loop_step0) {
 
     uint4 val;
+#if defined(NVTE_UB_FP16)
     asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+#else
+    asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];" : "=r" (val.x),"=r"(val.y),"=r"(val.z),"=r"(val.w) : "l"(mc_ptr+(mylineoffset+line)):"memory");
+#endif
     ((uint4*)outbuf)[(line/rowlines)*skiplines+(line%rowlines)]=val;
   }
 
