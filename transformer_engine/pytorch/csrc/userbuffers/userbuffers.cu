@@ -347,7 +347,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     (reinterpret_cast<int4 *>(outbuf))[(line / rowlines) * skiplines + (line % rowlines)] = sum;
   }
 
-  if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
+  if (threadIdx.x == 0 && (blockIdx.x == gridDim.x-1)) *reduceidptr = reduce_id;
 }  // fp16 reduce-scatter kernel (out of place)
 
 template <int RANKS>
