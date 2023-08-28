@@ -292,20 +292,19 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                                const int totallines, const int rowlines,
                                                const int skiplines, void **commbuff,
                                                const int handleridx, void *outbuf) {
-  __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  __shared__ int4* userptr[RANKS];
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
-
-    flagptr[physgpu] = reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int *flag = (volatile int *)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
