@@ -303,7 +303,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x : 1;
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
     int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
     if(old_val+adder==NVTE_MAX_SMS*(reduce_id)) lastSM=1;
     flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
