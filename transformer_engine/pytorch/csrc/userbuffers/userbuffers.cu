@@ -293,7 +293,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                                const int skiplines, void **commbuff,
                                                const int handleridx, void *outbuf) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
@@ -306,10 +307,12 @@ __global__ void __launch_bounds__(MAX_THREADS)
     myptr += blockflagoffset;
 
     flagptr[physgpu] = reduce_id;
+    __threadfence_system();
     volatile int *flag = (volatile int *)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
     while (*flag < reduce_id) {
+      __threadfence_system();
       if (clock64() - s > TIMEOUT) {
         printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x, threadIdx.x, reduce_id,
                *flag);
