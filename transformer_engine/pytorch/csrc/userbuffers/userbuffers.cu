@@ -1854,7 +1854,13 @@ void reducescatter2_userbuff_inplace(const int handler, const int offset, const 
   if (warps < ar_nvsize) warps = ar_nvsize;
 
   SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
-  callranks_rs(2) callranks_rs(4) callranks_rs(8)
+  if(comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+    callranks_rsMC(2)
+    callranks_rsMC(4)
+    callranks_rsMC(8)
+  } else {
+    callranks_rs(2) callranks_rs(4) callranks_rs(8)
+  }
 }
 void reducescatter2_userbuff_stridedoutput(void *output, const int handler, const int offset,
                                            const int rowelements, const int colelements,
