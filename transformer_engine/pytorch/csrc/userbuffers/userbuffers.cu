@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "userbuffers.h"
+#include <cuda/atomic>
 
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
@@ -293,23 +294,22 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                                const int skiplines, void **commbuff,
                                                const int handleridx, void *outbuf) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+  int lastSM=0;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
-
-    flagptr[physgpu] = reduce_id;
-    volatile int *flag = (volatile int *)&(myptr[targetgpu]);
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) cuda::atomic_ref<int,cuda::thread_scope_system>{flagptr[physgpu]}.store(reduce_id,cuda::memory_order_release);
+    int *flag = &(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
-    while (*flag < reduce_id) {
+    while(cuda::atomic_ref<int,cuda::thread_scope_system>{*flag}.load(cuda::memory_order_acquire)<reduce_id) {
       if (clock64() - s > TIMEOUT) {
         printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x, threadIdx.x, reduce_id,
                *flag);
@@ -318,6 +318,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
   }
   __syncthreads();
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
 
   int warp = blockIdx.x + (threadIdx.x >> 5);
   int dest[RANKS];
