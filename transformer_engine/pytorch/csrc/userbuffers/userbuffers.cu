@@ -229,19 +229,18 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                            const int mylineoffset, const int totallines,
                                            void **commbuff, const int handleridx) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+  int lastSM=0;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
-
-    flagptr[physgpu] = reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int *flag = (volatile int *)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
@@ -254,6 +253,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
   }
   __syncthreads();
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
 
   int warp = blockIdx.x + (threadIdx.x >> 5);
   int dest[RANKS];
@@ -283,7 +287,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     userptr[myrank][mylineoffset + line] = sum;
   }
 
-  if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
+  if (threadIdx.x == 0 && lastSM == 0) *reduceidptr = reduce_id;
 }  // fp16 inplace reduce-scatter kernel
 
 template <int RANKS>
@@ -295,19 +299,18 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                                const int skiplines, void **commbuff,
                                                const int handleridx, void *outbuf) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+  int lastSM=0;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
-
-    flagptr[physgpu] = reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int *flag = (volatile int *)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
@@ -320,6 +323,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
   }
   __syncthreads();
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
 
   int warp = blockIdx.x + (threadIdx.x >> 5);
   int dest[RANKS];
@@ -349,7 +357,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     (reinterpret_cast<int4 *>(outbuf))[(line / rowlines) * skiplines + (line % rowlines)] = sum;
   }
 
-  if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
+  if (threadIdx.x == 0 && lastSM) *reduceidptr = reduce_id;
 }  // fp16 reduce-scatter kernel (out of place)
 
 #if __CUDA_ARCH__ >= 900
@@ -427,26 +435,30 @@ template<int RANKS>
 __global__ void
 __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx,float4* mc_ptr) {
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   uint4* localptr=reinterpret_cast<uint4*>(commbuff[myrank*gpustep+firstrank+handleridx]);
+  int lastSM=0;
   //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
   if(threadIdx.x<RANKS) {
     physgpu = myrank*gpustep+firstrank;
     targetgpu = threadIdx.x*gpustep+firstrank;
-    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
     myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
     reduceidptr = myptr-NVTE_MAX_OPS;//+op;
     reduce_id=(*reduceidptr)+1;
-    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
-    myptr+=blockflagoffset;
-
-    flagptr[physgpu]=reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int* flag = (volatile int*)&(myptr[targetgpu]);
     clock_t s = clock64();
     while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
   }
   __syncthreads();
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
    const int loop_step0 = blockDim.x * gridDim.x;
   const int loop_step = loop_step0 * UNROLL_MC;
   const int start_elem = threadIdx.x+blockDim.x*blockIdx.x;
@@ -477,32 +489,36 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs(const int op,const int flagoffset,const i
         localptr[mylineoffset+line]=val;
       }
 
-  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+  if(threadIdx.x==0 && lastSM) *reduceidptr=reduce_id;
 } //fp16 inplace reduce-scatter kernel MC
 
 template<int RANKS>
 __global__ void
 __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, const int rowlines, const int skiplines, void **commbuff,const int handleridx,void* outbuf,float4* mc_ptr) {
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+  int lastSM=0;
   //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
   if(threadIdx.x<RANKS) {
     physgpu = myrank*gpustep+firstrank;
     targetgpu = threadIdx.x*gpustep+firstrank;
-    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
     myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
     reduceidptr = myptr-NVTE_MAX_OPS;//+op;
     reduce_id=(*reduceidptr)+1;
-    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
-    myptr+=blockflagoffset;
-
-    flagptr[physgpu]=reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int* flag = (volatile int*)&(myptr[targetgpu]);
     clock_t s = clock64();
     while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("[%d] NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",myrank,blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
   }
   __syncthreads();
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
 
   const int loop_step0 = blockDim.x * gridDim.x;
   const int loop_step = loop_step0 * UNROLL_MC;
@@ -534,27 +550,25 @@ userbuffers_fp16_sum_inplace_gpu_mc_rs_oop(const int op,const int flagoffset,con
     ((uint4*)outbuf)[(line/rowlines)*skiplines+(line%rowlines)]=val;
   }
 
-  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+  if (threadIdx.x == 0 && lastSM) *reduceidptr = reduce_id;
 } //fp16 reduce-scatter kernel (out of place) fp16 MC
 
 template<int RANKS>
 __global__ void
 __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, void **commbuff,const int handleridx, uint4* mc_ptr) {
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   uint4* localptr=reinterpret_cast<uint4*>(commbuff[myrank*gpustep+firstrank+handleridx]);
   //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
   if(threadIdx.x<RANKS) {
     physgpu = myrank*gpustep+firstrank;
     targetgpu = threadIdx.x*gpustep+firstrank;
-    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
     myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
     reduceidptr = myptr-NVTE_MAX_OPS;//+op;
     reduce_id=(*reduceidptr)+1;
-    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
-    myptr+=blockflagoffset;
-    reduce_id++;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
   }
   __syncthreads();
 
@@ -582,13 +596,20 @@ userbuffers_fp16_sum_inplace_gpu_mc_ag(const int op,const int flagoffset,const i
   if(threadIdx.x==0) __threadfence_system();
   __syncthreads();
 
-  if(threadIdx.x<RANKS) {
+  __shared__ int lastSM;
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1; else lastSM=0;
+  }
+  __syncthreads();
+  if (lastSM && threadIdx.x < RANKS) {
+    if(threadIdx.x==0)*reduceidptr = reduce_id;
     flagptr[physgpu]=reduce_id;
     volatile int* flag = (volatile int*)&myptr[targetgpu];
     clock_t s = clock64();
     while(*flag<reduce_id) { if(clock64()-s>2ull*TIMEOUT) {printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n",blockIdx.x,threadIdx.x,reduce_id,*flag);break;} }
   }
-  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
 } //fp16 inplace allgather kernel (Hopper) MC
 
 #else
@@ -608,28 +629,31 @@ __global__ void
 __launch_bounds__(MAX_THREADS)
 userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8(const int op,const int flagoffset,const int firstrank,const int myrank,const int gpustep,const int mylineoffset,const int totallines, const int rowlines, const int skiplines, void **commbuff,const int handleridx,void* outbuf, float* scale) {
   __shared__ int4* userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
+  int lastSM=0;
   half hscale = (half) *scale;
   //if(blockIdx.x==0 && threadIdx.x==0) printf("%d/%d(phys %d gpustep %d firstrank %d):RRkernel(d) start, size %lld\n",myrank,RANKS,gpustep*myrank+firstrank,gpustep,firstrank,numlines*16ull);
   if(threadIdx.x<RANKS) {
     physgpu = myrank*gpustep+firstrank;
     targetgpu = threadIdx.x*gpustep+firstrank;
-    const int blockflagoffset=NVTE_MAX_NVLINK*2*blockIdx.x;
     myptr = (reinterpret_cast<int*>(commbuff[physgpu]))+flagoffset;
     reduceidptr = myptr-NVTE_MAX_OPS;//+op;
     reduce_id=(*reduceidptr)+1;
-    flagptr = (reinterpret_cast<int*>(commbuff[targetgpu]))+flagoffset+blockflagoffset;
-    myptr+=blockflagoffset;
-
-    flagptr[physgpu]=reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    if(blockIdx.x==0) flagptr[physgpu] = reduce_id;
     volatile int* flag = (volatile int*)&(myptr[targetgpu]);
     userptr[threadIdx.x]=reinterpret_cast<int4*>(commbuff[targetgpu+handleridx]);
     clock_t s = clock64();
     while(*flag<reduce_id) {if(clock64()-s>TIMEOUT) {printf("[%d] NVONLY RSBAR:SM %d [%d]:expecting %d got %d\n",myrank,blockIdx.x,threadIdx.x,reduce_id,*flag);break;}}
   }
   __syncthreads();
-
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1;
+  }
   int warp=blockIdx.x+(threadIdx.x>>5);
   int dest[RANKS];
   #pragma unroll
@@ -661,7 +685,7 @@ userbuffers_fp16_sum_inplace_gpu_rr_rs_oop_fp8(const int op,const int flagoffset
         ((int4*)outbuf)[(hline/rowlines)*skiplines+(hline%rowlines)]=sum[1];
       }
 
-  if(threadIdx.x==0 && blockIdx.x==0) *reduceidptr=reduce_id;
+  if (threadIdx.x == 0 && lastSM) *reduceidptr = reduce_id;
 } //fp16 reduce-scatter kernel (out of place) (fp8->fp16)
 
 
@@ -672,19 +696,16 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                            const int mylineoffset, const int totallines,
                                            void **commbuff, const int handleridx) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
-
-    flagptr[physgpu] = reduce_id;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
     volatile int *flag = (volatile int *)&(myptr[targetgpu]);
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
     clock_t s = clock64();
@@ -719,7 +740,26 @@ __global__ void __launch_bounds__(MAX_THREADS)
       userptr[myrank][mylineoffset + line + totallines * dest[i]] = val[i];
     }
   }
-  if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
+  __shared__ int lastSM;
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1; else lastSM=0;
+  }
+  __syncthreads();
+  if (lastSM && threadIdx.x < RANKS) {
+    if(threadIdx.x==0)*reduceidptr = reduce_id;
+    flagptr[physgpu] = reduce_id;
+    volatile int *flag = (volatile int *)&myptr[targetgpu];
+    clock_t s = clock64();
+    while (*flag < reduce_id) {
+      if (clock64() - s > 2ull * TIMEOUT) {
+      printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x,
+               threadIdx.x, reduce_id, *flag);
+        break;
+      }
+    }
+  }
 }  // fp16 inplace reduce kernel (Ampere)
 
 template <int RANKS>
@@ -729,20 +769,18 @@ __global__ void __launch_bounds__(MAX_THREADS)
                                            const int mylineoffset, const int totallines,
                                            void **commbuff, const int handleridx) {
   __shared__ int4 *userptr[RANKS];
-  int *flagptr, physgpu, targetgpu, *myptr;
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
   int *reduceidptr, reduce_id;
   int4 *localptr;
   if (threadIdx.x < RANKS) {
     physgpu = myrank * gpustep + firstrank;
     targetgpu = threadIdx.x * gpustep + firstrank;
-    const int blockflagoffset = NVTE_MAX_NVLINK * 2 * blockIdx.x;
     myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
     reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
     reduce_id = (*reduceidptr) + 1;
-    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
-    myptr += blockflagoffset;
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
     userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
-    reduce_id++;
   }
   __syncthreads();
   localptr = userptr[myrank];
@@ -793,19 +831,26 @@ __global__ void __launch_bounds__(MAX_THREADS)
   if (threadIdx.x == 0) __threadfence_system();
   __syncthreads();
 
-  if (threadIdx.x < RANKS) {
+  __shared__ int lastSM;
+  if(threadIdx.x==0) {
+    const int adder = blockIdx.x==0 ? NVTE_MAX_SMS-gridDim.x+1 : 1;
+    int old_val = atomicAdd(myptr+(NVTE_MAX_NVLINK*2),adder);
+    if(old_val+adder==NVTE_MAX_SMS*reduce_id) lastSM=1; else lastSM=0;
+  }
+  __syncthreads();
+  if (lastSM && threadIdx.x < RANKS) {
+    if(threadIdx.x==0)*reduceidptr = reduce_id;
     flagptr[physgpu] = reduce_id;
     volatile int *flag = (volatile int *)&myptr[targetgpu];
     clock_t s = clock64();
     while (*flag < reduce_id) {
       if (clock64() - s > 2ull * TIMEOUT) {
-        printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x, threadIdx.x, reduce_id,
-               *flag);
+        printf("NVONLY AGBAR:SM %d [%d]:expecting %d got %d\n", blockIdx.x,
+               threadIdx.x, reduce_id, *flag);
         break;
       }
     }
   }
-  if (threadIdx.x == 0 && blockIdx.x == 0) *reduceidptr = reduce_id;
 }  // fp16 inplace allgather kernel (Volta,Hopper)
 
 template <int RANKS>
