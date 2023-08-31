@@ -258,7 +258,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size[1] = fc2_weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
 
-                if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                if ub_obj_fc2out.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                     fc2_out_index = tex.FP8FwdTensors.GEMM2_OUTPUT
                     fc2_meta_tensor = fp8_meta["scaling_fwd"]
                     fc2_te_type = fp8_dtype_forward
@@ -608,7 +608,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 if ctx.ub_bulk_wgrad: # allocate dgrad output
                     ub_obj_dgrad = get_ub("fc1_wgrad")
                     fc1_dgrad = ub_obj_dgrad.get_ubuf_output(1) # AllGather output
-                    if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                    if ub_obj_dgrad.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                         out_index = tex.FP8BwdTensors.GRAD_INPUT2
                         meta_tensor = ctx.fp8_meta["scaling_bwd"]
                         out_te_type = fp8_dtype_backward
@@ -722,7 +722,7 @@ class _LayerNormMLP(torch.autograd.Function):
                     # FC1 WGRAD
                     extra_output_tensor = None
                     if ctx.ub_bulk_wgrad:
-                        if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                        if ub_obj_dgrad.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                             dim_size = list(ub_obj_dgrad.get_ubuf_output(0).size()) # Reduce-scatter output
                             extra_output_tensor = torch.empty(dim_size, dtype=ctx.activation_dtype, device=fc1_dgrad.device)
                             fc1_dgrad = extra_output_tensor

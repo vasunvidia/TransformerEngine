@@ -384,6 +384,10 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     output_tensor = torch::from_blob(ubuf_wt_ptr, {output_c_dim0, output_c_dim1}, _ubuf.options());
     return output_tensor;
   }
+
+  bool is_fp8_ubuf () {
+    return (_ubuf.element_size() == 1);
+  }
 };  // UbufCommOverlap
 
 struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {

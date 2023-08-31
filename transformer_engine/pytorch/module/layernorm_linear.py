@@ -336,7 +336,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     ctx.fp8_meta["recipe"], fprop_tensor=False
                 )
                 out_index, meta_tensor, out_te_type, out_type = None, None, None, ctx.activation_dtype
-                if ctx.ub_bulk_wgrad and bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                if ctx.ub_bulk_wgrad and ub_obj_dgrad.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                     out_index = tex.FP8BwdTensors.GRAD_INPUT1
                     meta_tensor = ctx.fp8_meta["scaling_bwd"]
                     out_te_type = fp8_dtype_backward
@@ -395,7 +395,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     # WGRAD
                     extra_output_tensor = None
                     if ctx.ub_bulk_wgrad:
-                        if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                        if ub_obj_dgrad.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                             dim_size = list(ub_obj_dgrad.get_ubuf_output(0).size()) # Reduce-scatter output
                             extra_output_tensor = torch.empty(dim_size, dtype=ctx.activation_dtype, device=dgrad.device)
                             dgrad = extra_output_tensor

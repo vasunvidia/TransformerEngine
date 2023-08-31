@@ -165,7 +165,7 @@ class _Linear(torch.autograd.Function):
                 dim_size[1] = weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
-                if bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
+                if ub_obj_projout.is_fp8_ubuf(): #bool(int(os.getenv("NVTE_UB_FP8_RS", "0"))):
                     proj_out_index = tex.FP8FwdTensors.GEMM1_OUTPUT
                     meta_tensor = fp8_meta["scaling_fwd"]
                     proj_out_tetype = fp8_dtype_forward
