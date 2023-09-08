@@ -19,6 +19,8 @@ from transformer_engine.pytorch.cpp_extensions.fused_attn import (
     fused_attn_bwd_qkvpacked,
     fused_attn_fwd_kvpacked,
     fused_attn_bwd_kvpacked,
+    fused_attn_fwd_q_k_v,
+    fused_attn_bwd_q_k_v,
     QKVLayout,
     AttnBiasType,
     AttnMaskType,
@@ -36,6 +38,7 @@ from transformer_engine.pytorch.constants import (
     AttnMaskTypes,
     AttnTypes,
     AttnBiasTypes,
+    QKVLayouts,
     dist_group_type,
     TE_DType,
 )
@@ -55,7 +58,6 @@ if _flash_attn_2_available:
     from flash_attn_2_cuda import varlen_bwd as flash_attn_cuda_bwd # pylint: disable=no-name-in-module
 else:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func as flash_attn_forward_func # pylint: disable=no-name-in-module,ungrouped-imports
-
 
 __all__ = ["DotProductAttention", "MultiheadAttention"]
 
@@ -127,64 +129,6 @@ class _SplitLastDim(torch.autograd.Function):
 
         return torch.cat(grad_outputs, dim = -1), None
 
-class _CombineQKV(torch.autograd.Function):
-    """"""
-
-    @staticmethod
-    def forward(ctx,
-                query_layer: torch.Tensor,
-                key_layer: torch.Tensor, # pylint: disable=unused-argument
-                value_layer: torch.Tensor, # pylint: disable=unused-argument
-                dim: int,
-    ) -> torch.Tensor:
-
-        mixed_layer = torch.Tensor().to(device=query_layer.device,
-                                dtype=query_layer.dtype)
-        new_shape = list(query_layer.shape)
-        new_shape[dim] = new_shape[dim] * 3
-        mixed_layer.set_(query_layer.untyped_storage(),
-                 query_layer.storage_offset(),
-                 new_shape,
-                 query_layer.stride())
-        ctx.dim = dim
-        return mixed_layer
-
-    @staticmethod
-    def backward(ctx,
-                 *grad_outputs,
-    ) -> Tuple[torch.Tensor, ...]:
-        assert len(grad_outputs) > 0, "No gradients received for backprop!"
-        tensors = split_tensor_along_dim(grad_outputs[0], ctx.dim, 3)
-        return tensors[0], tensors[1], tensors[2], None
-
-class _CombineKV(torch.autograd.Function):
-    """"""
-
-    @staticmethod
-    def forward(ctx,
-                key_layer: torch.Tensor,
-                value_layer: torch.Tensor, # pylint: disable=unused-argument
-                dim: int,
-    ) -> torch.Tensor:
-
-        mixed_layer = torch.Tensor().to(device=key_layer.device,
-                                dtype=key_layer.dtype)
-        new_shape = list(key_layer.shape)
-        new_shape[dim] = new_shape[dim] * 2
-        mixed_layer.set_(key_layer.untyped_storage(),
-                 key_layer.storage_offset(),
-                 new_shape,
-                 key_layer.stride())
-        ctx.dim = dim
-        return mixed_layer
-
-    @staticmethod
-    def backward(ctx,
-                 *grad_outputs,
-    ) -> Tuple[torch.Tensor, ...]:
-        assert len(grad_outputs) > 0, "No gradients received for backprop!"
-        tensors = split_tensor_along_dim(grad_outputs[0], ctx.dim, 2)
-        return tensors[0], tensors[1], None
 
 class UnfusedDotProductAttention(torch.nn.Module):
     """Parallel attention w/o QKV and Proj Gemms
@@ -220,6 +164,9 @@ class UnfusedDotProductAttention(torch.nn.Module):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
+        qkv_layout: str = "sb3hd",
+        cu_seqlens_q: Optional[torch.Tensor] = None, # pylint: disable=unused-argument
+        cu_seqlens_kv: Optional[torch.Tensor] = None, # pylint: disable=unused-argument
         attn_mask_type: str = "causal",
         attention_mask: Optional[torch.Tensor] = None,
         core_attention_bias_type: str = "no_bias",
@@ -227,6 +174,16 @@ class UnfusedDotProductAttention(torch.nn.Module):
     ) -> torch.Tensor:
         """core attention fprop"""
 
+        qkv_format = ''.join([i for i in qkv_layout.split('_')[0] if i.isalpha()])
+        assert (
+            qkv_layout in QKVLayouts
+            ), f"UnfusedDotProductAttention does not support qkv_layout = {qkv_layout}!"
+        assert (qkv_format != 'thd'
+            ), """UnfusedDotProductAttention currently does not support inputs
+            with variable sequence lengths!"""
+        if qkv_format == 'bshd':
+            query_layer, key_layer, value_layer = [x.transpose(0, 1)
+                for x in [query_layer, key_layer, value_layer]]
         assert (
             attn_mask_type in AttnMaskTypes
         ), f"attn_mask_type {attn_mask_type} not supported"
@@ -242,7 +199,6 @@ class UnfusedDotProductAttention(torch.nn.Module):
             key_layer.size(0),
         )
 
-        assert key_layer.shape == value_layer.shape, "Keys and values must have the same shape!"
         if key_layer.shape[2] != query_layer.shape[2]:
             assert (query_layer.shape[2]%key_layer.shape[2]==0
                 ),"The number of attention heads must be divisible by the number of GQA groups!"
@@ -352,11 +308,19 @@ class UnfusedDotProductAttention(torch.nn.Module):
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
 
-        # [b, np, sq, hn] --> [sq, b, np, hn]
-        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+        if qkv_format == 'sbhd':
+            # [b, np, sq, hn] --> [sq, b, np, hn]
+            context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
-        # [sq, b, np, hn] --> [sq, b, hp]
-        context_layer = context_layer.view(seqlen, batch_size, -1)
+            # [sq, b, np, hn] --> [sq, b, hp]
+            context_layer = context_layer.view(seqlen, batch_size, -1)
+
+        if qkv_format == 'bshd':
+            # [b, np, sq, hn] --> [b, sq, np, hn]
+            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+
+            # [b, sq, np, hn] --> [b, sq, hp]
+            context_layer = context_layer.view(batch_size, seqlen, -1)
 
         return context_layer
 
@@ -391,66 +355,95 @@ class _PrepareQKVForFA(torch.autograd.Function):
         dq, dk, dv = split_tensor_along_dim(dqkv, -1, 3)
         return dq, dk, dv
 
+def _get_qkv_layout(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        qkv_format: str = 'sbhd',
+    ) -> str:
+    """Get qkv layout.
 
-def _check_qkv_layout(q, k, v):
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor.
+    k: torch.Tensor
+        Key tensor.
+    v: torch.Tensor
+        Value tensor.
+    qkv_format: str, default = `sbhd`
+        Dimension format for `q`, `k` and `v`, {`sbhd`, `bshd`, `thd`}. `s` is
+        the sequence length dimension, `b` the batch size, `h` the number of heads,
+        `d` the head size, and `t` the total number of sequences in a batch,
+        `t = sum(s_i) for i = 0...b-1`.
+
+    Returns
+    ----------
+    qkv_layout: str
+       Memory layout of `q`, `k` and `v`. Each `qkv_format` can be mapped into one of five
+       memory layouts:
+       `sbhd`: {`sb3hd`, `sbh3d`, `sbhd_sb2hd`, `sbhd_sbh2d`, `sbhd_sbhd_sbhd`}
+       `bshd`: {`bs3hd`, `bsh3d`, `bshd_bs2hd`, `bshd_bsh2d`, `bshd_bshd_bshd`}
+       `thd` : {`t3hd`, `th3d`, `thd_t2hd`, `thd_th2d`, `thd_thd_thd`}
+    """
+
+    check_last_dim_contiguous = all(x.stride(-1) == 1 for x in [q, k, v])
+    assert check_last_dim_contiguous, "q, k and v must have stride 1 in their last dimension!"
+
     data_ptr = q.untyped_storage().data_ptr()
-    check_ptrs = all(x.untyped_storage().data_ptr() == data_ptr for x in [q, k, v])
-    if not check_ptrs:
-        return False
+    check_ptrs_qkv = all(x.untyped_storage().data_ptr() == data_ptr for x in [q, k, v])
+    data_ptr = k.untyped_storage().data_ptr()
+    check_ptrs_kv = all(x.untyped_storage().data_ptr() == data_ptr for x in [k, v])
 
     stride = q.stride()
-    check_strides = all(stride == x.stride() for x in [q, k, v])
-    if not check_strides:
-        return False
+    check_strides_qkv = all(stride == x.stride() for x in [q, k, v])
+    stride = k.stride()
+    check_strides_kv = all(stride == x.stride() for x in [k, v])
 
     shape = q.shape
-    check_shapes = all(shape == x.shape for x in [q, k, v])
-    if not check_shapes:
-        return False
-
-    last_dim_size = shape[-1]
-    check_offsets = all(i * last_dim_size == x.storage_offset()
-                        for i, x in enumerate([q, k, v]))
-    if check_offsets:
-        return "sbh3d"
-
-    last_dims_size = shape[-1] * shape[-2]
-    check_offsets = all(i * last_dims_size == x.storage_offset()
-                        for i, x in enumerate([q, k, v]))
-    if check_offsets:
-        return "sb3hd"
-
-    return "other"
-
-def _check_kv_layout(k, v):
-    data_ptr = k.untyped_storage().data_ptr()
-    check_ptrs = all(x.untyped_storage().data_ptr() == data_ptr for x in [k, v])
-    if not check_ptrs:
-        return False
-
-    stride = k.stride()
-    check_strides = all(stride == x.stride() for x in [k, v])
-    if not check_strides:
-        return False
-
+    check_shapes_qkv = all(shape == x.shape for x in [q, k, v])
     shape = k.shape
-    check_shapes = all(shape == x.shape for x in [k, v])
-    if not check_shapes:
-        return False
+    check_shapes_kv = all(shape == x.shape for x in [k, v])
 
-    last_dim_size = shape[-1]
-    check_offsets = all(i * last_dim_size == x.storage_offset()
+    last_dim_size = q.shape[-1]
+    check_last_dim_offsets_qkv = all(i * last_dim_size == x.storage_offset()
+                        for i, x in enumerate([q, k, v]))
+    last_dim_size = k.shape[-1]
+    check_last_dim_offsets_kv = all(i * last_dim_size == x.storage_offset()
                         for i, x in enumerate([k, v]))
-    if check_offsets:
-        return "sbh2d"
 
-    last_dims_size = shape[-1] * shape[-2]
-    check_offsets = all(i * last_dims_size == x.storage_offset()
+    last_two_dims_size = q.shape[-1] * q.shape[-2]
+    check_last_two_dims_offsets_qkv = all(i * last_two_dims_size == x.storage_offset()
+                        for i, x in enumerate([q, k, v]))
+    last_two_dims_size = k.shape[-1] * k.shape[-2]
+    check_last_two_dims_offsets_kv = all(i * last_two_dims_size == x.storage_offset()
                         for i, x in enumerate([k, v]))
-    if check_offsets:
-        return "sb2hd"
 
-    return "other"
+    qkv_layout = None
+    if (check_ptrs_qkv and check_strides_qkv and check_shapes_qkv
+        and check_last_two_dims_offsets_qkv
+        and not check_last_dim_offsets_qkv):
+        # sb3hd, bs3hd, t3hd
+        qkv_layout = qkv_format[:-2] + '3' + qkv_format[-2:]
+    elif check_ptrs_qkv and check_strides_qkv and check_shapes_qkv and check_last_dim_offsets_qkv:
+        # sbh3d, bsh3d, th3d
+        qkv_layout = qkv_format[:-1] + '3' + qkv_format[-1:]
+    elif (check_ptrs_kv and check_strides_kv and check_shapes_kv
+        and check_last_two_dims_offsets_kv
+        and not check_last_dim_offsets_kv):
+        # sbhd_sb2hd, bshd_bs2hd, thd_t2hd
+        qkv_layout = qkv_format + '_' + qkv_format[:-2] + '2' + qkv_format[-2:]
+    elif (check_ptrs_kv and check_strides_kv and check_shapes_kv
+        and check_last_dim_offsets_kv):
+        # sbhd_sbh2d, bshd_bsh2d, thd_th2d
+        qkv_layout = qkv_format + '_' + qkv_format[:-1] + '2' + qkv_format[-1:]
+    elif check_strides_kv and check_shapes_kv:
+        # sbhd_sbhd_sbhd, bshd_bshd_bshd, thd_thd_thd
+        qkv_layout = '_'.join(list([qkv_format])*3)
+    else:
+        raise Exception("The provided qkv memory layout is not supported!")
+
+    return qkv_layout
 
 
 class FlashAttention(torch.nn.Module):
@@ -481,6 +474,9 @@ class FlashAttention(torch.nn.Module):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
+        qkv_layout: str = "sb3hd",
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
         attn_mask_type: str = "causal",
     ) -> torch.Tensor:
         """flash-attn fprop"""
@@ -489,52 +485,86 @@ class FlashAttention(torch.nn.Module):
             query_layer.dtype in [torch.float16, torch.bfloat16]
             and key_layer.dtype in [torch.float16, torch.bfloat16]
             and value_layer.dtype in [torch.float16, torch.bfloat16]
-            ), 'FlashAttention currently only supports FP16 and BF16.'
+            ), "FlashAttention currently only supports FP16 and BF16."
         assert (
             query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda
-            ), 'FlashAttention currently only supports CUDA tensors.'
+            ), "FlashAttention currently only supports CUDA tensors."
+        assert (
+            qkv_layout in QKVLayouts
+            ), f"FlashAttention does not support {qkv_layout} qkv_layout!"
 
-        # For now just 128, will make it more general in the future
+        qkv_format = ''.join([i for i in qkv_layout.split('_')[0] if i.isalpha()])
 
-        if (query_layer.shape[-1] == 128 and
-            query_layer.shape[0] * query_layer.shape[1] >= 512 and
-            _check_qkv_layout(query_layer, key_layer, value_layer) == "sbh3d"):
-            query_layer, key_layer, value_layer = _PrepareQKVForFA.apply(query_layer,
-                                                                         key_layer,
-                                                                         value_layer)
-        else:
-            query_layer, key_layer, value_layer = [x.transpose(0,1).contiguous()
-                           for x in (query_layer, key_layer, value_layer)]
+        if qkv_format == 'sbhd':
+            # For now just 128, will make it more general in the future
+            if (query_layer.shape[-1] == 128 and
+                query_layer.shape[0] * query_layer.shape[1] >= 512 and
+                qkv_layout == "sbh3d"):
+                query_layer, key_layer, value_layer = _PrepareQKVForFA.apply(query_layer,
+                                                                             key_layer,
+                                                                             value_layer)
+            else:
+                query_layer, key_layer, value_layer = [x.contiguous()
+                    for x in (query_layer, key_layer, value_layer)]
+                query_layer, key_layer, value_layer = [x.transpose(0,1).contiguous()
+                    for x in (query_layer, key_layer, value_layer)]
 
-        batch_size, seqlen = query_layer.shape[0], query_layer.shape[1]
+        if qkv_format == 'bshd':
+            query_layer, key_layer, value_layer = [x.contiguous()
+                for x in (query_layer, key_layer, value_layer)]
 
-        # [b, sq, np, hn]
-        query_layer, key_layer, value_layer = [
-            x.view(x.shape[0] * x.shape[1], *x.shape[2:])
-            for x in [query_layer, key_layer, value_layer]
-        ]
+        # qkv layout at this point is all bshd_bshd_bshd
+        if qkv_format in ['sbhd', 'bshd']:
+            batch_size = query_layer.shape[0]
+            max_seqlen_q = query_layer.shape[1]
+            max_seqlen_kv = key_layer.shape[1]
+            if cu_seqlens_q is None:
+                cu_seqlens_q = torch.arange(
+                        0,
+                        (batch_size + 1) * max_seqlen_q,
+                        step=max_seqlen_q,
+                        dtype=torch.int32,
+                        device=query_layer.device)
+            if cu_seqlens_kv is None:
+                cu_seqlens_kv = torch.arange(
+                        0,
+                        (batch_size + 1) * max_seqlen_kv,
+                        step=max_seqlen_kv,
+                        dtype=torch.int32,
+                        device=key_layer.device)
+            query_layer, key_layer, value_layer = [x.view(x.shape[0] * x.shape[1], *x.shape[2:])
+                for x in [query_layer, key_layer, value_layer]
+            ]
 
-        max_seqlen = seqlen
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * seqlen,
-            step=seqlen,
-            dtype=torch.int32,
-            device=query_layer.device)
+        if qkv_format == 'thd':
+            assert (_flash_attn_2_available
+                ), "flash-attn v2 is required to process inputs with variable sequence lengths!"
+            assert (cu_seqlens_q is not None and cu_seqlens_kv is not None
+                ), "cu_seqlens_q and cu_seqlens_kv are required for qkv_format = thd!"
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
+            max_seqlen_q = seqlens_q.max().item()
+            max_seqlen_kv = seqlens_kv.max().item()
 
         with self.attention_dropout_ctx():
             fa_optional_forward_kwargs = {}
             if not _flash_attn_2_available:
                 fa_optional_forward_kwargs["deterministic"] = self.deterministic
             output = flash_attn_forward_func(
-                query_layer, key_layer, value_layer, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                query_layer, key_layer, value_layer, cu_seqlens_q, cu_seqlens_kv,
+                max_seqlen_q, max_seqlen_kv,
                 self.attention_dropout if self.training else 0.0,
                 softmax_scale=1.0/self.norm_factor, causal=attn_mask_type=="causal",
                 **fa_optional_forward_kwargs
             )
 
-        # [(b sq), np, hn] -> [sq, b, (np hn)]
-        return output.view(batch_size, seqlen, -1).transpose(0, 1).contiguous()
+        if qkv_format == 'sbhd':
+            # bshd -> bs(hd) -> sb(hd)
+            output = output.view(batch_size, max_seqlen_q, -1).transpose(0, 1).contiguous()
+        if qkv_format == 'bshd':
+            # bshd -> bs(hd)
+            output = output.view(batch_size, max_seqlen_q, -1).contiguous()
+        return output
 
 
 class FusedAttnFunc_qkvpacked(torch.autograd.Function):
@@ -670,6 +700,62 @@ class FusedAttnFunc_kvpacked(torch.autograd.Function):
                 None, None, None, None, None, None,
                 None, None, None, None, None, None)
 
+class FusedAttnFunc_q_k_v(torch.autograd.Function):
+    """Function for FusedAttention with separate QKV input"""
+
+    @staticmethod
+    def forward(ctx, is_training, max_seqlen_q, max_seqlen_kv, cu_seqlens_q, cu_seqlens_kv,
+                q, k, v, qkv_dtype, attn_bias, attn_scale, dropout_p, fast_zero_fill,
+                qkv_layout, attn_bias_type, attn_mask_type,
+                rng_gen, fused_attention_backend):
+        out, aux_ctx_tensors = fused_attn_fwd_q_k_v(
+            is_training, max_seqlen_q, max_seqlen_kv, cu_seqlens_q, cu_seqlens_kv,
+            q, k, v, qkv_dtype, fused_attention_backend, attn_bias,
+            None, None, None, None, None,
+            attn_scale, dropout_p, fast_zero_fill, qkv_layout, attn_bias_type, attn_mask_type,
+            rng_gen)
+
+        ctx.save_for_backward(q, k, v, out, cu_seqlens_q, cu_seqlens_kv)
+        ctx.aux_ctx_tensors = aux_ctx_tensors
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_kv = max_seqlen_kv
+        ctx.qkv_dtype = qkv_dtype
+        ctx.attn_scale = attn_scale
+        ctx.dropout_p = dropout_p
+        ctx.fast_zero_fill = fast_zero_fill
+        ctx.qkv_layout = qkv_layout
+        ctx.attn_bias_type = attn_bias_type
+        ctx.attn_mask_type = attn_mask_type
+        ctx.fused_attention_backend = fused_attention_backend
+
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        q, k, v, out, cu_seqlens_q, cu_seqlens_kv = ctx.saved_tensors
+        dq, dk, dv, *rest = fused_attn_bwd_q_k_v(
+            ctx.max_seqlen_q, ctx.max_seqlen_kv, cu_seqlens_q, cu_seqlens_kv,
+            q, k, v, out, d_out,
+            ctx.qkv_dtype, ctx.aux_ctx_tensors,
+            ctx.fused_attention_backend,
+            None, None, None, None, None, None, None, None, None,
+            ctx.attn_scale, ctx.dropout_p, ctx.fast_zero_fill,
+            ctx.qkv_layout, ctx.attn_bias_type, ctx.attn_mask_type)
+
+        # if no_bias, return dqkv
+        if ctx.attn_bias_type == "no_bias":
+            ret = (None, None, None, None, None, dq, dk, dv, None, None, None,
+                    None, None, None, None, None, None,
+                    None, None, None, None, None, None)
+            return ret
+            #return (None, None, None, None, None, dq, dk, dv, None, None, None, None,
+            #        None, None, None, None, None, None,
+            #        None, None, None, None, None, None)
+        # else, return (dqkv, dbias)
+        return (None, None, None, None, None, dq, dk, dv, None, rest[0], None,
+                None, None, None, None, None, None,
+                None, None, None, None, None, None)
+
 class FusedAttention(torch.nn.Module):
     """Dot product attention, with multiple backends:
 
@@ -709,7 +795,7 @@ class FusedAttention(torch.nn.Module):
         self.attention_dropout = attention_dropout
         self.attention_dropout_ctx = attention_dropout_ctx
         self.attention_type = attention_type
-        self.use_FAv2_bwd = (os.getenv("NVTE_FUSED_ATTN_USE_FAv2_BWD", "1") == "1"
+        self.use_FAv2_bwd = (os.getenv("NVTE_FUSED_ATTN_USE_FAv2_BWD", "0") == "1"
                         and _flash_attn_2_available
                         and get_device_compute_capability() == 9.0)
 
@@ -718,6 +804,9 @@ class FusedAttention(torch.nn.Module):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
+        qkv_layout: str = "sb3hd",
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
         attn_mask_type: str = "causal",
         fused_attention_backend:
             tex.NVTE_Fused_Attn_Backend = tex.NVTE_Fused_Attn_Backend.NVTE_No_Backend,
@@ -738,132 +827,59 @@ class FusedAttention(torch.nn.Module):
         assert (
             query_layer.is_cuda and key_layer.is_cuda and value_layer.is_cuda
             ), 'FusedAttention only supports CUDA tensors.'
+        assert (
+            qkv_layout in QKVLayouts
+            ), f"FusedAttention does not support qkv_layout = {qkv_layout}!"
+
+        qkv_format = ''.join([i for i in qkv_layout.split('_')[0] if i.isalpha()])
+        if qkv_format in ['sbhd', 'bshd']:
+            batch_size = query_layer.shape[1] if qkv_format == 'sbhd' else query_layer.shape[0]
+            max_seqlen_q = query_layer.shape[0] if qkv_format == 'sbhd' else query_layer.shape[1]
+            max_seqlen_kv = key_layer.shape[0] if qkv_format == 'sbhd' else key_layer.shape[1]
+            if cu_seqlens_q is None:
+                cu_seqlens_q = torch.arange(
+                        0,
+                        (batch_size + 1) * max_seqlen_q,
+                        step=max_seqlen_q,
+                        dtype=torch.int32,
+                        device=query_layer.device)
+            if cu_seqlens_kv is None:
+                cu_seqlens_kv = torch.arange(
+                        0,
+                        (batch_size + 1) * max_seqlen_kv,
+                        step=max_seqlen_kv,
+                        dtype=torch.int32,
+                        device=key_layer.device)
+        if qkv_format == 'thd':
+            assert (cu_seqlens_q is not None and cu_seqlens_kv is not None
+                ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
+            max_seqlen_q = seqlens_q.max().item()
+            max_seqlen_kv = seqlens_kv.max().item()
 
         qkv_dtype = TE_DType[query_layer.dtype]
-        seqlen_q, batch_size = query_layer.shape[0], query_layer.shape[1]
-        seqlen_kv = key_layer.shape[0]
-        max_seqlen_q = seqlen_q
-        max_seqlen_kv = seqlen_kv
 
-        if self.attention_type == "self":
-            qkv_layout = _check_qkv_layout(query_layer, key_layer, value_layer)
-            if qkv_layout == "sbh3d":
-                mixed_layer = _CombineQKV.apply(query_layer, key_layer, value_layer, 3)
-                # [s, b, h, 3, d]
-                mixed_layer = mixed_layer.view(
-                        *mixed_layer.shape[0:3], 3, query_layer.shape[-1])
-                # [b, s, 3, h, d]
-                mixed_layer = mixed_layer.transpose(2, 3).transpose(0, 1).contiguous()
-            elif qkv_layout == "sb3hd":
-                mixed_layer = _CombineQKV.apply(query_layer, key_layer, value_layer, 2)
-                # [s, b, 3, h, d]
-                mixed_layer = mixed_layer.view(
-                        *mixed_layer.shape[0:2], 3, *query_layer.shape[2:])
-                # [b, s, 3, h, d]
-                mixed_layer = mixed_layer.transpose(0, 1).contiguous()
-            else:
-                raise Exception("FusedAttention only supports qkv layout sbh3d or sb3hd!")
+        with self.attention_dropout_ctx():
+            output = FusedAttnFunc_q_k_v.apply(
+                self.training,
+                max_seqlen_q, max_seqlen_kv,
+                cu_seqlens_q, cu_seqlens_kv,
+                query_layer, key_layer, value_layer,
+                qkv_dtype,
+                core_attention_bias,
+                1.0/self.norm_factor,
+                self.attention_dropout if self.training else 0.0,
+                fast_zero_fill,
+                qkv_layout,
+                core_attention_bias_type,
+                attn_mask_type,
+                None, # rng_gen
+                fused_attention_backend,
+            )
 
-            # [total_seqs, 3, h, d]
-            mixed_layer = mixed_layer.view(
-                mixed_layer.shape[0] * mixed_layer.shape[1], *mixed_layer.shape[2:])
-
-            qkv_layout = "qkv_interleaved"
-            max_seqlen = seqlen_q
-            cu_seqlens = torch.arange(
-                0,
-                (batch_size + 1) * seqlen_q,
-                step=seqlen_q,
-                dtype=torch.int32,
-                device=query_layer.device)
-            use_FAv2_bwd = (self.use_FAv2_bwd
-                        and (fused_attention_backend
-                            == tex.NVTE_Fused_Attn_Backend.NVTE_F16_arbitrary_seqlen)
-                        and core_attention_bias_type == "no_bias")
-
-            with self.attention_dropout_ctx():
-                output = FusedAttnFunc_qkvpacked.apply(
-                    self.training,
-                    max_seqlen,
-                    cu_seqlens,
-                    mixed_layer,
-                    qkv_dtype,
-                    core_attention_bias,
-                    1.0/self.norm_factor,
-                    self.attention_dropout if self.training else 0.0,
-                    fast_zero_fill,
-                    qkv_layout,
-                    core_attention_bias_type,
-                    attn_mask_type,
-                    None, # rng_gen
-                    fused_attention_backend,
-                    use_FAv2_bwd
-                )
-            output = output.view(batch_size, seqlen_q, -1).transpose(0, 1).contiguous()
-
-        if self.attention_type == "cross":
-            kv_layout = _check_kv_layout(key_layer, value_layer)
-            if kv_layout == "sbh2d":
-                key_value = _CombineKV.apply(key_layer, value_layer, 3)
-                # [s, b, h, 2, d]
-                key_value = key_value.view(
-                        *key_value.shape[0:3], 2, key_layer.shape[-1])
-                # [b, s, 2, h, d]
-                key_value = key_value.transpose(2, 3).transpose(0, 1).contiguous()
-            elif qkv_layout == "sb2hd":
-                key_value = _CombineKV.apply(key_layer, value_layer, 2)
-                # [s, b, 2, h, d]
-                key_value = key_value.view(
-                        *key_value.shape[0:2], 2, *key_layer.shape[2:])
-                # [b, s, 2, h, d]
-                key_value = key_value.transpose(0, 1).contiguous()
-            else:
-                raise Exception("FusedAttention only supports kv layout sbh2d or sb2hd!")
-
-            # [total_seqs, h, d]
-            query_layer = query_layer.transpose(0, 1).contiguous()
-            query_layer = query_layer.view(
-                    query_layer.shape[0] * query_layer.shape[1], *query_layer.shape[2:])
-            # [total_seqs, 2, h, d]
-            key_value = key_value.view([key_value.shape[0] * key_value.shape[1]]
-                + key_value.shape[2:])
-
-            qkv_layout = "kv_interleaved"
-            cu_seqlens_q = torch.arange(
-                0,
-                (batch_size + 1) * seqlen_q,
-                step=seqlen_q,
-                dtype=torch.int32,
-                device=query_layer.device)
-            cu_seqlens_kv = torch.arange(
-                0,
-                (batch_size + 1) * seqlen_kv,
-                step=seqlen_kv,
-                dtype=torch.int32,
-                device=key_layer.device)
-
-            with self.attention_dropout_ctx():
-                outputs = FusedAttnFunc_kvpacked.apply(
-                    self.training,
-                    max_seqlen_q, max_seqlen_kv,
-                    cu_seqlens_q, cu_seqlens_kv,
-                    query_layer, key_value,
-                    qkv_dtype,
-                    core_attention_bias,
-                    1.0/self.norm_factor,
-                    self.attention_dropout if self.training else 0.0,
-                    fast_zero_fill,
-                    qkv_layout,
-                    core_attention_bias_type,
-                    attn_mask_type,
-                    None, # rng_gen
-                    fused_attention_backend,
-                    use_FAv2_bwd
-                )
-
-            output = (outputs[0].view(batch_size, seqlen_q, -1).transpose(0, 1).contiguous(),
-                    outputs[1].view(batch_size, seqlen_q, -1).transpose(0, 1).contiguous())
-        return output
+        # bshd -> bs(hd) or sbhd -> sb(hd)
+        return output.view(*output.shape[:-2], -1)
 
 
 class DotProductAttention(torch.nn.Module):
@@ -1030,6 +1046,9 @@ class DotProductAttention(torch.nn.Module):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         value_layer: torch.Tensor,
+        qkv_format: str = "sbhd",
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_type: str = "causal",
         checkpoint_core_attention: bool = False,
@@ -1072,6 +1091,22 @@ class DotProductAttention(torch.nn.Module):
                    Key tensor.
         value_layer : torch.Tensor
                      Value tensor.
+        qkv_format: str, default = `sbhd`
+                   Dimension format for `query_layer`, `key_layer` and `value_layer`,
+                   {`sbhd`, `bshd`, `thd`}. `s` is the sequence length dimension,
+                   `b` the batch size, `h` the number of heads, `d` the head size,
+                   and `t` the total number of sequences in a batch, `t = sum(s_i) for i = 0...b-1`.
+                   `sbhd` and `bshd` are used for cases where sequences in a batch are
+                   of equal length or padded to the same length, and `thd` is used for when
+                   sequence lengths in a batch are different. These formats do not describe
+                   how `query_layer`, `key_layer` and `value_layer`
+                   are laid out in memory, for which, please see `_get_qkv_layout`.
+        cu_seqlens_q: Optional[torch.Tensor], default = `None`
+                   Cumulative sum of sequence lengths in a batch for `query_layer`,
+                   with shape [batch_size + 1] and dtype torch.int32.
+        cu_seqlens_kv: Optional[torch.Tensor], default = `None`
+                   Cumulative sum of sequence lengths in a batch for `key_layer` and `value_layer`,
+                   with shape [batch_size + 1] and dtype torch.int32.
         attention_mask : Optional[torch.Tensor], default = `None`
                         Boolean tensor used to mask out softmax input when not using flash-attn.
         attn_mask_type: {'causal', 'padding', 'no_mask'}, default = `causal`
@@ -1085,10 +1120,12 @@ class DotProductAttention(torch.nn.Module):
                     Bias type, {`no_bias`, `pre_scale_bias`, 'post_scale_bias`}
         core_attention_bias: Optional[torch.Tensor], default = `None`
                     Bias tensor for Q * K.T
-        fast_zero_fill: bool, defautl = `True`
+        fast_zero_fill: bool, default = `True`
                     Whether to use the fast path to set output tensors to 0 or not.
         """
 
+        assert (key_layer.shape == value_layer.shape
+            ), "Keys and values must have the same shape!"
         if self.attn_mask_type is not None:
             warnings.warn(
                 "Argument :attr:`attn_mask_type` has been moved to the `forward` method and"
@@ -1099,8 +1136,62 @@ class DotProductAttention(torch.nn.Module):
             attn_mask_type = self.attn_mask_type
 
         assert (key_layer.shape[-2] == self.num_gqa_groups_per_partition
-                and value_layer.shape[-2] == self.num_gqa_groups_per_partition
-                ), f"Keys and values must have {self.num_gqa_groups} heads!"
+            and value_layer.shape[-2] == self.num_gqa_groups_per_partition
+            ), f"Keys and values must have num_gqa_group = {self.num_gqa_groups} heads!"
+        assert (qkv_format in ['sbhd', 'bshd', 'thd']
+            ), "DotProductAttention only supports qkv_format = {'sbhd', 'bshd', 'thd'}!"
+
+        if qkv_format == 'thd':
+            assert (all(len(x.shape) == 3 for x in (query_layer, key_layer, value_layer))
+                ), "Queries, keys and values must be 3D tensors when qkv_format = thd!"
+            assert (cu_seqlens_q is not None and cu_seqlens_kv is not None
+                ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
+            assert (cu_seqlens_q.shape == cu_seqlens_kv.shape
+                and len(cu_seqlens_q.shape) == 1
+                and len(cu_seqlens_kv.shape) == 1
+                ), "cu_seqlens_q and cu_seqlens_q must both have shape [batch_size + 1]!"
+            assert (cu_seqlens_q.dtype == torch.int32
+                and cu_seqlens_kv.dtype == torch.int32
+                ), "cu_seqlens_q and cu_seqlens_q must have dtype torch.int32!"
+            batch_size = len(cu_seqlens_q) - 1
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
+            max_seqlen_q = seqlens_q.max().item()
+            max_seqlen_kv = seqlens_kv.max().item()
+            if (all(seqlens_q == seqlens_q[0])
+                and all(seqlens_kv == seqlens_kv[0])
+                and query_layer.shape[0] == batch_size * seqlens_q[0]
+                and key_layer.shape[0] == batch_size * seqlens_kv[0]):
+                qkv_format = 'bshd'
+                query_layer = query_layer.view(batch_size, seqlens_q[0], *query_layer.shape[-2:])
+                key_layer, value_layer = [x.view(batch_size, seqlens_kv[0], *x.shape[-2:])
+                    for x in (key_layer, value_layer)]
+                warnings.warn(
+                    """Please use qkv_format bshd instead of thd when sequences in a batch
+                    are of equal length."""
+                    )
+
+        if qkv_format in ['sbhd', 'bshd']:
+            assert (all(len(x.shape) == 4 for x in (query_layer, key_layer, value_layer))
+                ), f"Queries, keys and values must be 4D tensors when qkv_format = {qkv_format}!"
+            batch_size = query_layer.shape[1] if qkv_format == 'sbhd' else query_layer.shape[0]
+            max_seqlen_q = query_layer.shape[0] if qkv_format == 'sbhd' else query_layer.shape[1]
+            max_seqlen_kv = key_layer.shape[0] if qkv_format == 'sbhd' else key_layer.shape[1]
+            if cu_seqlens_q is not None:
+                seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                assert (all(seqlens_q <= max_seqlen_q)
+                    ), """Sequence lengths indicated by cu_seqlens_q must not be greater than
+                    the sequence dimention in the query tensor!"""
+            if cu_seqlens_kv is not None:
+                seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
+                assert (all(seqlens_kv <= max_seqlen_kv)
+                    ), """Sequence lengths indicated by cu_seqlens_kv must not be greater than
+                    the sequence dimention in the key and value tensors!"""
+
+        qkv_layout = _get_qkv_layout(query_layer,
+            key_layer,
+            value_layer,
+            qkv_format = qkv_format)
 
         use_flash_attention = self.use_flash_attention
         use_fused_attention = self.use_fused_attention
@@ -1131,8 +1222,6 @@ class DotProductAttention(torch.nn.Module):
             use_flash_attention = False
             use_fused_attention = False
 
-        qkv_layout = "qkv_interleaved" if self.attention_type == "self" else "kv_interleaved"
-
         if use_fused_attention:
             fused_attention_backend = tex.get_fused_attn_backend(
                 TE_DType[query_layer.dtype],
@@ -1141,7 +1230,7 @@ class DotProductAttention(torch.nn.Module):
                 AttnBiasType[core_attention_bias_type],
                 AttnMaskType[attn_mask_type],
                 self.attention_dropout,
-                query_layer.shape[0], key_layer.shape[0],
+                max_seqlen_q, max_seqlen_kv,
                 query_layer.shape[-1])
             # DPA does not support FP8; for FP8, use cpp_extensions modules directly
             is_backend_avail = (fused_attention_backend in
@@ -1163,9 +1252,15 @@ class DotProductAttention(torch.nn.Module):
                                                             query_layer,
                                                             key_layer,
                                                             value_layer,
-                                                            attn_mask_type=attn_mask_type)
-            return self.flash_attention(
-                query_layer, key_layer, value_layer, attn_mask_type=attn_mask_type)
+                                                            qkv_layout = qkv_layout,
+                                                            cu_seqlens_q = cu_seqlens_q,
+                                                            cu_seqlens_kv = cu_seqlens_kv,
+                                                            attn_mask_type = attn_mask_type)
+            return self.flash_attention(query_layer, key_layer, value_layer,
+                                                            qkv_layout = qkv_layout,
+                                                            cu_seqlens_q = cu_seqlens_q,
+                                                            cu_seqlens_kv = cu_seqlens_kv,
+                                                            attn_mask_type = attn_mask_type)
 
         if use_fused_attention:
             if checkpoint_core_attention:
@@ -1173,17 +1268,23 @@ class DotProductAttention(torch.nn.Module):
                               query_layer,
                               key_layer,
                               value_layer,
-                              attn_mask_type=attn_mask_type,
-                              fused_attention_backend=fused_attention_backend,
-                              core_attention_bias_type=core_attention_bias_type,
-                              core_attention_bias=core_attention_bias,
-                              fast_zero_fill=fast_zero_fill)
+                              qkv_layout = qkv_layout,
+                              cu_seqlens_q = cu_seqlens_q,
+                              cu_seqlens_kv = cu_seqlens_kv,
+                              attn_mask_type = attn_mask_type,
+                              fused_attention_backend = fused_attention_backend,
+                              core_attention_bias_type = core_attention_bias_type,
+                              core_attention_bias = core_attention_bias,
+                              fast_zero_fill = fast_zero_fill)
             return self.fused_attention(query_layer, key_layer, value_layer,
-                              attn_mask_type=attn_mask_type,
-                              fused_attention_backend=fused_attention_backend,
-                              core_attention_bias_type=core_attention_bias_type,
-                              core_attention_bias=core_attention_bias,
-                              fast_zero_fill=fast_zero_fill)
+                              qkv_layout = qkv_layout,
+                              cu_seqlens_q = cu_seqlens_q,
+                              cu_seqlens_kv = cu_seqlens_kv,
+                              attn_mask_type = attn_mask_type,
+                              fused_attention_backend = fused_attention_backend,
+                              core_attention_bias_type = core_attention_bias_type,
+                              core_attention_bias = core_attention_bias,
+                              fast_zero_fill = fast_zero_fill)
 
         if checkpoint_core_attention:
             return self._checkpointed_attention_forward(
@@ -1191,19 +1292,23 @@ class DotProductAttention(torch.nn.Module):
                 query_layer,
                 key_layer,
                 value_layer,
-                attn_mask_type=attn_mask_type,
-                attention_mask=attention_mask,
-                core_attention_bias_type=core_attention_bias_type,
-                core_attention_bias=core_attention_bias,
-            )
+                qkv_layout = qkv_layout,
+                cu_seqlens_q = cu_seqlens_q,
+                cu_seqlens_kv = cu_seqlens_kv,
+                attn_mask_type = attn_mask_type,
+                attention_mask = attention_mask,
+                core_attention_bias_type = core_attention_bias_type,
+                core_attention_bias = core_attention_bias)
         return self.unfused_attention(query_layer,
                 key_layer,
                 value_layer,
-                attn_mask_type=attn_mask_type,
-                attention_mask=attention_mask,
-                core_attention_bias_type=core_attention_bias_type,
-                core_attention_bias=core_attention_bias,
-        )
+                qkv_layout = qkv_layout,
+                cu_seqlens_q = cu_seqlens_q,
+                cu_seqlens_kv = cu_seqlens_kv,
+                attn_mask_type = attn_mask_type,
+                attention_mask = attention_mask,
+                core_attention_bias_type = core_attention_bias_type,
+                core_attention_bias = core_attention_bias)
 
 
 class MultiheadAttention(torch.nn.Module):

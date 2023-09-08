@@ -128,6 +128,229 @@ void generateMatrixStrides(
             strideA[head_dim_idx] = d;
             strideA[batch_dim_idx] = s_q * h * d;
             break;
+        default:
+            break;
+    }
+
+    switch (layout) {
+        case NVTE_QKV_Layout::NVTE_SB3HD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = 3 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * 3 * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = 3 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_transpose_dim_idx] = b * 3 * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            } else if (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_SBH3D:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = 3 * h * d;
+                    strideA[head_dim_idx] = 3 * d;
+                    strideA[seqlen_dim_idx] = b * 3 * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = 3 * h * d;
+                    strideA[head_dim_idx] = 3 * d;
+                    strideA[seqlen_transpose_dim_idx] = b * 3 * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            } else if (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_SBHD_SB2HD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = 2 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * 2 * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = 2 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_transpose_dim_idx] = b * 2 * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_SBHD_SBH2D:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = 2 * h * d;
+                    strideA[head_dim_idx] = 2 * d;
+                    strideA[seqlen_dim_idx] = b * 2 * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = 2 * h * d;
+                    strideA[head_dim_idx] = 2 * d;
+                    strideA[seqlen_transpose_dim_idx] = b * 2 * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_SBHD_SBHD_SBHD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = b * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_transpose_dim_idx] = b * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_BS3HD:
+        case NVTE_QKV_Layout::NVTE_T3HD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = s_q * 3 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = 3 * h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = s_q * 3 * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_transpose_dim_idx] = 3 * h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            } else if (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix) {
+                    strideA[batch_dim_idx] = s_q * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = h * d;
+                    strideA[hidden_dim_idx] = 1;
+            }
+            break;
+        case NVTE_QKV_Layout::NVTE_BSH3D:
+        case NVTE_QKV_Layout::NVTE_TH3D:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                     strideA[batch_dim_idx] = s_q * 3 * h * d;
+                     strideA[head_dim_idx] = 3 * d;
+                     strideA[seqlen_dim_idx] = 3 * h * d;
+                     strideA[hidden_dim_idx] = 1;
+             } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                     strideA[batch_dim_idx] = s_q * 3 * h * d;
+                     strideA[head_dim_idx] = 3 * d;
+                     strideA[seqlen_transpose_dim_idx] = 3 * h * d;
+                     strideA[hidden_transpose_dim_idx] = 1;
+             } else if (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix) {
+                     strideA[batch_dim_idx] = s_q * h * d;
+                     strideA[head_dim_idx] = d;
+                     strideA[seqlen_dim_idx] = h * d;
+                     strideA[hidden_dim_idx] = 1;
+             }
+             break;
+        case NVTE_QKV_Layout::NVTE_BSHD_BS2HD:
+        case NVTE_QKV_Layout::NVTE_THD_T2HD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                     strideA[batch_dim_idx] = s_kv * 2 * h * d;
+                     strideA[head_dim_idx] = d;
+                     strideA[seqlen_dim_idx] = 2 * h * d;
+                     strideA[hidden_dim_idx] = 1;
+             } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                     strideA[batch_dim_idx] = s_kv * 2 * h * d;
+                     strideA[head_dim_idx] = d;
+                     strideA[seqlen_transpose_dim_idx] = 2 * h * d;
+                     strideA[hidden_transpose_dim_idx] = 1;
+             } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                     strideA[batch_dim_idx] = s_q * h * d;
+                     strideA[head_dim_idx] = d;
+                     strideA[seqlen_dim_idx] = h * d;
+                     strideA[hidden_dim_idx] = 1;
+             }
+             break;
+        case NVTE_QKV_Layout::NVTE_BSHD_BSH2D:
+        case NVTE_QKV_Layout::NVTE_THD_TH2D:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                     strideA[batch_dim_idx] = s_kv * 2 * h * d;
+                     strideA[head_dim_idx] = 2 * d;
+                     strideA[seqlen_dim_idx] = 2 * h * d;
+                     strideA[hidden_dim_idx] = 1;
+             } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                     strideA[batch_dim_idx] = s_kv * 2 * h * d;
+                     strideA[head_dim_idx] = 2 * d;
+                     strideA[seqlen_transpose_dim_idx] = 2 * h * d;
+                     strideA[hidden_transpose_dim_idx] = 1;
+             } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                 || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                     strideA[batch_dim_idx] = s_q * h * d;
+                     strideA[head_dim_idx] = d;
+                     strideA[seqlen_dim_idx] = h * d;
+                     strideA[hidden_dim_idx] = 1;
+             }
+             break;
+        case NVTE_QKV_Layout::NVTE_BSHD_BSHD_BSHD:
+        case NVTE_QKV_Layout::NVTE_THD_THD_THD:
+            if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+                    strideA[batch_dim_idx] = s_q * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+                    strideA[batch_dim_idx] = s_kv * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_dim_idx] = h * d;
+                    strideA[hidden_dim_idx] = 1;
+            } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose)
+                || (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+                    strideA[batch_dim_idx] = s_kv * h * d;
+                    strideA[head_dim_idx] = d;
+                    strideA[seqlen_transpose_dim_idx] = h * d;
+                    strideA[hidden_transpose_dim_idx] = 1;
+            }
+            break;
+    }
+
+    if (matrix == NVTE_QKV_Matrix::NVTE_S_Matrix) {
+        strideA[seqlen_kv_dim_idx] = 1;
+        strideA[seqlen_q_dim_idx] = s_kv;
+        strideA[head_dim_idx] = s_q * s_kv;
+        strideA[batch_dim_idx] = h * s_q * s_kv;
     }
 }
 

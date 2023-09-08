@@ -290,7 +290,7 @@ def setup_requirements() -> Tuple[List[str], List[str], List[str]]:
 
     # Framework-specific requirements
     if "pytorch" in frameworks():
-        add_unique(install_reqs, ["torch", "flash-attn>=1.0.6, <=2.0.0.post1"])
+        add_unique(install_reqs, ["torch", "flash-attn>=1.0.6, <=2.0.8"])
         add_unique(test_reqs, ["numpy", "onnxruntime", "torchvision"])
     if "jax" in frameworks():
         if not found_pybind11():
@@ -508,7 +508,7 @@ def setup_pytorch_extension() -> setuptools.Extension:
     else:
         if version >= (11, 2):
             nvcc_flags.extend(["--threads", "4"])
-        if version >= (11, 0):
+        if version >= (11, 0) and version < (11, 8):
             nvcc_flags.extend(["-gencode", "arch=compute_80,code=sm_80"])
         if version >= (11, 8):
             nvcc_flags.extend(["-gencode", "arch=compute_90,code=sm_90"])
@@ -579,7 +579,7 @@ def setup_paddle_extension() -> setuptools.Extension:
     else:
         if version >= (11, 2):
             nvcc_flags.extend(["--threads", "4"])
-        if version >= (11, 0):
+        if version >= (11, 0) and version < (11, 8):
             nvcc_flags.extend(["-gencode", "arch=compute_80,code=sm_80"])
         if version >= (11, 8):
             nvcc_flags.extend(["-gencode", "arch=compute_90,code=sm_90"])

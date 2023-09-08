@@ -1013,7 +1013,7 @@ void fused_attn_fp8_fwd_impl(int64_t b, int64_t s_q, int64_t s_kv, int64_t h, in
       FADescriptor descriptor{
               b, h, s_q, s_kv, d,
               attnScale, isTraining, dropoutProbability, layout,
-              NVTE_Bias_Type::NVTE_NO_BIAS, NVTE_Mask_Type::NVTE_PADDING_MASK, tensorType};
+              NVTE_Bias_Type::NVTE_NO_BIAS, NVTE_Mask_Type::NVTE_PADDING_MASK, tensorType, false};
 
       using CacheType = std::map<FADescriptor, cudnn_frontend::ExecutionPlan>;
       static thread_local CacheType fa_fprop_cache;
@@ -1329,7 +1329,7 @@ void fused_attn_fp8_bwd_impl(int64_t b, int64_t s_q, int64_t s_kv, int64_t h, in
       FADescriptor descriptor{
               b, h, s_q, s_kv, d,
               attnScale, false, dropoutProbability, layout,
-              NVTE_Bias_Type::NVTE_NO_BIAS, NVTE_Mask_Type::NVTE_PADDING_MASK, tensorType};
+              NVTE_Bias_Type::NVTE_NO_BIAS, NVTE_Mask_Type::NVTE_PADDING_MASK, tensorType, false};
 
       using CacheType = std::map<FADescriptor, cudnn_frontend::ExecutionPlan>;
       static thread_local CacheType fa_bprop_cache;
@@ -2032,6 +2032,203 @@ void fused_attn_fp8_bwd_qkvpacked(
                   devPtrAmaxdS,
                   devPtrAmaxdQ, devPtrAmaxdK, devPtrAmaxdV,
                   devPtrcuSeqlens, devPtrcuSeqlens,
+                  devPtrDropoutSeed, devPtrDropoutOffset,
+                  get_cudnn_dtype(QKV_type),
+                  workspace->data.dptr, &workspace_size, stream, handle);
+
+  if (workspace_size > 0) {
+    if (workspace->data.dptr == nullptr) {
+      workspace->data.shape = { workspace_size };
+      workspace->data.dtype = DType::kByte;
+      return;
+    }
+  } else if (workspace_size == 0) {
+    workspace->data.shape = { 1 };
+    workspace->data.dtype = DType::kByte;
+    return;
+  }
+}
+// fused attention FWD FP8 with separate Q, K, V
+void fused_attn_fp8_fwd_q_k_v(
+            size_t b, size_t max_seqlen_q, size_t max_seqlen_kv,
+            size_t h, size_t d,
+            bool is_training, float attn_scale,
+            float p_dropout, NVTE_QKV_Layout qkv_layout,
+            const Tensor *input_Q,
+            const Tensor *input_K,
+            const Tensor *input_V,
+            Tensor *input_output_S,
+            Tensor *output_O,
+            NVTETensorPack* Aux_CTX_Tensors,
+            const Tensor *cu_seqlens_q,
+            const Tensor *cu_seqlens_kv,
+            const Tensor *rng_state,
+            Tensor *workspace,
+            cudaStream_t stream,
+            cudnnHandle_t handle) {
+  using namespace transformer_engine;
+  void* devPtrQ = input_Q->data.dptr;
+  void* devPtrK = input_K->data.dptr;
+  void* devPtrV = input_V->data.dptr;
+  void* devPtrDescaleQ = input_Q->scale_inv.dptr;
+  void* devPtrDescaleK = input_Q->scale_inv.dptr;
+  void* devPtrDescaleV = input_Q->scale_inv.dptr;
+
+  void* devPtrO = output_O->data.dptr;
+  void* devPtrAmaxO = output_O->amax.dptr;
+  void* devPtrScaleO = output_O->scale.dptr;
+
+  void* devPtrM = nullptr;
+  void* devPtrZInv = nullptr;
+  if (Aux_CTX_Tensors->size == 0) {
+    if (is_training) {
+      Aux_CTX_Tensors->size = 3;
+      Tensor *output_M = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[0]);
+      Tensor *output_ZInv = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[1]);
+      Tensor *output_rng_state = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[2]);
+      output_M->data.dptr = nullptr;
+      output_M->data.shape = {b, h, max_seqlen_q, 1};
+      output_M->data.dtype = DType::kFloat32;
+      output_ZInv->data.dptr = nullptr;
+      output_ZInv->data.shape = {b, h, max_seqlen_q, 1};
+      output_ZInv->data.dtype = DType::kFloat32;
+      output_rng_state->data.dptr = nullptr;
+      output_rng_state->data.shape = {2};
+      output_rng_state->data.dtype = DType::kInt64;
+    }
+  } else if (Aux_CTX_Tensors->size == 3) {
+    Tensor *output_M = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[0]);
+    Tensor *output_ZInv = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[1]);
+    Tensor *output_rng_state = reinterpret_cast<Tensor*>(Aux_CTX_Tensors->tensors[2]);
+    devPtrM = output_M->data.dptr;
+    devPtrZInv = output_ZInv->data.dptr;
+    output_rng_state->data.dptr = rng_state->data.dptr;
+  }
+
+  void* devPtrAmaxS = input_output_S->amax.dptr;
+  void* devPtrScaleS = input_output_S->scale.dptr;
+  void* devPtrDescaleS = input_output_S->scale_inv.dptr;
+
+  void* devPtrcuSeqlensQ = reinterpret_cast<void *>(
+                  reinterpret_cast<int32_t*>(cu_seqlens_q->data.dptr));
+  void* devPtrcuSeqlensKV = reinterpret_cast<void *>(
+                  reinterpret_cast<int32_t*>(cu_seqlens_kv->data.dptr));
+  void* devPtrDropoutSeed = reinterpret_cast<void *>(
+                  reinterpret_cast<uint64_t*>(rng_state->data.dptr));
+  void* devPtrDropoutOffset = reinterpret_cast<void *>(
+                  reinterpret_cast<uint64_t*>(rng_state->data.dptr) + 1);
+
+  const DType QKV_type = input_Q->data.dtype;
+  size_t workspace_size = 0;
+
+  fused_attn::fused_attn_fp8_fwd_impl(
+                  b, max_seqlen_q, max_seqlen_kv, h, d,
+                  is_training, attn_scale, p_dropout, qkv_layout,
+                  devPtrQ, devPtrK, devPtrV,
+                  devPtrM, devPtrZInv,
+                  devPtrO,
+                  devPtrDescaleQ, devPtrDescaleK, devPtrDescaleV,
+                  devPtrDescaleS, devPtrScaleS, devPtrScaleO,
+                  devPtrAmaxO, devPtrAmaxS,
+                  devPtrcuSeqlensQ, devPtrcuSeqlensKV,
+                  devPtrDropoutSeed, devPtrDropoutOffset,
+                  get_cudnn_dtype(QKV_type),
+                  workspace->data.dptr, &workspace_size, stream, handle);
+
+  if (workspace_size > 0) {
+    if (workspace->data.dptr == nullptr) {
+      workspace->data.shape = { workspace_size };
+      workspace->data.dtype = DType::kByte;
+      return;
+    }
+  } else if (workspace_size == 0) {
+    workspace->data.shape = { 1 };
+    workspace->data.dtype = DType::kByte;
+    return;
+  }
+}
+// fused attention BWD FP8 with separate Q, K, V
+void fused_attn_fp8_bwd_q_k_v(
+            size_t b, size_t max_seqlen_q, size_t max_seqlen_kv,
+            size_t h, size_t d,
+            float attn_scale, float p_dropout, NVTE_QKV_Layout qkv_layout,
+            const Tensor *input_Q,
+            const Tensor *input_K,
+            const Tensor *input_V,
+            const Tensor *input_O,
+            const Tensor *input_dO,
+            const Tensor *input_M,
+            const Tensor *input_ZInv,
+            const Tensor *input_S,
+            Tensor *input_output_dP,
+            const Tensor *output_dQ,
+            const Tensor *output_dK,
+            const Tensor *output_dV,
+            const Tensor *cu_seqlens_q,
+            const Tensor *cu_seqlens_kv,
+            const Tensor *rng_state,
+            Tensor *workspace,
+            cudaStream_t stream,
+            cudnnHandle_t handle) {
+  using namespace transformer_engine;
+  void* devPtrQ = input_Q->data.dptr;
+  void* devPtrK = input_K->data.dptr;
+  void* devPtrV = input_V->data.dptr;
+  void* devPtrDescaleQ = input_Q->scale_inv.dptr;
+  void* devPtrDescaleK = input_Q->scale_inv.dptr;
+  void* devPtrDescaleV = input_Q->scale_inv.dptr;
+
+  void* devPtrO = input_O->data.dptr;
+  void* devPtrDescaleO = input_O->scale_inv.dptr;
+  void* devPtrdO = input_dO->data.dptr;
+  void* devPtrDescaledO = input_dO->scale_inv.dptr;
+
+  void* devPtrM = input_M->data.dptr;
+  void* devPtrZInv = input_ZInv->data.dptr;
+
+  void* devPtrScaleS = input_S->scale.dptr;
+  void* devPtrDescaleS = input_S->scale_inv.dptr;
+  void* devPtrAmaxdS = input_output_dP->amax.dptr;
+  void* devPtrScaledS = input_output_dP->scale.dptr;
+  void* devPtrDescaledS = input_output_dP->scale_inv.dptr;
+
+  void* devPtrdQ = output_dQ->data.dptr;
+  void* devPtrdK = output_dK->data.dptr;
+  void* devPtrdV = output_dV->data.dptr;
+  void* devPtrAmaxdQ = output_dQ->amax.dptr;
+  void* devPtrAmaxdK = output_dQ->amax.dptr;
+  void* devPtrAmaxdV = output_dQ->amax.dptr;
+  void* devPtrScaledQ = output_dQ->scale.dptr;
+  void* devPtrScaledK = output_dQ->scale.dptr;
+  void* devPtrScaledV = output_dQ->scale.dptr;
+
+  void* devPtrcuSeqlensQ = reinterpret_cast<void *>(
+                  reinterpret_cast<int32_t*>(cu_seqlens_q->data.dptr));
+  void* devPtrcuSeqlensKV = reinterpret_cast<void *>(
+                  reinterpret_cast<int32_t*>(cu_seqlens_kv->data.dptr));
+  void* devPtrDropoutSeed = reinterpret_cast<void *>(
+                  reinterpret_cast<uint64_t*>(rng_state->data.dptr));
+  void* devPtrDropoutOffset = reinterpret_cast<void *>(
+                  reinterpret_cast<uint64_t*>(rng_state->data.dptr) + 1);
+
+  const DType QKV_type = input_Q->data.dtype;
+  size_t workspace_size = 0;
+
+  fused_attn::fused_attn_fp8_bwd_impl(
+                  b, max_seqlen_q, max_seqlen_kv, h, d,
+                  attn_scale, p_dropout, qkv_layout,
+                  devPtrQ, devPtrK, devPtrV,
+                  devPtrM, devPtrZInv,
+                  devPtrO, devPtrdO,
+                  devPtrdQ, devPtrdK, devPtrdV,
+                  devPtrDescaleQ, devPtrDescaleK, devPtrDescaleV,
+                  devPtrDescaleO, devPtrDescaledO,
+                  devPtrDescaleS, devPtrDescaledS,
+                  devPtrScaleS, devPtrScaledS,
+                  devPtrScaledQ, devPtrScaledK, devPtrScaledV,
+                  devPtrAmaxdS,
+                  devPtrAmaxdQ, devPtrAmaxdK, devPtrAmaxdV,
+                  devPtrcuSeqlensQ, devPtrcuSeqlensKV,
                   devPtrDropoutSeed, devPtrDropoutOffset,
                   get_cudnn_dtype(QKV_type),
                   workspace->data.dptr, &workspace_size, stream, handle);
