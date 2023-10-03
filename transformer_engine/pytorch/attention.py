@@ -1840,6 +1840,16 @@ class MultiheadAttention(torch.nn.Module):
                 :attr:`hidden_size` / :attr:`num_attention_heads` if `None`.
     attention_dropout: float, default = 0.1
                       dropout probability for the dropout op during multi-head attention.
+    qkv_format: str, default = `sbhd`
+               dimension format for `query_layer`, `key_layer` and `value_layer`,
+               {`sbhd`, `bshd`, `thd`}. `s` stands for the sequence length, `b` batch size,
+               `h` the number of heads, `d` head size, and `t` the total number of sequences
+               in a batch, with `t = sum(s_i), for i = 0...b-1`. `sbhd` and `bshd` formats
+               are used for when sequences in a batch are of equal length or padded to
+               equal length, and the `thd` format is used for when sequences in a batch
+               have different lengths. Please note that these formats do not reflect how
+               tensors `query_layer`, `key_layer`, `value_layer` are laid out in memory.
+               For that, please use `_get_qkv_layout` to gain the layout information.
     layernorm_epsilon : float, default = 1e-5
                        a value added to the denominator of layer normalization
                        for numerical stability.
@@ -1965,6 +1975,7 @@ class MultiheadAttention(torch.nn.Module):
         set_parallel_mode: bool = False,
         fuse_qkv_params: bool = False,
         zero_centered_gamma: bool = False,
+        qkv_format: str = "sbhd",
         qkv_weight_interleaved: bool = True,
         ub_bulk_wgrad: bool = False,
         ub_bulk_dgrad: bool = False,
@@ -1976,6 +1987,7 @@ class MultiheadAttention(torch.nn.Module):
     ) -> None:
         super().__init__()
 
+        self.qkv_format = qkv_format
         self.attn_mask_type = attn_mask_type
         self.layer_number = layer_number
         self.input_layernorm = input_layernorm
@@ -2109,6 +2121,7 @@ class MultiheadAttention(torch.nn.Module):
             kv_channels,
             num_gqa_groups=self.num_gqa_groups,
             attention_dropout=attention_dropout,
+            qkv_format=self.qkv_format,
             tp_size=tp_size,
             get_rng_state_tracker=get_rng_state_tracker,
             sequence_parallel=sequence_parallel,
@@ -2161,6 +2174,7 @@ class MultiheadAttention(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        qkv_format: Optional[str] = None,
         encoder_output: Optional[torch.Tensor] = None,
         attn_mask_type: Optional[str] = None,
         is_first_microbatch: Optional[bool] = None,
@@ -2187,6 +2201,8 @@ class MultiheadAttention(torch.nn.Module):
              Boolean tensor used to mask out self-attention softmax input.
         attn_mask_type: {'causal', 'padding', 'no_mask'}, default = `None`
                        type of attention mask passed into softmax operation.
+        qkv_format: str, default = `None`
+                   If provided, overrides :attr:`qkv_format` from initialization.
         encoder_output : Optional[torch.Tensor], default = `None`
              Output of the encoder block to be fed into the decoder block if using
              `layer_type="decoder"`.
@@ -2261,7 +2277,7 @@ class MultiheadAttention(torch.nn.Module):
         # =====================
 
         if self.attention_type == "self":
-            # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn]
+            # Attention heads [..., h] --> [..., ng * (np/ng + 2) * hn]
             if self.input_layernorm:
                 layernorm_qkv_outputs = self.layernorm_qkv(
                     hidden_states,
@@ -2280,7 +2296,7 @@ class MultiheadAttention(torch.nn.Module):
             num_queries_per_key_value = (self.num_attention_heads_per_partition //
                                          self.num_gqa_groups_per_partition)
             if self.qkv_weight_interleaved:
-                # [sq, b, ng * (np/ng + 2) * hn] --> [sq, b, ng, (np/ng + 2), hn]
+                # [..., ng * (np/ng + 2) * hn] --> [..., ng, (np/ng + 2), hn]
                 new_tensor_shape = mixed_x_layer.size()[:-1] + (
                     self.num_gqa_groups_per_partition,
                     (num_queries_per_key_value + 2),
@@ -2289,7 +2305,7 @@ class MultiheadAttention(torch.nn.Module):
                 # split along second last dimension
                 split_dim = -2
             else:
-                # [sq, b, ng * (np/ng + 2) * hn] --> [sq, b, (np/ng + 2), ng, hn]
+                # [..., ng * (np/ng + 2) * hn] --> [..., (np/ng + 2), ng, hn]
                 new_tensor_shape = mixed_x_layer.size()[:-1] + (
                     (num_queries_per_key_value + 2),
                     self.num_gqa_groups_per_partition,
@@ -2301,11 +2317,11 @@ class MultiheadAttention(torch.nn.Module):
             mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
             # qkv_weight_interleaved:
-            #  [sq, b, ng, (np/ng + 2), hn]
-            #  --> [sq, b, ng, np/ng, hn], [sq, b, ng, 1, hn], [sq, b, ng, 1, hn]
+            #  [..., ng, (np/ng + 2), hn]
+            #  --> [..., ng, np/ng, hn], [..., ng, 1, hn], [..., ng, 1, hn]
             # not qkv_weight_interleaved:
-            #  [sq, b, (np/ng + 2), ng, hn]
-            #  --> [sq, b, np/ng, np, hn], [sq, b, 1, ng, hn], [sq, b, 1, ng, hn]
+            #  [..., (np/ng + 2), ng, hn]
+            #  --> [..., np/ng, np, hn], [..., 1, ng, hn], [..., 1, ng, hn]
             if not is_in_onnx_export_mode():
                 query_layer, key_layer, value_layer = _SplitAlongDim.apply(
                     mixed_x_layer, split_dim, (num_queries_per_key_value, 1, 1)
@@ -2315,11 +2331,18 @@ class MultiheadAttention(torch.nn.Module):
                     mixed_x_layer, (num_queries_per_key_value, 1, 1), dim = split_dim,
                  )
 
-            # query: -> [sq, b, np, hn]
-            # key, value: -> [sq, b, ng, hn]
-            query_layer, key_layer, value_layer = (x.reshape(x.size(0), x.size(1), -1,
-                                                             self.hidden_size_per_attention_head)
-                                                   for x in (query_layer, key_layer, value_layer))
+            # query: -> [..., np, hn]
+            # key, value: -> [..., ng, hn]
+            # NOTE: Dims 0 and 1 (usually sequence length and batch size) are untouched
+            if self.qkv_format != 'thd':
+                query_layer, key_layer, value_layer = (x.reshape(x.size(0), x.size(1), -1,
+                                                                self.hidden_size_per_attention_head)
+                                                    for x in (query_layer, key_layer, value_layer))
+            else:
+                # 'thd' format has one less dimension here than 'sbhd' or 'bshd'.
+                query_layer, key_layer, value_layer = (x.reshape(x.size(0), -1,
+                                                                self.hidden_size_per_attention_head)
+                                                    for x in (query_layer, key_layer, value_layer))
 
         elif self.attention_type == "cross":
             # Attention heads [sk, b, h] --> [sk, b, (ng * 2 * hn)]
@@ -2329,7 +2352,7 @@ class MultiheadAttention(torch.nn.Module):
             )
 
             if self.qkv_weight_interleaved:
-                # [sq, b, (ng * 2 * hn)] --> [sq, b, ng, 2 * hn]
+                # [..., (ng * 2 * hn)] --> [..., ng, 2 * hn]
                 new_tensor_shape = mixed_kv_layer.size()[:-1] + (
                     self.num_gqa_groups_per_partition,
                     2 * self.hidden_size_per_attention_head,
@@ -2337,7 +2360,7 @@ class MultiheadAttention(torch.nn.Module):
                 # split along last dimension
                 split_dim = -1
             else:
-                # [sq, b, (ng * 2 * hn)] --> [sq, b, 2 * ng, hn]
+                # [..., (ng * 2 * hn)] --> [..., 2 * ng, hn]
                 new_tensor_shape = mixed_kv_layer.size()[:-1] + (
                     2 * self.num_gqa_groups_per_partition,
                     self.hidden_size_per_attention_head,
@@ -2357,7 +2380,7 @@ class MultiheadAttention(torch.nn.Module):
                     mixed_kv_layer, mixed_kv_layer.shape[split_dim] // 2, dim = split_dim,
                 )
 
-            # Attention head [sq, b, h] --> [sq, b, hp]
+            # Attention head [..., h] --> [..., hp]
             if self.input_layernorm:
                 layernorm_query_outputs = self.layernorm_query(
                     hidden_states,
@@ -2373,7 +2396,7 @@ class MultiheadAttention(torch.nn.Module):
                     is_first_microbatch=is_first_microbatch,
                 )
 
-            # [sq, b, hp] --> [sq, b, np, hn]
+            # [..., hp] --> [..., np, hn]
             new_tensor_shape = query_layer.size()[:-1] + (
                 self.num_attention_heads_per_partition,
                 self.hidden_size_per_attention_head,
@@ -2442,7 +2465,7 @@ class MultiheadAttention(torch.nn.Module):
             query_layer,
             key_layer,
             value_layer,
-            qkv_format='sbhd',
+            qkv_format=qkv_format,
             cu_seqlens_q=None,
             cu_seqlens_kv=None,
             attention_mask=attention_mask,
@@ -2454,7 +2477,7 @@ class MultiheadAttention(torch.nn.Module):
         )
 
         # =================
-        # Output. [sq, b, h]
+        # Output. [..., h]
         # =================
 
         projection_output = self.proj(
