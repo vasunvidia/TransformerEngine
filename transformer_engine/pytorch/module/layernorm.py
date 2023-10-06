@@ -41,7 +41,8 @@ class _LayerNorm(torch.autograd.Function):
         in_features = ln_weight.numel()
         assert inp.is_cuda, "TransformerEngine needs CUDA."
         assert inp.shape[-1] == in_features, "LayerNorm not possible"
-        inputmat = inp.view((-1, in_features))
+        #inputmat = inp.view((-1, in_features))
+        inputmat = inp.reshape((-1, in_features))
 
         # Cast for native AMP
         inputmat = cast_if_needed(inputmat, activation_dtype)
