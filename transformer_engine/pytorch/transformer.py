@@ -152,7 +152,7 @@ class TransformerLayer(torch.nn.Module):
           if set to `False`, the transformer layer will not learn any additive biases.
     activation : str, default = 'gelu'
           Type of activation used in MLP block.
-          Options are: 'gelu', 'relu', 'reglu', 'geglu' and 'swiglu'.
+          Options are: 'gelu', 'relu', 'reglu', 'geglu', 'swiglu' and 'qgelu'.
     device : Union[torch.device, str], default = "cuda"
           The device on which the parameters of the model will allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
@@ -323,6 +323,7 @@ class TransformerLayer(torch.nn.Module):
             "ub_bulk_dgrad" : ub_bulk_dgrad,
             "ub_split_ag" : ub_split_ag,
             "ub_split_rs" : ub_split_rs,
+            "attn_mask_type" : self.self_attn_mask_type
         }
 
         self.self_attention = MultiheadAttention(
