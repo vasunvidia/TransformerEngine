@@ -159,7 +159,7 @@ void dqgelu(const Tensor &grad,
   CheckOutputTensor(*output, "dqgelu_output");
   NVTE_CHECK(input.data.shape == output->data.shape, "Input and output shapes must match.");
   NVTE_CHECK(input.data.dtype == grad.data.dtype,
-      "Input and incoming gradient types must match.");
+              "Input and incoming gradient types must match.");
   const size_t tot_elts = product(input.data.shape);
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(input.data.dtype, IType,

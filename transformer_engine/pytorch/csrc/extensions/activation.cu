@@ -283,10 +283,10 @@ at::Tensor qgelu(at::Tensor input,
                       otype);
 
   auto itype = GetTransformerEngineDType(input.scalar_type());
-  auto input_cu = makeTransformerEngineTensor(input.data_ptr(), {M, N}, itype);
+  auto input_cu =  makeTransformerEngineTensor(input.data_ptr(), {M, N}, itype);
   auto output_cu = makeTransformerEngineTensor(output.data_ptr(), {M, N}, otype,
-                                               amax.data_ptr(), scale.data_ptr(),
-                                               scale_inv.data_ptr());
+                                  amax.data_ptr(), scale.data_ptr(),
+                                  scale_inv.data_ptr());
 
   nvte_qgelu(input_cu.data(), output_cu.data(), at::cuda::getCurrentCUDAStream());
 
@@ -309,8 +309,8 @@ at::Tensor dqgelu(at::Tensor grad,
 
   auto itype = GetTransformerEngineDType(input.scalar_type());
   auto gtype = GetTransformerEngineDType(grad.scalar_type());
-  auto input_cu = makeTransformerEngineTensor(input.data_ptr(), {M, N}, itype);
-  auto grad_cu = makeTransformerEngineTensor(grad.data_ptr(), {M, N}, gtype);
+  auto input_cu =  makeTransformerEngineTensor(input.data_ptr(), {M, N}, itype);
+  auto grad_cu =  makeTransformerEngineTensor(grad.data_ptr(), {M, N}, gtype);
   auto output_cu = makeTransformerEngineTensor(output.data_ptr(), {M, N}, otype);
 
   nvte_dqgelu(grad_cu.data(), input_cu.data(), output_cu.data(), at::cuda::getCurrentCUDAStream());
