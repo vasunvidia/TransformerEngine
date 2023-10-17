@@ -1209,7 +1209,7 @@ class FlashAttention(torch.nn.Module):
         attention_dropout_ctx: Optional[Callable] = nullcontext,
         attention_type: str = "self",
         layer_number: Optional[int] = None,
-        deterministic: bool = False,
+        deterministic: bool = False
     ) -> None:
         super().__init__()
 
@@ -1237,6 +1237,8 @@ class FlashAttention(torch.nn.Module):
         cp_group: Optional[dist_group_type] = None,
         cp_global_ranks: List[int] = None,
         cp_stream: torch.cuda.Stream = None,
+        packed_input = False,
+        packed_output = False
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -1283,7 +1285,7 @@ class FlashAttention(torch.nn.Module):
                     for x in [query_layer, key_layer, value_layer]
                 ]
 
-            if attn_mask_type == 'padding':
+            if attn_mask_type == 'padding' and not packed_input:
                 assert not context_parallel, "Padding mask not supported with context parallelism."
 
                 if self.attention_type == "self":
@@ -1357,7 +1359,7 @@ class FlashAttention(torch.nn.Module):
                     **fa_optional_forward_kwargs
                 )
 
-        if attn_mask_type == 'padding':
+        if attn_mask_type == 'padding' and not packed_output:
             output = UnpackTensor.apply(_indices_q, batch_size * max_seqlen_q, output)
 
         if qkv_format == 'sbhd':
@@ -1778,6 +1780,10 @@ class DotProductAttention(torch.nn.Module):
                    arg is useful for dynamically changing mask types, e.g. a different
                    mask for training and inference. The init arg is useful for cases
                    involving compilation/tracing, e.g. ONNX export.
+    backend: {None, 'flash', 'fused', 'unfused'}, default = None
+            backend function for the dot-product attention computation. Default lets
+            TransformerEngine pick the most performant backend that is compatible with
+            the inputs.
 
     Parallelism parameters
     ----------------------
@@ -1815,6 +1821,7 @@ class DotProductAttention(torch.nn.Module):
         cp_group: Optional[dist_group_type] = None,
         cp_global_ranks: List[int] = None,
         cp_stream: torch.cuda.Stream = None,
+        backend = None
     ) -> None:
         super().__init__()
 
@@ -1850,6 +1857,7 @@ class DotProductAttention(torch.nn.Module):
         self.use_flash_attention = (
             int(os.getenv("NVTE_FLASH_ATTN", "1"))
             and self.device_compute_capability >= 8.0
+            and backend in [None, 'flash']
         )
         if _flash_attn_2_available and self.deterministic:
             self.use_flash_attention = False
@@ -1862,6 +1870,7 @@ class DotProductAttention(torch.nn.Module):
         self.use_fused_attention = (
             int(os.getenv("NVTE_FUSED_ATTN", "1"))
             and self.device_compute_capability >= 8.0
+            and backend in [None, 'fused']
         )
 
         assert (
@@ -1939,6 +1948,8 @@ class DotProductAttention(torch.nn.Module):
         core_attention_bias_type: str = "no_bias",
         core_attention_bias: Optional[torch.Tensor] = None,
         fast_zero_fill: bool = True,
+        packed_input=False,
+        packed_output=False
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -2014,6 +2025,12 @@ class DotProductAttention(torch.nn.Module):
                     Bias tensor for Q * K.T
         fast_zero_fill: bool, default = `True`
                     Whether to use the fast path to set output tensors to 0 or not.
+        packed_input: bool, default = `False`
+                    Whether the input tensor has already been packed with the padding mask in
+                    previous layers. This avoids unnecessary redundant packing/unpacking.
+        packed_output: bool, default = `False`
+                    Whether the output should be left packed or unpacked when a padding mask is
+                    used.
         """
 
         assert (
@@ -2172,7 +2189,9 @@ class DotProductAttention(torch.nn.Module):
                                         attn_mask_type=attn_mask_type,
                                         cp_group=self.cp_group,
                                         cp_global_ranks=self.cp_global_ranks,
-                                        cp_stream=self.cp_stream)
+                                        cp_stream=self.cp_stream,
+                                        packed_input=packed_input,
+                                        packed_output=packed_output)
 
         assert (
             self.cp_group is None or get_distributed_world_size(self.cp_group) == 1
