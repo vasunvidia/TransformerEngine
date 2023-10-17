@@ -1351,6 +1351,7 @@ class FlashAttention(torch.nn.Module):
                 fa_optional_forward_kwargs = {}
                 if not _flash_attn_2_available:
                     fa_optional_forward_kwargs["deterministic"] = self.deterministic
+
                 output = flash_attn_forward_func(
                     query_layer, key_layer, value_layer,
                     cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
@@ -2140,6 +2141,7 @@ class DotProductAttention(torch.nn.Module):
             assert use_flash_attention, "No attention backend available for causal + padding masks."
         elif attn_mask_type == "padding":
             use_fused_attention = False
+            use_flash_attention = False
 
         if use_fused_attention:
             fused_attention_backend = tex.get_fused_attn_backend(
