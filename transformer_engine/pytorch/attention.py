@@ -1238,7 +1238,9 @@ class FlashAttention(torch.nn.Module):
         cp_global_ranks: List[int] = None,
         cp_stream: torch.cuda.Stream = None,
         packed_input = False,
-        packed_output = False
+        packed_output = False,
+        max_seqlen_q = None,
+        max_seqlen_kv = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -1274,8 +1276,9 @@ class FlashAttention(torch.nn.Module):
                 for x in (query_layer, key_layer, value_layer)]
 
         global _cu_seqlens_q, _cu_seqlens_kv, _indices_q, _indices_kv
-        batch_size, max_seqlen_q, max_seqlen_kv = (
-                query_layer.shape[0], query_layer.shape[1], key_layer.shape[1])
+        batch_size = query_layer.shape[0]
+        max_seqlen_q = query_layer.shape[1] if max_seqlen_q is None else max_seqlen_q
+        max_seqlen_kv = key_layer.shape[1] if max_seqlen_kv is None else max_seqlen_kv
 
         if qkv_format in ['sbhd', 'bshd']:
             if not context_parallel:
@@ -1332,8 +1335,8 @@ class FlashAttention(torch.nn.Module):
                 ), "cu_seqlens_q and cu_seqlens_kv can not be None when qkv_format = thd!"
             seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
             seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-            max_seqlen_q = seqlens_q.max().item()
-            max_seqlen_kv = seqlens_kv.max().item()
+            max_seqlen_q = seqlens_q.max().item() if max_seqlen_q is None else max_seqlen_q
+            max_seqlen_kv = seqlens_kv.max().item() if max_seqlen_kv is None else max_seqlen_kv
 
         if context_parallel:
             with self.attention_dropout_ctx():
@@ -1369,6 +1372,9 @@ class FlashAttention(torch.nn.Module):
         elif qkv_format == 'bshd':
             # (bs)hd -> bs(hd)
             output = output.view(batch_size, max_seqlen_q, -1).contiguous()
+        elif qkv_format == 'thd':
+            # (t)hd -> (t)(hd)
+            output = output.view(batch_size, -1).contiguous()
 
         return output
 
@@ -1950,7 +1956,9 @@ class DotProductAttention(torch.nn.Module):
         core_attention_bias: Optional[torch.Tensor] = None,
         fast_zero_fill: bool = True,
         packed_input=False,
-        packed_output=False
+        packed_output=False,
+        max_seqlen_q = None,
+        max_seqlen_kv = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -2067,8 +2075,8 @@ class DotProductAttention(torch.nn.Module):
                 ), "cu_seqlens_q and cu_seqlens_q must both be in dtype torch.int32!"
             seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
             seqlens_kv = cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]
-            max_seqlen_q = seqlens_q.max().item()
-            max_seqlen_kv = seqlens_kv.max().item()
+            max_seqlen_q = seqlens_q.max().item() if max_seqlen_q is None else max_seqlen_q
+            max_seqlen_kv = seqlens_kv.max().item() if max_seqlen_kv is None else max_seqlen_kv
 
         if qkv_format in ['sbhd', 'bshd']:
             assert (all(len(x.shape) == 4 for x in (query_layer, key_layer, value_layer))
@@ -2193,7 +2201,10 @@ class DotProductAttention(torch.nn.Module):
                                         cp_global_ranks=self.cp_global_ranks,
                                         cp_stream=self.cp_stream,
                                         packed_input=packed_input,
-                                        packed_output=packed_output)
+                                        packed_output=packed_output,
+                                        max_seqlen_q = max_seqlen_q,
+                                        max_seqlen_kv = max_seqlen_kv,
+                                       )
 
         assert (
             self.cp_group is None or get_distributed_world_size(self.cp_group) == 1
@@ -2622,6 +2633,10 @@ class MultiheadAttention(torch.nn.Module):
         core_attention_bias_type: str = "no_bias",
         core_attention_bias: Optional[torch.Tensor] = None,
         fast_zero_fill: bool = True,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_kv: Optional[int] = None,
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """
         Forward propagation for MultiheadAttention layer.
@@ -2685,6 +2700,7 @@ class MultiheadAttention(torch.nn.Module):
         assert (core_attention_bias_type in AttnBiasTypes
                 ), f"core_attention_bias_type {core_attention_bias_type} is not supported!"
 
+        qkv_format = self.qkv_format if qkv_format is None else qkv_format
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
@@ -2773,7 +2789,7 @@ class MultiheadAttention(torch.nn.Module):
             # query: -> [..., np, hn]
             # key, value: -> [..., ng, hn]
             # NOTE: Dims 0 and 1 (usually sequence length and batch size) are untouched
-            if self.qkv_format != 'thd':
+            if qkv_format != 'thd':
                 query_layer, key_layer, value_layer = (x.reshape(x.size(0), x.size(1), -1,
                                                                 self.hidden_size_per_attention_head)
                                                     for x in (query_layer, key_layer, value_layer))
@@ -2906,14 +2922,16 @@ class MultiheadAttention(torch.nn.Module):
             key_layer,
             value_layer,
             qkv_format=qkv_format,
-            cu_seqlens_q=None,
-            cu_seqlens_kv=None,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
             attention_mask=attention_mask,
             attn_mask_type=attn_mask_type,
             checkpoint_core_attention=checkpoint_core_attention,
             core_attention_bias_type=core_attention_bias_type,
             core_attention_bias=core_attention_bias,
             fast_zero_fill=fast_zero_fill,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
         )
 
         # =================
