@@ -37,8 +37,8 @@ from ..cpp_extensions import (
 from ..constants import dist_group_type
 
 _2X_ACC_FPROP = False
-_2X_ACC_DGRAD = True
-_2X_ACC_WGRAD = True
+_2X_ACC_DGRAD = not bool(os.getenv('NVTE_DISABLE_2XACC'))
+_2X_ACC_WGRAD = not bool(os.getenv('NVTE_DISABLE_2XACC'))
 _cublas_workspace = None
 _ub_communicators = None
 _NUM_MAX_UB_STREAMS = 3
