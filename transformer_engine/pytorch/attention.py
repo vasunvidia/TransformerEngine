@@ -2200,8 +2200,8 @@ class FusedAttention(torch.nn.Module):
             if qkv_format == 'sbhd':
                 output = output.transpose(0,1).contiguous()
         else:
-            with self.attention_dropout_ctx():
-                output = FusedAttnFunc.apply(
+            #with self.attention_dropout_ctx():
+            output = FusedAttnFunc.apply(
                     self.training,
                     max_seqlen_q, max_seqlen_kv,
                     cu_seqlens_q, cu_seqlens_kv,
