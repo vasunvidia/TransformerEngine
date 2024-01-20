@@ -89,8 +89,8 @@ def _prepare_backward(
             fp8_meta["autocast_id_bwd"] = fp8_meta["autocast_id_fwd_stack"].pop(0)
 
             FP8GlobalStateManager.add_amax_to_global_buffer(fp8_meta, forward=False)
-        else:
-            amax_and_scale_update(fp8_meta, False)
+        #else:
+        #    amax_and_scale_update(fp8_meta, False)
 
     with torch.cuda.nvtx.range(name + " backward"):
         yield
@@ -534,10 +534,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 self.set_fp8_weights()
 
             update_weight_scale_inv = is_first_microbatch is None or is_first_microbatch
-            if self.fp8 and self.sequence_parallel:
-                assert self.fp8_meta["recipe"].reduce_amax, \
-                "Amax reduction across tensor parallel group is " \
-                "necessary when using sequence parallelism with FP8."
+            #if self.fp8 and self.sequence_parallel:
+            #    assert self.fp8_meta["recipe"].reduce_amax, \
+            #    "Amax reduction across tensor parallel group is " \
+            #    "necessary when using sequence parallelism with FP8."
 
             # Previous iteration was grad_enabled
             if self.fp8 and self.fp8_meta.get("update_amax_and_scale_fwd", True):
@@ -548,10 +548,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
                     )
                     FP8GlobalStateManager.set_amax_buffer_key_deletion(self.fp8_meta, forward=True)
-                else:
-                    amax_and_scale_update(
-                        self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
-                    )
+                #else:
+                #    amax_and_scale_update(
+                #        self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
+                #    )
 
             if self.fp8 and self.training:
                 # Setup for amax reduction
