@@ -160,7 +160,7 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     }
 
     // Catch up the default torch stream
-    at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     CHECK_CUDA(cudaEventRecord(_start_comm, (cudaStream_t)stream_main));
     CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_comm, 0));
 
@@ -241,13 +241,10 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     int ori_sms = _ub_comm->sms;
 
     // Catch up the default torch stream
-    at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     CHECK_CUDA(cudaEventRecord(_start_compute, stream_main));
-    CHECK_CUDA(cudaEventRecord(_stop_comm, _stream_comm));
-    for (int i = 0; i < _stream_compute.size(); i++) {
-      CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[i], _start_compute, 0));
-      CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[i], _stop_comm, 0));
-    }
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[0], _start_compute, 0));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_compute, 0));
 
     if (A_scale_inverse.numel())
       A_scale_inverse = A_scale_inverse[A_fp8_tensor];
@@ -353,11 +350,12 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     int ori_sms = _ub_comm->sms;
 
     // Catch up the default torch stream
-    at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     CHECK_CUDA(cudaEventRecord(_start_compute, stream_main));
     for (int i = 0; i < _stream_compute.size(); i++) {
       CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[i], _start_compute, 0));
     }
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_compute, 0));
 
     if (A_scale_inverse.numel())
       A_scale_inverse = A_scale_inverse[A_fp8_tensor];
@@ -472,13 +470,13 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
         output_buf_chunk_ptr += output_chunk_size * _ubuf.element_size();
       }
     }
+    for (int i = 0; i < _stream_compute.size(); i++) {
+      CHECK_CUDA(
+          cudaEventRecord(_stop_compute, (cudaStream_t)_stream_compute[i]));
+      CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_compute, 0));
+    }
     _ub_comm->sms = ori_sms;
-    int last_compute_stream_id =
-        (_num_splits + _stream_compute.size() - 1) % _stream_compute.size();
-    CHECK_CUDA(
-        cudaEventRecord(_stop_compute, (cudaStream_t)_stream_compute[last_compute_stream_id]));
     CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
-    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_compute, 0));
     CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
     at::cuda::setCurrentCUDAStream(stream_main);
 
