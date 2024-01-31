@@ -89,8 +89,8 @@ def _prepare_backward(
             fp8_meta["autocast_id_bwd"] = fp8_meta["autocast_id_fwd_stack"].pop(0)
 
             FP8GlobalStateManager.add_amax_to_global_buffer(fp8_meta, forward=False)
-        #else:
-        #    amax_and_scale_update(fp8_meta, False)
+        else:
+            amax_and_scale_update(fp8_meta, False)
 
     with torch.cuda.nvtx.range(name + " backward"):
         yield
@@ -263,7 +263,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         num_fp8_tensors = (
             self.fp8_meta["num_gemms"] * 3 if fwd else self.fp8_meta["num_gemms"] * 2
         )
-
         self.fp8_meta[fp8_meta_tensor_key] = tex.FP8TensorMeta()
         self.fp8_meta[fp8_meta_tensor_key].scale = torch.ones(
             num_fp8_tensors, dtype=torch.float32, device="cuda"
@@ -304,7 +303,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 self.fp8_meta[key].scale.copy_(torch.ones_like(self.fp8_meta[key].scale))
                 self.fp8_meta[key].scale_inv.copy_(torch.ones_like(self.fp8_meta[key].scale_inv))
                 self.fp8_meta[key].amax_history.copy_(
-                    torch.ones_like(self.fp8_meta[key].amax_history))
+                    torch.zeros_like(self.fp8_meta[key].amax_history))
         with torch.no_grad():
             reset("scaling_fwd")
             reset("scaling_bwd")
@@ -548,10 +547,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
                     )
                     FP8GlobalStateManager.set_amax_buffer_key_deletion(self.fp8_meta, forward=True)
-                #else:
-                #    amax_and_scale_update(
-                #        self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
-                #    )
+                else:
+                    amax_and_scale_update(
+                        self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
+                    )
 
             if self.fp8 and self.training:
                 # Setup for amax reduction

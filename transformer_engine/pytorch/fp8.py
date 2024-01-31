@@ -594,7 +594,8 @@ def _default_get_amax(
     else:  # amax_compute_algo == "most_recent"
         amax = amax_history[0].clone()
 
-    amax_history = _update_amax_history(amax_history)
+    amax_history1 = _update_amax_history(amax_history)
+    amax_history.copy_(amax_history1)
     return amax_history, amax
 
 
@@ -609,7 +610,8 @@ def _default_sf_compute(
     sf = (fp8_max / amax) / (2 ** margin)
     sf = torch.where(amax > 0.0, sf, scale)
     sf = torch.where(torch.isfinite(amax), sf, scale)
-    return sf
+    scale.copy_(sf)
+    return scale
 
 
 @jit_fuser
@@ -621,8 +623,11 @@ def _compute_scaling_factor_inverse(
 ) -> torch.Tensor:
     """Compute inverse of scaling factor."""
     if update_weight_scale_inv:
-        return 1.0 / scale
-    return torch.where(non_weight_mask, 1.0 / scale, scale_inv)
+        scale_inv.copy_(1.0 / scale)
+    else:
+        scale_inv1 = torch.where(non_weight_mask, 1.0 / scale, scale_inv)
+        scale_inv.copy_(scale_inv1)
+    return scale_inv
 
 
 @jit_fuser
