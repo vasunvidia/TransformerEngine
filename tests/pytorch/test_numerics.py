@@ -21,8 +21,8 @@ from transformer_engine.pytorch.utils import (
     is_bf16_compatible,
 )
 from transformer_engine.pytorch import (
-    DotProductAttention, LayerNormLinear, LayerNormMLP, Linear,
-    MultiheadAttention, RMSNorm, TransformerLayer, LayerNorm, InferenceParams
+    DotProductAttention, LayerNormLinear, LayerNormMLP, Linear, RMSNorm,
+    make_graphed_callables, MultiheadAttention, TransformerLayer, LayerNorm, InferenceParams
 )
 from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
 from transformer_engine.pytorch.distributed import _set_cuda_rng_state, CudaRNGStatesTracker
@@ -1321,6 +1321,7 @@ def test_gpt_fp8_parameters(dtype, bs, model):
     outputs_fp8_params = _test_gpt_fp8_parameters(bs, dtype, config, True)
     assert_all_equal(outputs, outputs_fp8_params)
 
+
 @pytest.mark.parametrize("dtype", param_types)
 @pytest.mark.parametrize("bs", batch_sizes)
 @pytest.mark.parametrize("model", model_configs.keys())
@@ -1512,3 +1513,68 @@ def test_kv_cache_accuracy(dtype, bs, model_key, use_RoPE, input_format, module,
 
     # Check if the fully generated output matches the one generated incrementally
     assert_allclose(full_output, incremental_output, atol[dtype])
+def _test_gpt_e2e_make_graphed_callables(block, forward_func, bs, dtype, config):
+    reset_rng_states()
+
+    inp = torch.randn(config.seq_len, bs, config.hidden_size, device='cuda', dtype=dtype, requires_grad=True)
+
+    out = forward_func(inp)
+    loss = out.sum()
+    loss.backward()
+
+    grads = [inp.grad]
+    for p in block.parameters():
+        if p.requires_grad:
+            grads.append(p.grad)
+
+    return out, grads
+
+
+def get_forward_func(block):
+    def func(inp):
+        with fp8_autocast(enabled=fp8_available):
+            out = block(inp)
+        return out
+    return func
+
+
+@pytest.mark.parametrize("dtype", param_types)
+@pytest.mark.parametrize("bs", batch_sizes)
+@pytest.mark.parametrize("model", model_configs.keys())
+def test_gpt_make_graphed_callables(dtype, bs, model):
+    config = model_configs[model]
+
+    sigma = 0.023
+    init_method = init_method_normal(sigma)
+    output_layer_init_method = scaled_init_method_normal(sigma, config.num_layers)
+
+    block = (
+        TransformerLayer(
+            config.hidden_size,
+            4 * config.hidden_size,
+            config.num_attention_heads,
+            layernorm_epsilon=config.eps,
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
+            hidden_dropout=0.1,
+            attention_dropout=0.1,
+            kv_channels=config.embed,
+            apply_residual_connection_post_layernorm=False,
+            output_layernorm=False,
+            fuse_qkv_params=True,
+        )
+        .to(dtype=dtype)
+        .cuda()
+    )
+    graphed_block = copy.deepcopy(block)
+    graph_inp = torch.randn(config.seq_len, bs, config.hidden_size, device='cuda', dtype=dtype, requires_grad=True)
+
+    forward_func = get_forward_func(block)
+    forward_func_graphed = make_graphed_callables(graphed_block, (graph_inp,), num_warmup_iters=3, enabled=fp8_available)
+
+    out, grads = _test_gpt_e2e_make_graphed_callables(block, forward_func, bs, dtype, config)
+    graphed_out, graphed_grads = _test_gpt_e2e_make_graphed_callables(graphed_block, forward_func_graphed, bs, dtype, config)
+
+    # Check that results match
+    assert_allclose(out, graphed_out, 1e-1)
+    # assert_allclose(grads, graphed_grads, 1e-1)
