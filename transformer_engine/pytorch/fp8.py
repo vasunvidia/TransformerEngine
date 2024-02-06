@@ -585,27 +585,28 @@ def fp8_autocast(
         FP8GlobalStateManager.fp8_autocast_exit(enabled, _graph=_graph)
 
 
-def _update_amax_history(amax_history: torch.Tensor) -> None:
+def _update_amax_history(amax_history: torch.Tensor) -> torch.Tensor:
     """Update amax history and set next amax to zero."""
     if amax_history.shape[0] > 1:
         new_amax_history = torch.roll(amax_history, -1, 0)
         amax_history.copy_(new_amax_history)
     amax_history[0].fill_(0.0)
+    return amax_history
 
 
 @torch.jit.script
 def _default_get_amax_and_update_history(
     amax_history: torch.Tensor,
     amax_compute_algo: str,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Default function to obtain amax from history."""
     if amax_compute_algo == "max":
         amax = torch.max(amax_history, dim=0).values
     else:  # amax_compute_algo == "most_recent"
         amax = amax_history[0].clone()
 
-    _update_amax_history(amax_history)
-    return amax
+    amax_history = _update_amax_history(amax_history)
+    return amax_history, amax
 
 
 @jit_fuser
@@ -614,7 +615,7 @@ def _default_sf_compute(
     scale: torch.Tensor,
     fp8_max: float,
     margin: int,
-) -> None:
+) -> torch.Tensor:
     """Default function to convert amax to scaling factor."""
     sf = (fp8_max / amax) / (2 ** margin)
     sf = torch.where(amax > 0.0, sf, scale)
@@ -644,19 +645,17 @@ def _compute_scaling_factor(
     scale: torch.Tensor,
     fp8_max: float,
     recipe: DelayedScaling,
-) -> None:
+) -> torch.Tensor:
     """Convert amax to scaling factor."""
 
     if recipe.scaling_factor_compute_algo is None:
-        _default_sf_compute(
+        return _default_sf_compute(
             amax,
             scale,
             fp8_max,
             recipe.margin,
         )
-        return
-    new_scale = recipe.scaling_factor_compute_algo(amax, scale, fp8_max, recipe)
-    scale.copy_(new_scale)
+    return recipe.scaling_factor_compute_algo(amax, scale, fp8_max, recipe)
 
 
 def _amax_and_scale_update(
