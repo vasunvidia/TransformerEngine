@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -9,6 +9,7 @@ from torch.utils._pytree import tree_unflatten as _tree_unflatten
 from torch._C import _graph_pool_handle
 
 from .fp8 import fp8_autocast, FP8GlobalStateManager
+from .distributed import _set_cuda_rng_state
 
 
 __all__ = ["make_graphed_callables"]
@@ -303,14 +304,21 @@ def make_graphed_callables(
     else:
         forward_funcs = tuple(forward_funcs)
 
+    # Save RNG state.
+    cuda_rng_state = torch.cuda.get_rng_state()
+
     graphed_callables = _make_graphed_callables(
         forward_funcs, sample_args, per_callable_module_params,
         num_warmup_iters=num_warmup_iters,
         allow_unused_input=allow_unused_input)
 
+    # Ensures warmup does not affect numerics for ops such as dropout.
+    _set_cuda_rng_state(cuda_rng_state)
+
     # Remove FP8 state from warmup.
     for module in modules:
-        module.reset_fp8_meta_tensors()
+        if hasattr(module, 'reset_fp8_meta_tensors'):
+            module.reset_fp8_meta_tensors()
         for p in module.parameters():
             p.grad = None
     FP8GlobalStateManager.reset()
