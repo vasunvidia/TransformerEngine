@@ -247,8 +247,9 @@ def _make_graphed_callables(
 
                 return new_fwd
 
-            func.forward = make_graphed_forward(func, func.training, graphed, func.forward)
-            ret.append(func)
+            #func.forward = make_graphed_forward(func, func.training, graphed, func.forward)
+            #ret.append(func)
+            ret.append(graphed)
         else:
             ret.append(graphed)
 
