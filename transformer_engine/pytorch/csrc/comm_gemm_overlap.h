@@ -507,7 +507,7 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
       }
     }
 
-    at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     CHECK_CUDA(cudaEventRecord(_start_d2dcopy, (cudaStream_t)stream_main));
     CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_d2dcopy, 0));
     CHECK_CUDA(cudaMemcpyAsync(ubuf_ptr, input.data_ptr(), input.numel() * input.element_size(),
