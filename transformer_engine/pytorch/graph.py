@@ -389,4 +389,5 @@ def make_graphed_callables(
     # Restore FP8 state.
     restore_fp8_tensors(modules, saved_fp8_tensors)
 
+    set_fp8_graph_capture_end()
     return graphed_callables
