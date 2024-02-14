@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Functions for CUDA Graphs support in FP8"""
+import os
 import torch
 from torch.utils._pytree import tree_flatten as _tree_flatten
 from torch.utils._pytree import tree_unflatten as _tree_unflatten
@@ -30,6 +31,7 @@ def graph_pool_handle():
 def _make_graphed_callables(
     callables,
     sample_args,
+    order=None,
     num_warmup_iters=3,
     allow_unused_input=False,
     fp8_weight_caching=False,
@@ -56,7 +58,7 @@ def _make_graphed_callables(
     if fp8_weight_caching:
         FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
-    for c, args in zip(callables, sample_args):
+    for c in callables:
         if isinstance(c, torch.nn.Module):
             assert (
                 len(c._backward_hooks) == 0
@@ -72,6 +74,7 @@ def _make_graphed_callables(
                 + ":func:`~make_graphed_callables`, only parameters may be trainable. "
                 + "All buffers must have ``requires_grad=False``."
             )
+    for args in sample_args:
         flatten_arg, _ = _tree_flatten(args)
         flatten_sample_args.append(tuple(flatten_arg))
         assert all(isinstance(arg, torch.Tensor) for arg in flatten_arg), (
@@ -82,17 +85,40 @@ def _make_graphed_callables(
     # If a callable is an nn.Module, its graph's full input surface is the args the user explicitly
     # passes to forward (ie, its sample_args) AND the module's parameter attributes.
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
-    per_callable_module_params = [
-        tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
-        for c in callables
-    ]
-    per_callable_static_input_surfaces = [
-        flatten_sample_args[i] + per_callable_module_params[i]
-        for i in range(len(callables))
-    ]
+    if order is None:
+        per_callable_module_params = [
+            tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
+            for c in callables
+        ]
+        per_callable_static_input_surfaces = [
+            flatten_sample_args[i] + per_callable_module_params[i]
+            for i in range(len(callables))
+        ]
+    else:
+        # order is a list containing 1..model_chunk values in the order of microbatch schedule
+        num_model_chunks = max(order)
+        num_microbatches = len(order) // num_model_chunks // 2
+        assert num_model_chunks * num_microbatches * 2 == len(order)
+        assert (len(flatten_sample_args)*2 >= len(order)) and (len(flatten_sample_args)*2 % len(order) == 0), f'{len(flatten_sample_args)} >= {len(order)} and {len(flatten_sample_args)} % {len(order)} == 0'
+        num_layers = len(flatten_sample_args) // num_model_chunks // num_microbatches
+        assert len(callables) == num_model_chunks*num_layers, (f"Callables should have ({num_model_chunks * num_layers}) "
+            + f"entries when order input is provided but got {len(callables)}."
+        )
+        assert len(flatten_sample_args) == num_model_chunks * num_microbatches * num_layers, (f"Expected {num_model_chunks * num_microbatches}"
+            + f"args tuple, but got {len(flatten_sample_args)}."
+        )
+        per_callable_module_params = []
+        for c in callables:
+            for i in range(num_microbatches):
+                per_callable_module_params.append(tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ())
+        assert len(per_callable_module_params) == len(flatten_sample_args)
+        per_callable_static_input_surfaces = [
+            flatten_sample_args[i] + per_callable_module_params[i]
+            for i in range(len(flatten_sample_args))
+        ]
 
-    fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(callables))]
-    bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(callables))]
+    fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
+    bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
 
     mempool = graph_pool_handle()
 
@@ -101,9 +127,9 @@ def _make_graphed_callables(
     # from ending up in any captures.
     torch.cuda.synchronize()
     with torch.cuda.stream(torch.cuda.Stream()):
-        for func, args, static_input_surface in zip(
-            callables, sample_args, per_callable_static_input_surfaces
-        ):
+        for c_i, func in enumerate(callables):
+            args = sample_args[c_i]
+            static_input_surface = per_callable_static_input_surfaces[c_i]
             for _ in range(num_warmup_iters):
                 outputs, _ = _tree_flatten(func(*args))
                 grad_inputs = torch.autograd.grad(
@@ -122,58 +148,117 @@ def _make_graphed_callables(
     # the safest approach is to capture all passes in the same order they'll run:
     # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
 
-    # Capture forward graphs
-    per_callable_static_outputs = []
-    per_callable_output_unflatten_spec = []
-    for func, args, fwd_graph in zip(callables, sample_args, fwd_graphs):
-        with torch.cuda.graph(fwd_graph, pool=mempool):
-            outputs = func(*args)
+    if order is not None:
+        per_callable_static_outputs = [None] * len(flatten_sample_args)
+        per_callable_output_unflatten_spec = [None] * len(flatten_sample_args)
+        per_callable_static_grad_outputs = [None] * len(flatten_sample_args)
+        per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
+        fwd_idx = [0] * num_microbatches
+        bwd_idx = [0] * num_microbatches
+        for c_id in order:
+            if c_id > 0:
+                # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
+                m_chunk = c_id-1
+                for l_no in range(num_layers):
+                    func = callables[m_chunk*num_layers + l_no]
+                    per_callable_fwd_idx = m_chunk * num_microbatches * num_layers + fwd_idx[m_chunk] * num_layers + l_no
+                    args = sample_args[per_callable_fwd_idx]
+                    fwd_graph = fwd_graphs[per_callable_fwd_idx]
+                    with torch.cuda.graph(fwd_graph, pool=mempool):
+                        outputs = func(*args)
+                    flatten_outputs, spec = _tree_flatten(outputs)
+                    per_callable_static_outputs[per_callable_fwd_idx] = tuple(flatten_outputs)
+                    per_callable_output_unflatten_spec[per_callable_fwd_idx] = spec
+                fwd_idx[m_chunk] += 1
+            else:
+                # Capture backward graph for model chunk c_id, microbatch bwd_idx[-c_id-1]
+                m_chunk = -c_id-1
+                for l_no in list(reversed(range(num_layers))):
+                    per_callable_bwd_idx = m_chunk * num_microbatches * num_layers + bwd_idx[m_chunk] * num_layers + l_no
+                    static_input_surface = per_callable_static_input_surfaces[per_callable_bwd_idx]
+                    static_outputs = per_callable_static_outputs[per_callable_bwd_idx]
+                    bwd_graph = bwd_graphs[per_callable_bwd_idx]
+                    # For now, assumes all static_outputs require grad
+                    static_grad_outputs = tuple(
+                        torch.empty_like(o) if o.requires_grad else None for o in static_outputs
+                    )
+                    with torch.cuda.graph(bwd_graph, pool=mempool):
+                        grad_inputs = torch.autograd.grad(
+                            outputs=tuple(o for o in static_outputs if o.requires_grad),
+                            inputs=tuple(i for i in static_input_surface if i.requires_grad),
+                            grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
+                            only_inputs=True,
+                            allow_unused=allow_unused_input,
+                        )
+                    # Constructs a tuple suitable for returning from Graphed.backward:
+                    # Pads out the actually-needed grads with Nones in gradient slots for inputs that
+                    # don't require grad. I couldn't think of a slick one-liner for this pattern.
+                    static_grad_inputs = []
+                    grad_idx = 0
+                    for arg in static_input_surface:
+                        if arg.requires_grad:
+                            static_grad_inputs.append(grad_inputs[grad_idx])
+                            grad_idx += 1
+                        else:
+                            static_grad_inputs.append(None)  # type: ignore[arg-type]
+                    static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
 
-        flatten_outputs, spec = _tree_flatten(outputs)
-        per_callable_static_outputs.append(tuple(flatten_outputs))
-        per_callable_output_unflatten_spec.append(spec)
+                    per_callable_static_grad_outputs[per_callable_bwd_idx] = static_grad_outputs
+                    per_callable_static_grad_inputs[per_callable_bwd_idx] = static_grad_inputs
+                bwd_idx[m_chunk] += 1
+    else:
+        # Capture forward graphs
+        per_callable_static_outputs = []
+        per_callable_output_unflatten_spec = []
+        for func, args, fwd_graph in zip(callables, sample_args, fwd_graphs):
+            with torch.cuda.graph(fwd_graph, pool=mempool):
+                outputs = func(*args)
 
-    # Capture backward graphs in reverse order
-    per_callable_static_grad_outputs = []
-    per_callable_static_grad_inputs = []
-    for static_input_surface, static_outputs, bwd_graph in zip(
-        reversed(per_callable_static_input_surfaces),
-        reversed(per_callable_static_outputs),
-        reversed(bwd_graphs),
-    ):
-        # For now, assumes all static_outputs require grad
-        static_grad_outputs = tuple(
-            torch.empty_like(o) if o.requires_grad else None for o in static_outputs
-        )
+            flatten_outputs, spec = _tree_flatten(outputs)
+            per_callable_static_outputs.append(tuple(flatten_outputs))
+            per_callable_output_unflatten_spec.append(spec)
 
-        with torch.cuda.graph(bwd_graph, pool=mempool):
-            grad_inputs = torch.autograd.grad(
-                outputs=tuple(o for o in static_outputs if o.requires_grad),
-                inputs=tuple(i for i in static_input_surface if i.requires_grad),
-                grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
-                only_inputs=True,
-                allow_unused=allow_unused_input,
+        # Capture backward graphs in reverse order
+        per_callable_static_grad_outputs = []
+        per_callable_static_grad_inputs = []
+        for static_input_surface, static_outputs, bwd_graph in zip(
+            reversed(per_callable_static_input_surfaces),
+            reversed(per_callable_static_outputs),
+            reversed(bwd_graphs),
+        ):
+            # For now, assumes all static_outputs require grad
+            static_grad_outputs = tuple(
+                torch.empty_like(o) if o.requires_grad else None for o in static_outputs
             )
 
-        # Constructs a tuple suitable for returning from Graphed.backward:
-        # Pads out the actually-needed grads with Nones in gradient slots for inputs that
-        # don't require grad. I couldn't think of a slick one-liner for this pattern.
-        static_grad_inputs = []
-        grad_idx = 0
-        for arg in static_input_surface:
-            if arg.requires_grad:
-                static_grad_inputs.append(grad_inputs[grad_idx])
-                grad_idx += 1
-            else:
-                static_grad_inputs.append(None)  # type: ignore[arg-type]
-        static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
+            with torch.cuda.graph(bwd_graph, pool=mempool):
+                grad_inputs = torch.autograd.grad(
+                    outputs=tuple(o for o in static_outputs if o.requires_grad),
+                    inputs=tuple(i for i in static_input_surface if i.requires_grad),
+                    grad_outputs=tuple(o for o in static_grad_outputs if o is not None),
+                    only_inputs=True,
+                    allow_unused=allow_unused_input,
+                )
 
-        per_callable_static_grad_outputs.append(static_grad_outputs)
-        per_callable_static_grad_inputs.append(static_grad_inputs)
+            # Constructs a tuple suitable for returning from Graphed.backward:
+            # Pads out the actually-needed grads with Nones in gradient slots for inputs that
+            # don't require grad. I couldn't think of a slick one-liner for this pattern.
+            static_grad_inputs = []
+            grad_idx = 0
+            for arg in static_input_surface:
+                if arg.requires_grad:
+                    static_grad_inputs.append(grad_inputs[grad_idx])
+                    grad_idx += 1
+                else:
+                    static_grad_inputs.append(None)  # type: ignore[arg-type]
+            static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
 
-    # Reverses the most recent two lists
-    per_callable_static_grad_outputs = list(reversed(per_callable_static_grad_outputs))
-    per_callable_static_grad_inputs = list(reversed(per_callable_static_grad_inputs))
+            per_callable_static_grad_outputs.append(static_grad_outputs)
+            per_callable_static_grad_inputs.append(static_grad_inputs)
+
+        # Reverses the most recent two lists
+        per_callable_static_grad_outputs = list(reversed(per_callable_static_grad_outputs))
+        per_callable_static_grad_inputs = list(reversed(per_callable_static_grad_inputs))
     # Now for every per_callable list, per_callable_*[i] holds the stuff for the ith callable.
 
     def make_graphed_autograd_function(
@@ -244,7 +329,7 @@ def _make_graphed_callables(
 
     # Put together the final graphed callables
     ret = []
-    for i, func in enumerate(callables):
+    for i in range(len(sample_args)):
         graphed = make_graphed_autograd_function(
             fwd_graphs[i],
             bwd_graphs[i],
@@ -257,27 +342,31 @@ def _make_graphed_callables(
             per_callable_static_grad_inputs[i],
         )
 
-        if isinstance(func, torch.nn.Module):
+        if order is None:
+            func = callables[i]
+            if isinstance(func, torch.nn.Module):
 
-            def make_graphed_forward(func, graph_training_state, graphed, orig_fwd):
-                def new_fwd(*user_args, **user_kwargs):
-                    # If the module's training-or-eval state matches what we graphed,
-                    # run the graph, otherwise run the original forward method
-                    if func.training == graph_training_state:
-                        # Set the FP8 group from global amax reduction.
-                        for m in func.modules():
-                            if (isinstance(m, TransformerEngineBaseModule)
-                                and FP8GlobalStateManager.is_fp8_enabled()):
-                                m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                                m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
-                                FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                    m.fp8_meta, fp8_weights=m.get_fp8_params())
-                        return graphed(*user_args, **user_kwargs)
-                    return orig_fwd(*user_args, **user_kwargs)
-                return new_fwd
+                def make_graphed_forward(func, graph_training_state, graphed, orig_fwd):
+                    def new_fwd(*user_args, **user_kwargs):
+                        # If the module's training-or-eval state matches what we graphed,
+                        # run the graph, otherwise run the original forward method
+                        if func.training == graph_training_state:
+                            # Set the FP8 group from global amax reduction.
+                            for m in func.modules():
+                                if (isinstance(m, TransformerEngineBaseModule)
+                                    and FP8GlobalStateManager.is_fp8_enabled()):
+                                    m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
+                                    m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+                                    FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
+                                        m.fp8_meta, fp8_weights=m.get_fp8_params())
+                            return graphed(*user_args, **user_kwargs)
+                        return orig_fwd(*user_args, **user_kwargs)
+                    return new_fwd
 
-            func.forward = make_graphed_forward(func, func.training, graphed, func.forward)
-            ret.append(func)
+                func.forward = make_graphed_forward(func, func.training, graphed, func.forward)
+                ret.append(func)
+            else:
+                ret.append(graphed)
         else:
             ret.append(graphed)
 
@@ -314,6 +403,7 @@ def restore_fp8_tensors(modules, fp8_tensors):
 def make_graphed_callables(
     modules,
     sample_args,
+    order=None,
     num_warmup_iters=3,
     allow_unused_input=False,
     enabled=False,
@@ -374,7 +464,7 @@ def make_graphed_callables(
     cuda_rng_state = torch.cuda.get_rng_state()
 
     graphed_callables = _make_graphed_callables(
-        forward_funcs, sample_args, num_warmup_iters=num_warmup_iters,
+        forward_funcs, sample_args, order, num_warmup_iters=num_warmup_iters,
         allow_unused_input=allow_unused_input,
         fp8_weight_caching=fp8_weight_caching)
 

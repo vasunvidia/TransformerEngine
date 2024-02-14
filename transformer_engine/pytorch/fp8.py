@@ -677,7 +677,7 @@ def _amax_and_scale_update(
     amax_history.copy_(new_amax_history)
 
 
-@jit_fuser
+#@jit_fuser
 def split_and_copy(
     buffer: torch.Tensor,
     outputs: List[torch.Tensor],
