@@ -153,8 +153,8 @@ def _make_graphed_callables(
         per_callable_output_unflatten_spec = [None] * len(flatten_sample_args)
         per_callable_static_grad_outputs = [None] * len(flatten_sample_args)
         per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
-        fwd_idx = [0] * num_microbatches
-        bwd_idx = [0] * num_microbatches
+        fwd_idx = [0] * num_model_chunks
+        bwd_idx = [0] * num_model_chunks
         for c_id in order:
             if c_id > 0:
                 # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
