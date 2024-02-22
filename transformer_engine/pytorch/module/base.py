@@ -212,6 +212,11 @@ def get_ub(name: str):
     assert name in _ub_communicators, f"UB for {name} is not registered."
     return _ub_communicators[name]
 
+def destroy_ub():
+    global _ub_communicators
+    assert _ub_communicators is not None, "UB communicators are not initialized."
+    ub_obj = get_ub("qkv_fprop")
+    ub_obj.destroy()
 
 class TransformerEngineBaseModule(torch.nn.Module, ABC):
     """Base TE module."""

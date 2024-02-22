@@ -121,14 +121,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("atomic_gemm_overlap_rs", &ubuf::UbufCommOverlap::atomic_gemm_overlap_rs)
     .def("is_fp8_ubuf", &ubuf::UbufCommOverlap::is_fp8_ubuf)
     .def("copy_input_to_ubuf", &ubuf::UbufCommOverlap::copy_input_to_ubuf)
-    .def("get_ubuf_output", &ubuf::UbufCommOverlap::get_ubuf_output);
+    .def("get_ubuf_output", &ubuf::UbufCommOverlap::get_ubuf_output)
+    .def("destroy", &ubuf::UbufCommOverlap::destroy);
 
   py::class_<ubuf::UbufP2PCommOverlap>(m, "UbufP2PCommOverlap")
     .def(py::init<torch::Tensor&, int, int, int, int, bool, bool, int, torch::Tensor>())
     .def("split_overlap_ag", &ubuf::UbufP2PCommOverlap::split_overlap_ag)
     .def("atomic_gemm_overlap_ag", &ubuf::UbufP2PCommOverlap::atomic_gemm_overlap_ag)
     .def("copy_input_to_ubuf", &ubuf::UbufP2PCommOverlap::copy_input_to_ubuf)
-    .def("get_ubuf_output", &ubuf::UbufP2PCommOverlap::get_ubuf_output);
+    .def("get_ubuf_output", &ubuf::UbufP2PCommOverlap::get_ubuf_output)
+    .def("destroy", &ubuf::UbufP2PCommOverlap::destroy);
 #else  // NVTE_WITH_USERBUFFERS
   m.def("UbufOverlapAlgo", &placeholder, "Dummy function for python side annotations");
   m.def("UbufCommOverlap", &placeholder, "Dummy function for python side annotations");

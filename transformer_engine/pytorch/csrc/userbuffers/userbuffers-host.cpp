@@ -344,6 +344,8 @@ void destroy_communicator(communicator *comm) {
   if (!comm->myrank && getenv("NVTE_UBDEBUG"))
     printf("waiting for userbuffers proxy thread to exit()\n");
   gdr_close(comm->g);
+  MPI_Comm_free(&comm->comm_inter);
+  MPI_Comm_free(&comm->comm_intra);
 }
 
 int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *comm, bool alloc) {

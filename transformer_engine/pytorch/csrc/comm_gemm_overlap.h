@@ -517,6 +517,15 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     output_tensor = torch::from_blob(ubuf_wt_ptr, {output_c_dim0, output_c_dim1}, _ubuf.options());
     return output_tensor;
   }
+
+  void destroy() {
+    // Destroy userbuf communicator
+    if (comm_created) {
+      printf ("Destroy communicator\n");
+      destroy_communicator(_ub_comm);
+      comm_created = false;
+    }
+  }
 };  // UbufCommOverlap
 
 struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
@@ -977,6 +986,15 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
     int output_c_dim0 = (_comm_type == COMM_TYPE::AG) ? _ubuf.size(0) : _ubuf.size(0) / _tp_size;
     int output_c_dim1 = _ubuf.size(1);
     return torch::from_blob(ubuf_wt_ptr, {output_c_dim0, output_c_dim1}, _ubuf.options());
+  }
+
+  void destroy() {
+    // Destroy userbuf communicator
+    if (comm_created) {
+      printf ("Destroy communicator\n");
+      destroy_communicator(_ub_comm);
+      comm_created = false;
+    }
   }
 };  // UbufP2PCommOverlap
 
