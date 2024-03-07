@@ -270,6 +270,10 @@ def _make_graphed_callables(
                     # If the module's training-or-eval state matches what we graphed,
                     # run the graph, otherwise run the original forward method
                     if func.training == graph_training_state:
+                        # Set the FP8 group from global amax reduction.
+                        for module in func.modules():
+                            if isinstance(module, TransformerEngineBaseModule):
+                                module.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                         return graphed(*user_args, **user_kwargs)
                     return orig_fwd(*user_args, **user_kwargs)
 
@@ -315,10 +319,9 @@ def make_graphed_callables(
     sample_args,
     num_warmup_iters=3,
     allow_unused_input=False,
-    enabled = False,
-    calibrating = False,
-    fp8_recipe = None,
-    fp8_group = None,
+    enabled=False,
+    calibrating=False,
+    fp8_recipe=None,
     fp8_weight_caching=False,
 ):
     """
@@ -348,8 +351,7 @@ def make_graphed_callables(
         def forward_func(*args, **kwargs):
             with fp8_autocast(enabled=enabled,
                               calibrating=calibrating,
-                              fp8_recipe=fp8_recipe,
-                              fp8_group=fp8_group):
+                              fp8_recipe=fp8_recipe):
                 outputs = old_forward(*args, **kwargs)
             return outputs
         block.forward = forward_func
