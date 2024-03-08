@@ -55,8 +55,35 @@ def _make_graphed_callables(
 
     flatten_sample_args = []
 
+    if order is not None:
+        # order is a list containing 1..model_chunk values in the order of microbatch schedule
+        num_model_chunks = max(order)
+        num_microbatches = len(order) // num_model_chunks // 2
+        assert num_model_chunks * num_microbatches * 2 == len(order)
+        assert (len(sample_args)*2 >= len(order)) and (len(sample_args)*2 % len(order) == 0), f'{len(sample_args)} >= {len(order)} and {len(sample_args)} % {len(order)} == 0'
+        num_layers = len(sample_args) // num_model_chunks // num_microbatches
+        assert len(callables) == num_model_chunks*num_layers, (f"Callables should have ({num_model_chunks * num_layers}) "
+            + f"entries when order input is provided but got {len(callables)}."
+        )
+        assert len(sample_args) == num_model_chunks * num_microbatches * num_layers, (f"Expected {num_model_chunks * num_microbatches}"
+            + f"args tuple, but got {len(sample_args)}."
+        )
+
     if fp8_weight_caching:
         FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+        modified_sample_args = []
+        n_callables = len(callables)
+        for i, args in enumerate(sample_args):
+            if order is None:
+                args += (torch.empty(1, device="cuda"),)
+            else:
+                current_microbatch = (i // num_layers) % num_microbatches
+                if current_microbatch == 0:
+                    args += (torch.zeros(1, device="cuda"),)
+                else:
+                    args += (torch.ones(1, device="cuda"),)
+            modified_sample_args.append(args)
+        sample_args = modified_sample_args
 
     for c in callables:
         if isinstance(c, torch.nn.Module):
@@ -95,18 +122,6 @@ def _make_graphed_callables(
             for i in range(len(callables))
         ]
     else:
-        # order is a list containing 1..model_chunk values in the order of microbatch schedule
-        num_model_chunks = max(order)
-        num_microbatches = len(order) // num_model_chunks // 2
-        assert num_model_chunks * num_microbatches * 2 == len(order)
-        assert (len(flatten_sample_args)*2 >= len(order)) and (len(flatten_sample_args)*2 % len(order) == 0), f'{len(flatten_sample_args)} >= {len(order)} and {len(flatten_sample_args)} % {len(order)} == 0'
-        num_layers = len(flatten_sample_args) // num_model_chunks // num_microbatches
-        assert len(callables) == num_model_chunks*num_layers, (f"Callables should have ({num_model_chunks * num_layers}) "
-            + f"entries when order input is provided but got {len(callables)}."
-        )
-        assert len(flatten_sample_args) == num_model_chunks * num_microbatches * num_layers, (f"Expected {num_model_chunks * num_microbatches}"
-            + f"args tuple, but got {len(flatten_sample_args)}."
-        )
         per_callable_module_params = []
         for c in callables:
             for i in range(num_microbatches):
@@ -280,7 +295,10 @@ def _make_graphed_callables(
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
 
                 for i in range(len_user_args):
-                    if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
+                    if not torch.is_tensor(inputs[i]):
+                        if inputs[i] != -1:
+                            static_input_surface[i].fill_(inputs[i])
+                    elif static_input_surface[i].data_ptr() != inputs[i].data_ptr():
                         static_input_surface[i].copy_(inputs[i])
                 fwd_graph.replay()
                 assert isinstance(static_outputs, tuple)
@@ -320,6 +338,12 @@ def _make_graphed_callables(
 
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(
                     not user_kwargs["is_first_microbatch"])
+                if order is not None:
+                    bool_tensor = -1
+                else:
+                    f = torch.zeros if user_kwargs["is_first_microbatch"] else torch.ones
+                    bool_tensor = f(1, device="cuda")
+                user_args += (bool_tensor,)
 
             flatten_user_args, _ = _tree_flatten(user_args)
             out = Graphed.apply(*(tuple(flatten_user_args) + module_params))
