@@ -413,6 +413,7 @@ class TransformerLayer(torch.nn.Module):
             zero_centered_gamma=zero_centered_gamma,
             ub_bulk_wgrad=ub_bulk_wgrad,
             ub_bulk_dgrad=ub_bulk_dgrad,
+            ub_overlap_rs_dgrad=ub_overlap_rs_dgrad,
             ub_overlap_rs=ub_overlap_rs,
             ub_overlap_ag=ub_overlap_ag,
             activation=activation,
