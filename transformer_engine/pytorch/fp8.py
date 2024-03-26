@@ -18,7 +18,6 @@ from .jit import jit_fuser
 
 
 __all__ = ["fp8_autocast", "fp8_model_init"]
-_IN_FP8_CUDA_GRAPH_CAPTURE = False
 
 
 def check_fp8_support() -> Tuple[bool, str]:
@@ -686,20 +685,3 @@ def split_and_copy(
     """Split `buffer` by `chunk_sizes` and copy into `outputs`."""
     splits = buffer.split(chunk_sizes)
     torch._foreach_copy_(outputs, splits)
-
-
-def set_fp8_graph_capture_start():
-    """Being capture."""
-    global _IN_FP8_CUDA_GRAPH_CAPTURE
-    _IN_FP8_CUDA_GRAPH_CAPTURE = True
-
-
-def set_fp8_graph_capture_end():
-    """End capture."""
-    global _IN_FP8_CUDA_GRAPH_CAPTURE
-    _IN_FP8_CUDA_GRAPH_CAPTURE = False
-
-
-def in_fp8_graph_capture_mode():
-    """Is cuda graph being captured."""
-    return _IN_FP8_CUDA_GRAPH_CAPTURE
