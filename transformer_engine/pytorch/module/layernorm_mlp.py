@@ -593,7 +593,7 @@ class _LayerNormMLP(torch.autograd.Function):
                     ctx.ub_overlap_rs_dgrad = False
             if ctx.ub_bulk_dgrad:
                 tp_world_size = get_distributed_world_size(ctx.tp_group)
-                if tp_world_size == 1:
+                if tp_world_size == 1 or not fc1_weight.requires_grad:
                     ctx.ub_bulk_dgrad = False
             if ctx.ub_bulk_dgrad:
                 dim_size = list(ln_out.size())
