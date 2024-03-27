@@ -165,9 +165,7 @@ def rmsnorm_fwd_fp8(
             fp8_meta_tensor.scale_inv[fp8_tensor],
             otype,
             sm_margin,
-            zero_centered_gamma,
-            workspace,
-            barrier,
+            zero_centered_gamma
         )
     else:
         out, rsigma, workspace, barrier = tex.rmsnorm_fwd_fp8(
@@ -179,9 +177,7 @@ def rmsnorm_fwd_fp8(
             fp8_meta_tensor.scale_inv[fp8_tensor],
             otype,
             sm_margin,
-            zero_centered_gamma,
-            workspace,
-            barrier,
+            zero_centered_gamma
         )
     set_norm_workspace_and_barrier(conf, workspace, barrier)
     return out, rsigma
