@@ -71,19 +71,6 @@ def _make_graphed_callables(
 
     if fp8_weight_caching:
         FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
-        modified_sample_args = []
-        n_callables = len(callables)
-        for i, args in enumerate(sample_args):
-            if order is None:
-                args += (torch.empty(1, device="cuda"),)
-            else:
-                current_microbatch = (i // num_layers) % num_microbatches
-                if current_microbatch == 0:
-                    args += (torch.zeros(1, device="cuda"),)
-                else:
-                    args += (torch.ones(1, device="cuda"),)
-            modified_sample_args.append(args)
-        sample_args = modified_sample_args
 
     for c in callables:
         if isinstance(c, torch.nn.Module):
@@ -134,7 +121,7 @@ def _make_graphed_callables(
 
     fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
     bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
-
+    graph_callables = [None for _ in range(len(flatten_sample_args))]
     mempool = graph_pool_handle()
 
     # Warmup
@@ -184,6 +171,7 @@ def _make_graphed_callables(
                     flatten_outputs, spec = _tree_flatten(outputs)
                     per_callable_static_outputs[per_callable_fwd_idx] = tuple(flatten_outputs)
                     per_callable_output_unflatten_spec[per_callable_fwd_idx] = spec
+                    graph_callables[per_callable_fwd_idx] = func
                 fwd_idx[m_chunk] += 1
             else:
                 # Capture backward graph for model chunk c_id, microbatch bwd_idx[-c_id-1]
@@ -225,9 +213,12 @@ def _make_graphed_callables(
         # Capture forward graphs
         per_callable_static_outputs = []
         per_callable_output_unflatten_spec = []
+        graph_id = 0
         for func, args, fwd_graph in zip(callables, sample_args, fwd_graphs):
             with torch.cuda.graph(fwd_graph, pool=mempool):
                 outputs = func(*args)
+            graph_callables[graph_id] = func
+            graph_id += 1
 
             flatten_outputs, spec = _tree_flatten(outputs)
             per_callable_static_outputs.append(tuple(flatten_outputs))
@@ -295,10 +286,7 @@ def _make_graphed_callables(
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
 
                 for i in range(len_user_args):
-                    if not torch.is_tensor(inputs[i]):
-                        if inputs[i] != -1:
-                            static_input_surface[i].fill_(inputs[i])
-                    elif static_input_surface[i].data_ptr() != inputs[i].data_ptr():
+                    if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
                         static_input_surface[i].copy_(inputs[i])
                 fwd_graph.replay()
                 assert isinstance(static_outputs, tuple)
@@ -338,12 +326,6 @@ def _make_graphed_callables(
 
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(
                     not user_kwargs["is_first_microbatch"])
-                if order is not None:
-                    bool_tensor = -1
-                else:
-                    f = torch.zeros if user_kwargs["is_first_microbatch"] else torch.ones
-                    bool_tensor = f(1, device="cuda")
-                user_args += (bool_tensor,)
 
             flatten_user_args, _ = _tree_flatten(user_args)
             out = Graphed.apply(*(tuple(flatten_user_args) + module_params))
@@ -366,31 +348,31 @@ def _make_graphed_callables(
             per_callable_static_grad_inputs[i],
         )
 
-        if order is None:
-            func = callables[i]
-            if isinstance(func, torch.nn.Module):
+        func = graph_callables[i]
+        if isinstance(func, torch.nn.Module):
+            def make_graphed_forward(func, graph_training_state, graphed, orig_fwd):
+                def new_fwd(*user_args, **user_kwargs):
+                    # If the module's training-or-eval state matches what we graphed,
+                    # run the graph, otherwise run the original forward method
+                    if func.training == graph_training_state:
+                        # Set the FP8 group from global amax reduction.
+                        for m in func.modules():
+                            if (isinstance(m, TransformerEngineBaseModule)
+                                and FP8GlobalStateManager.is_fp8_enabled()):
+                                m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
+                                m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+                                FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
+                                    m.fp8_meta, fp8_weights=m.get_fp8_params())
+                        return graphed(*user_args, **user_kwargs)
+                    return orig_fwd(*user_args, **user_kwargs)
+                return new_fwd
 
-                def make_graphed_forward(func, graph_training_state, graphed, orig_fwd):
-                    def new_fwd(*user_args, **user_kwargs):
-                        # If the module's training-or-eval state matches what we graphed,
-                        # run the graph, otherwise run the original forward method
-                        if func.training == graph_training_state:
-                            # Set the FP8 group from global amax reduction.
-                            for m in func.modules():
-                                if (isinstance(m, TransformerEngineBaseModule)
-                                    and FP8GlobalStateManager.is_fp8_enabled()):
-                                    m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                                    m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
-                                    FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                        m.fp8_meta, fp8_weights=m.get_fp8_params())
-                            return graphed(*user_args, **user_kwargs)
-                        return orig_fwd(*user_args, **user_kwargs)
-                    return new_fwd
-
-                func.forward = make_graphed_forward(func, func.training, graphed, func.forward)
+            forward = make_graphed_forward(func, func.training, graphed, func.forward)
+            if order is None:
+                func.forward = forward
                 ret.append(func)
             else:
-                ret.append(graphed)
+                ret.append(forward)
         else:
             ret.append(graphed)
 
