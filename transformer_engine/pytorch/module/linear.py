@@ -146,6 +146,11 @@ class _Linear(torch.autograd.Function):
                 # Weight is already in FP8
                 weight.reset_fp8_meta_scale_inv()
                 weight_fp8 = weight
+                weight_t_fp8 = weight._transpose(
+                    cache=is_first_microbatch is not None,
+                    update_cache=is_first_microbatch,
+                    noop_tensor=skip_fp8_weight_update,
+                )
             elif update_fp8_weights:
                 # Need to cast weights to FP8
                 weight_fp8 = Float8Tensor(
@@ -174,6 +179,8 @@ class _Linear(torch.autograd.Function):
                         out=weight_fp8._data,
                     )
                     weight_t_fp8 = None
+                weight_t_fp8 = weight_t_fp8._data
+
 
             proj_out_index, meta_tensor, proj_out_tetype, proj_out_pttype = (
                 None, None, None, activation_dtype)
@@ -352,16 +359,6 @@ class _Linear(torch.autograd.Function):
             if ctx.cpu_offloading and ctx.fuse_wgrad_accumulation:
                 weight = torch.nn.Parameter(weight, False)
                 weight.main_grad = main_grad
-
-            # Primary weights are in FP8.
-            if ctx.primary_weights_in_fp8:
-                weight_t_fp8 = weight._transpose(
-                    cache=ctx.is_first_microbatch is not None,
-                    update_cache=ctx.is_first_microbatch,
-                    noop_tensor=skip_fp8_weight_update,
-                )
-            elif ctx.fp8:
-                weight_t_fp8 = weight_t_fp8._data
 
             tp_world_size = get_distributed_world_size(ctx.tp_group)
             ctx.ub_overlap_ag = False if tp_world_size == 1 else ctx.ub_overlap_ag
