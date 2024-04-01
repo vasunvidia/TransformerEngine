@@ -287,7 +287,7 @@ def _make_graphed_callables(
 
                 for i in range(len_user_args):
                     if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
-                        static_input_surface[i].copy_(inputs[i])
+                        static_input_surface[i].copy_(inputs[i], non_blocking=True)
                 fwd_graph.replay()
                 assert isinstance(static_outputs, tuple)
                 return tuple(o.detach() for o in static_outputs)
@@ -301,7 +301,7 @@ def _make_graphed_callables(
                         # don't copy if autograd gods have been kind and the
                         # incoming grad is already in the right place
                         if g.data_ptr() != grad.data_ptr():
-                            g.copy_(grad)
+                            g.copy_(grad, non_blocking=True)
                 bwd_graph.replay()
 
                 if ctx.is_first_module:
