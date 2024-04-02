@@ -278,7 +278,7 @@ class TestFloat8Tensor:
         x = x_fp8.from_float8()
 
         # Perform transpose
-        x_fp8_t = x_fp8._transpose()
+        x_fp8_t = x_fp8.transpose_2d()
         x_t = x.transpose(0, 1)
         if x_fp8_t.dtype == torch.uint8:
             x_fp8_t = Float8Tensor.make_like(x_fp8, data=x_fp8_t)

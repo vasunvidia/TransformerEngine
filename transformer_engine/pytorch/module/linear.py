@@ -355,10 +355,9 @@ class _Linear(torch.autograd.Function):
 
             # Primary weights are in FP8.
             if ctx.primary_weights_in_fp8:
-                weight_t_fp8 = weight._transpose(
+                weight_t_fp8 = weight.transpose_2d(
                     cache=ctx.is_first_microbatch is not None,
-                    update_cache=ctx.is_first_microbatch,
-                    noop_tensor=skip_fp8_weight_update,
+                    noop_flag=skip_fp8_weight_update,
                 )
             elif ctx.fp8:
                 weight_t_fp8 = weight_t_fp8._data
