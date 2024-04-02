@@ -633,6 +633,7 @@ def _fused_amax_and_scale_update(
     amax_history: torch.Tensor,
     scale: torch.Tensor,
     scale_inv: torch.Tensor,
+    fp8_max: float,
     fp8_dtype: tex.DType,
     margin: int,
     amax_compute_algo: str,
@@ -660,12 +661,7 @@ def _fused_amax_and_scale_update(
         scale,
         scale_inv,
         non_weight_mask,
-        amax_history,
-        scale,
-        scale_inv,
-        amax_compute_algo,
-        fp8_dtype,
-        margin,
+        update_weight_scale_inv,
     )
 
     return amax_history, scale, scale_inv
@@ -725,6 +721,7 @@ def amax_and_scale_update(
             fp8_meta[fp8_meta_tensor_key].amax_history,
             fp8_meta[fp8_meta_tensor_key].scale,
             fp8_meta[fp8_meta_tensor_key].scale_inv,
+            fp8_meta[fp8_max_key],
             get_fp8_te_dtype(fp8_meta["recipe"], fwd_update),
             fp8_meta["recipe"].margin,
             fp8_meta["recipe"].amax_compute_algo,
