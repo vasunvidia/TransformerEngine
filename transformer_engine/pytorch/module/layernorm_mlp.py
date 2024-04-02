@@ -214,16 +214,6 @@ class _LayerNormMLP(torch.autograd.Function):
                 fc2_weight.reset_fp8_meta_scale_inv()
                 fc1_weight_fp8 = fc1_weight
                 fc2_weight_fp8 = fc2_weight
-                fc1_weight_t_fp8 = fc1_weight._transpose(
-                    cache=is_first_microbatch is not None,
-                    update_cache=is_first_microbatch,
-                    noop_tensor=skip_fp8_weight_update,
-                )
-                fc2_weight_t_fp8 = fc2_weight._transpose(
-                    cache=is_first_microbatch is not None,
-                    update_cache=is_first_microbatch,
-                    noop_tensor=skip_fp8_weight_update,
-                )
             elif update_fp8_weights:
                 # Need to cast weights to FP8
                 fc1_weight_fp8 = Float8Tensor(
@@ -275,9 +265,6 @@ class _LayerNormMLP(torch.autograd.Function):
                         out=fc2_weight_fp8._data,
                     )
                     fc2_weight_t_fp8 = None
-
-                fc1_weight_t_fp8 = fc1_weight_t_fp8._data
-                fc2_weight_t_fp8 = fc2_weight_t_fp8._data
 
             # Perform FP8 GEMM
             fp8_gemm_args = [
@@ -592,6 +579,22 @@ class _LayerNormMLP(torch.autograd.Function):
 
                 fc1_weight.main_grad = fc1_weight_main_grad
                 fc2_weight.main_grad = fc2_weight_main_grad
+
+            # Primary weights are in FP8.
+            if ctx.primary_weights_in_fp8:
+                fc1_weight_t_fp8 = fc1_weight._transpose(
+                    cache=ctx.is_first_microbatch is not None,
+                    update_cache=ctx.is_first_microbatch,
+                    noop_tensor=skip_fp8_weight_update,
+                )
+                fc2_weight_t_fp8 = fc2_weight._transpose(
+                    cache=ctx.is_first_microbatch is not None,
+                    update_cache=ctx.is_first_microbatch,
+                    noop_tensor=skip_fp8_weight_update,
+                )
+            elif ctx.fp8:
+                fc1_weight_t_fp8 = fc1_weight_t_fp8._data
+                fc2_weight_t_fp8 = fc2_weight_t_fp8._data
 
             activation_func = _act_func(ctx.activation)[1]
 
