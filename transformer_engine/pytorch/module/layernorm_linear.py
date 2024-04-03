@@ -297,7 +297,7 @@ class _LayerNormLinear(torch.autograd.Function):
                 weight,
                 weight.main_grad if cpu_offloading and fuse_wgrad_accumulation else None,
                 weight_t_fp8,
-                ln_out,
+                ln_out if weight.requires_grad else None,
                 fp8_meta["scaling_fwd"].scale_inv.clone() if fp8 else None,
                 skip_fp8_weight_update.clone() if skip_fp8_weight_update is not None else None,
             )
@@ -378,7 +378,7 @@ class _LayerNormLinear(torch.autograd.Function):
 
             if ctx.ub_bulk_dgrad:
                 tp_world_size = get_distributed_world_size(ctx.tp_group)
-                if tp_world_size == 1:
+                if tp_world_size == 1 or not weight.requires_grad:
                     ctx.ub_bulk_dgrad = False
             if ctx.ub_bulk_dgrad:
                 dim_size = list(ln_out.size())

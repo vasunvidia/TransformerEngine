@@ -398,7 +398,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     *reduceidptr = reduce_id;
 }  // fp16 reduce-scatter kernel (out of place)
 
-#if 0
+#if __CUDA_ARCH__ >= 900
 // All MC kernels here
 template <int RANKS>
 __global__ void __launch_bounds__(MAX_THREADS)
@@ -2641,7 +2641,11 @@ int reducescatter2_userbuff_inplace_gpu(const int maxcredit, const int handler, 
     callranks2_block_rs(1) callranks2_block_rs(2) callranks2_block_rs(4) callranks2_block_rs(8)
   } else {
     SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
+    if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+      callranks_rsMC(2) callranks_rsMC(4) callranks_rsMC(8)
+    } else {
       callranks_rs(2) callranks_rs(4) callranks_rs(8)
+    }
   }
   return sms;
 }
@@ -2860,7 +2864,11 @@ void allgather2_userbuff_inplace(const int handler, const int offset, const int 
     warps = ar_nvsize;
 
   SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
+  if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+    callranks_agMC(2) callranks_agMC(4) callranks_agMC(8)
+  } else {
     callranks_ag(2) callranks_ag(4) callranks_ag(8)
+  }
 }
 
 void allgather2_userbuff_inplace_sliced(const int handler, const int offset, const int elements,
@@ -2896,7 +2904,11 @@ void reducescatter2_userbuff_inplace(const int handler, const int offset, const 
     warps = ar_nvsize;
 
   SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
+  if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+    callranks_rsMC(2) callranks_rsMC(4) callranks_rsMC(8)
+  } else {
     callranks_rs(2) callranks_rs(4) callranks_rs(8)
+  }
 }
 void reducescatter2_userbuff_stridedoutput(void *output, const int handler, const int offset,
                                            const int rowelements, const int colelements,
@@ -2919,7 +2931,11 @@ void reducescatter2_userbuff_stridedoutput(void *output, const int handler, cons
     warps = ar_nvsize;
 
   SETUP_LAUNCH_CONFIG(sms, warps * 32, stream);
+  if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED)) {
+    callranks_rs_oopMC(2) callranks_rs_oopMC(4) callranks_rs_oopMC(8)
+  } else {
     callranks_rs_oop(2) callranks_rs_oop(4) callranks_rs_oop(8)
+  }
 }
 void reducescatter2_userbuff(void *output, const int handler, const int offset, const int elements,
                              communicator *comm, cudaStream_t stream) {
@@ -3655,6 +3671,20 @@ static __global__ void consumer_kernel(void *atomic_ptr, int chunk_i) {
   }
 }
 
+// consumer_batch
+static __global__ void consumer_batch_kernel(void *atomic_ptr, int first_chunk_i, int num_chunks) {
+  // Wait for producer to change the val to 0, which signal producer ready
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int old_val;
+    for (int i = first_chunk_i; i < num_chunks; i++) {
+      while (0 != (old_val = atomicCAS((unsigned int *)atomic_ptr + i, 0, 0))) {
+      }
+      ((unsigned int *)atomic_ptr)[i] = 1;
+      asm volatile("fence.sc.gpu;\n");
+    }
+  }
+}
+
 void producer(void *atomic_ptr, int chunk_i, cudaStream_t stream) {
   dim3 block(1);
   dim3 grid(1);
@@ -3665,6 +3695,12 @@ void consumer(void *atomic_ptr, int chunk_i, cudaStream_t stream) {
   dim3 block(1);
   dim3 grid(1);
   consumer_kernel<<<grid, block, 0, stream>>>(atomic_ptr, chunk_i);
+}
+
+void consumer_batch(void *atomic_ptr, int first_chunk_i, int num_chunks, cudaStream_t stream) {
+  dim3 block(1);
+  dim3 grid(1);
+  consumer_batch_kernel<<<grid, block, 0, stream>>>(atomic_ptr, first_chunk_i, num_chunks);
 }
 
 template <typename fp8type>
