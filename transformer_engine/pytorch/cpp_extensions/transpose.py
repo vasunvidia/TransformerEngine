@@ -22,7 +22,7 @@ def fp8_cast_transpose_fused(
     otype: tex.DType,
     cast_out: Optional[torch.Tensor] = None,
     transpose_out: Optional[torch.Tensor] = None,
-    noop_tensor: Optional[torch.Tensor] = None,
+    noop_flag: Optional[torch.Tensor] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], None]:
     """Cast + Transpose with FP8 output"""
 
@@ -36,12 +36,12 @@ def fp8_cast_transpose_fused(
         cast_out = torch.empty_like(inp, dtype=torch.uint8)
         return_outputs = True
 
-    if noop_tensor is None:
-        noop_tensor = torch.Tensor()
+    if noop_flag is None:
+        noop_flag = torch.Tensor()
 
     tex.fused_cast_transpose_noop(
         inp,
-        noop_tensor,
+        noop_flag,
         fp8_meta_tensor.scale[fp8_tensor],
         fp8_meta_tensor.amax_history[0][fp8_tensor],
         fp8_meta_tensor.scale_inv[fp8_tensor],

@@ -252,7 +252,7 @@ class _LayerNormMLP(torch.autograd.Function):
                         fp8_dtype_forward,
                         cast_out=fc1_weight_fp8._data,
                         transpose_out=fc1_weight_t_fp8._data,
-                        noop_tensor=skip_fp8_weight_update,
+                        noop_flag=skip_fp8_weight_update,
                     )
                     tex.fp8_cast_transpose_fused(
                         fc2_weight,
@@ -261,7 +261,7 @@ class _LayerNormMLP(torch.autograd.Function):
                         fp8_dtype_forward,
                         cast_out=fc2_weight_fp8._data,
                         transpose_out=fc2_weight_t_fp8._data,
-                        noop_tensor=skip_fp8_weight_update,
+                        noop_flag=skip_fp8_weight_update,
                     )
                 else:
                     tex.cast_to_fp8(
