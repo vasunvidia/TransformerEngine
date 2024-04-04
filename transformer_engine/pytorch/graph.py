@@ -190,9 +190,11 @@ def _make_graphed_callables(
         class Graphed(torch.autograd.Function):
             """Autograd function for graph replay."""
             @staticmethod
-            def forward(ctx, *inputs):
+            def forward(ctx, skip_fp8_weight_update, *inputs):
                 # At this stage, only the user args may (potentially) be new tensors.
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
+                if ctx.is_first_module and skip_fp8_weight_update is not None:
+                    FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(skip_fp8_weight_update)
 
                 for i in range(len_user_args):
                     if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
@@ -218,7 +220,7 @@ def _make_graphed_callables(
 
                 # Input args that didn't require grad expect a None gradient.
                 assert isinstance(static_grad_inputs, tuple)
-                return tuple(
+                return (None,), tuple(
                     b.detach() if b is not None else b for b in static_grad_inputs
                 )
 
@@ -227,17 +229,17 @@ def _make_graphed_callables(
             # inputs to the graph that might require grad
             # (explicit user args + module parameters)
             # Assumes module params didn't change since capture.
+            skip_fp8_weight_update = None
             if fp8_weight_caching:
                 assert (
                     ("is_first_microbatch" in user_kwargs
                      and isinstance(user_kwargs["is_first_microbatch"], bool))
                 ), "`is_first_microbatch` boolean kwarg must be provided for FP8 weight caching."
 
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(
-                    not user_kwargs["is_first_microbatch"])
+                skip_fp8_weight_update = not user_kwargs["is_first_microbatch"]
 
             flatten_user_args, _ = _tree_flatten(user_args)
-            out = Graphed.apply(*(tuple(flatten_user_args) + module_params))
+            out = Graphed.apply(skip_fp8_weight_update, *(tuple(flatten_user_args) + module_params))
             return _tree_unflatten(out, output_unflatten_spec)
 
         return functionalized
