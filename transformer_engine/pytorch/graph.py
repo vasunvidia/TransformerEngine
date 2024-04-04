@@ -220,7 +220,7 @@ def _make_graphed_callables(
 
                 # Input args that didn't require grad expect a None gradient.
                 assert isinstance(static_grad_inputs, tuple)
-                return (None,), tuple(
+                return (None,) + tuple(
                     b.detach() if b is not None else b for b in static_grad_inputs
                 )
 
