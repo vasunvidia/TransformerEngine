@@ -71,13 +71,13 @@ def assert_all_equal(l1: List[torch.Tensor], l2: List[torch.Tensor], names=None)
 
 
 def generate_data(
-    s: int, b: int, h: int, kv: int, dtype: torch.dtype,
+    s: int, b: int, h: int, nheads: int, kv: int, dtype: torch.dtype,
     dpa: bool = False, warmup: bool = False, gen_labels: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Generate synthetic data."""
     gen_func = torch.ones if warmup else torch.randn
     if dpa:
-        inputs = [gen_func(s, b, h, kv, device="cuda", requires_grad=True, dtype=dtype) for _ in range(3)]
+        inputs = [gen_func(s, b, nheads, kv, device="cuda", requires_grad=True, dtype=dtype) for _ in range(3)]
     else:
         inputs = [gen_func(s, b, h, device="cuda", requires_grad=True, dtype=dtype)]
 
@@ -103,12 +103,15 @@ def _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, graph, mod
     """Helper function for test."""
     reset_rng_states()
     FP8GlobalStateManager.reset()
+    dpa = module == "dpa"
 
     with fp8_model_init(enabled=fp8_params):
         # Create modules.
         if module == "transformer":
             modules = [TransformerLayer(
-                            config.h, config.h, config.nheads,
+                            config.h,
+                            config.h,
+                            config.nheads,
                             hidden_dropout=0.0,
                             attention_dropout=0.0,
                             fuse_qkv_params=True,
@@ -124,9 +127,13 @@ def _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, graph, mod
             ) for _ in range(num_layers)]
         elif module == "mha":
             modules = [MultiheadAttention(
-                config.h, config.nheads, attention_dropout=0.0, params_dtype=dtype
-            ) for _ in range(num_layers)]
-        elif module == "dpa":
+                            config.h,
+                            config.nheads,
+                            attention_dropout=0.0,
+                            params_dtype=dtype,
+                            fuse_qkv_params=True,
+                       ) for _ in range(num_layers)]
+        elif dpa:
             assert config.h % config.nheads == 0, "Err."
             assert num_layers == 1, "Err."
             modules = [DotProductAttention(
@@ -141,35 +148,37 @@ def _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, graph, mod
         if graph:
             # Graph entire module at once.
             if graph_mode == "full":
-                model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
+                model = modules[0] if dpa else torch.nn.Sequential(*modules)
                 model = make_graphed_callables(
                         model,
-                        generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", warmup=True),
+                        generate_data(config.s, bs, config.h, config.nheads, config.kv, dtype, dpa=dpa, warmup=True),
                         num_warmup_iters=10,
                         enabled=fp8)
             else:
                 modules = [make_graphed_callables(
                     module,
-                    generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", warmup=True),
+                    generate_data(config.s, bs, config.h, config.nheads, config.kv, dtype, dpa=dpa, warmup=True),
                     num_warmup_iters=10,
                     enabled=fp8) for module in modules]
-                model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
+                model = modules[0] if dpa else torch.nn.Sequential(*modules)
         else:
-            model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
+            model = modules[0] if dpa else torch.nn.Sequential(*modules)
 
     # Loss function and optimizer.
     loss_fn = torch.nn.MSELoss()
-    optimizer = optimizer(model.parameters(), lr=0.001)
+    if not dpa:
+        optimizer = optimizer(model.parameters(), lr=0.001)
 
     # Launch.
     for _ in range(10):
-        inputs, target = generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", gen_labels=True)
+        inputs, target = generate_data(config.s, bs, config.h, config.nheads, config.kv, dtype, dpa=dpa, gen_labels=True)
         with fp8_autocast(enabled=fp8):
             output = model(*inputs)
         loss = loss_fn(output, target)
         loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        if not dpa:
+            optimizer.step()
+            optimizer.zero_grad()
 
     return get_outputs(model, output)
 
