@@ -2,178 +2,200 @@
 #
 # See LICENSE for license information.
 
-
-import argparse
+from typing import List, Tuple
+import pytest
 
 import torch
-import transformer_engine.pytorch as te
-import apex
+from transformer_engine.pytorch import (
+    DotProductAttention, LayerNormLinear, LayerNormMLP, Linear, make_graphed_callables,
+    MultiheadAttention, TransformerLayer, fp8_autocast, fp8_model_init,
+)
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+from transformer_engine.pytorch.distributed import _set_cuda_rng_state
+from transformer_engine.pytorch.utils import is_bf16_compatible
 
 
-def str_to_optimizer(optim):
-    """Get optimizer."""
-    if optim == "sgd":
-        return torch.optim.SGD
-    if optim == "adamw":
-        return torch.optim.AdamW
-    if optim == "fused_sgd":
-        return apex.optimizers.FusedSGD
-    return apex.optimizers.FusedAdam
+# Only run FP8 tests on H100.
+fp8_available, reason_for_no_fp8 = FP8GlobalStateManager.is_fp8_available()
 
 
-def str_to_torch_dtype(dtype):
-    """Get pytorch dtype."""
-    if dtype == "bf16":
-        return torch.bfloat16
-    if dtype == "fp16":
-        return torch.float16
-    return torch.float32
+seed = 1234
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+# Record initial RNG state from script run.
+_cpu_rng_state = torch.get_rng_state()
+_cuda_rng_state = torch.cuda.get_rng_state()
 
 
-def manual_seed(seed):
-    """Set seed."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+class ModelConfig:
+    def __init__(self, hidden_size, nheads, kv, seq_len):
+        self.h = hidden_size
+        self.nheads = nheads
+        self.kv = kv
+        self.s = seq_len
+
+model_configs = {
+    "126m": ModelConfig(768, 12, 64, 2048),
+}
+
+modules = ["transformer", "layernorm_mlp", "layernorm_linear", "linear", "mha", "dpa"]
+
+optimizers = [torch.optim.SGD, torch.optim.Adam]
+
+all_boolean = [True, False]
+
+dtypes = [torch.float32, torch.float16]
+if is_bf16_compatible():  # bf16 requires sm_80 or higher
+    dtypes.append(torch.bfloat16)
 
 
-def generate_data(args, warmup=False, gen_labels=False):
+def reset_rng_states() -> None:
+    """revert back to initial RNG state."""
+    torch.set_rng_state(_cpu_rng_state)
+    _set_cuda_rng_state(_cuda_rng_state)
+
+
+def assert_all_equal(l1: List[torch.Tensor], l2: List[torch.Tensor], names=None) -> bool:
+    """Ensures two lists are equal."""
+    assert len(l1) == len(l2), "Unequal number of outputs."
+    failed = False
+    failed_tensors = ""
+    for i, (t1, t2) in enumerate(zip(l1, l2)):
+        with torch.no_grad():
+            t1.masked_fill_(t1.isnan(), 1.0)
+            t2.masked_fill_(t2.isnan(), 1.0)
+        if not torch.equal(t1, t2):
+            failed = True
+            failed_tensors += f"    {names[i]}\n" if names is not None else f"    tensor at idx={i}\n"
+    assert not failed, "Output mismatches in:\n" + failed_tensors
+
+
+def generate_data(
+    s: int, b: int, h: int, kv: int, dtype: torch.dtype,
+    dpa: bool = False, warmup: bool = False, gen_labels: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Generate synthetic data."""
-    dtype = str_to_torch_dtype(args.dtype)
     gen_func = torch.ones if warmup else torch.randn
-    if args.module == "dpa":
-        inputs = [gen_func(
-            args.seq_length, args.bs, args.nheads,
-            args.embed, device="cuda", requires_grad=True, dtype=dtype
-        ) for _ in range(3)]
+    if dpa:
+        inputs = [gen_func(s, b, h, kv, device="cuda", requires_grad=True, dtype=dtype) for _ in range(3)]
     else:
-        inputs = [gen_func(args.seq_length, args.bs,
-                              args.hdim, device="cuda", requires_grad=True, dtype=dtype)]
+        inputs = [gen_func(s, b, h, device="cuda", requires_grad=True, dtype=dtype)]
 
     if not gen_labels:
         return inputs
 
-    target = torch.randn(args.seq_length, args.bs, args.hdim, device="cuda", dtype=dtype)
+    target = torch.randn(s, b, h, device="cuda", dtype=dtype)
     return inputs, target
 
 
-def print_values(model, output):
-    """Debug."""
+def get_outputs(model, output):
+    """Return grads and params for comparsion."""
     values = []
     for param in model.parameters():
-        values.append(param.sum().item())
+        values.append(param)
         if param.grad is not None:
-            values.append(param.grad.sum().item())
-    values.append(output.sum().item())
-    print(values)
+            values.append(param.grad)
+    values.append(output)
+    return values
 
 
-def parse_args():
-    """Arguments."""
-    parser = argparse.ArgumentParser(description="Args for testing CUDA graphs with TE layers.")
-    parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--dtype', type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
-    parser.add_argument('--optimizer', type=str, default="adamw",
-                        choices=["fused_adamw", "fused_sgd", "sgd", "adamw"])
-    parser.add_argument('--num-layers', type=int, default=1)
-    parser.add_argument('--module', default="linear",
-                        choices=['linear', 'layernorm_linear', 'layernorm_mlp',
-                                 'transformer', 'dpa', 'mha'])
-    parser.add_argument('--fp8', action='store_true')
-    parser.add_argument('--fp8-params', action='store_true')
-    parser.add_argument('--graph', action='store_true')
-    parser.add_argument('--graph-mode', default="full", choices=['full', 'individual'])
-    parser.add_argument('--num-warmup-iters', type=int, default=3)
-    parser.add_argument('--steps', type=int, default=1)
-    parser.add_argument('--hdim', type=int, default=768)
-    parser.add_argument('--seq-length', type=int, default=2048)
-    parser.add_argument('--bs', type=int, default=2)
-    parser.add_argument('--nheads', type=int, default=12)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    return parser.parse_args()
+def _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, graph, module, optimizer, graph_mode=""):
+    """Helper function for test."""
+    reset_rng_states()
+    FP8GlobalStateManager.reset()
 
-
-def train(args):
-    """Train."""
-
-    dtype = str_to_torch_dtype(args.dtype)
-    if args.fp8_params:
-        assert args.fp8, "FP8 execution needed for FP8 parameters."
-        assert (args.optimizer in ("sgd", "adamw")
-        ), f"Unsupported optimizer {args.optimizer} for FP8 parameters."
-
-    with te.fp8_model_init(enabled=args.fp8_params):
+    with fp8_model_init(enabled=fp8_params):
         # Create modules.
-        if args.module == "transformer":
-            modules = [te.TransformerLayer(
-                            args.hdim, args.hdim, args.nheads,
-                            hidden_dropout=args.dropout,
-                            attention_dropout=args.dropout,
+        if module == "transformer":
+            modules = [TransformerLayer(
+                            config.h, config.h, config.nheads,
+                            hidden_dropout=0.0,
+                            attention_dropout=0.0,
                             fuse_qkv_params=True,
                             params_dtype=dtype,
-                        ) for _ in range(args.num_layers)]
-        elif args.module == "layernorm_mlp":
-            modules = [te.LayerNormMLP(
-                args.hdim, args.hdim, params_dtype=dtype
-            ) for _ in range(args.num_layers)]
-        elif args.module == "layernorm_linear":
-            modules = [te.LayerNormLinear(
-                args.hdim, args.hdim, params_dtype=dtype
-            ) for _ in range(args.num_layers)]
-        elif args.module == "mha":
-            modules = [te.MultiheadAttention(
-                args.hdim, args.nheads, attention_dropout=args.dropout, params_dtype=dtype
-            ) for _ in range(args.num_layers)]
-        elif args.module == "dpa":
-            assert args.hdim % args.nheads == 0, "Err."
-            assert args.num_layers == 1, "Err."
-            args.embed = args.hdim // args.nheads
-            modules = [te.DotProductAttention(
-                        args.nheads, args.embed, attention_dropout=args.dropout
-                        ) for _ in range(args.num_layers)]
+                       ) for _ in range(num_layers)]
+        elif module == "layernorm_mlp":
+            modules = [LayerNormMLP(
+                config.h, config.h, params_dtype=dtype
+            ) for _ in range(num_layers)]
+        elif module == "layernorm_linear":
+            modules = [LayerNormLinear(
+                config.h, config.h, params_dtype=dtype
+            ) for _ in range(num_layers)]
+        elif module == "mha":
+            modules = [MultiheadAttention(
+                config.h, config.nheads, attention_dropout=0.0, params_dtype=dtype
+            ) for _ in range(num_layers)]
+        elif module == "dpa":
+            assert config.h % config.nheads == 0, "Err."
+            assert num_layers == 1, "Err."
+            modules = [DotProductAttention(
+                        config.nheads, config.kv, attention_dropout=0.0
+                        ) for _ in range(num_layers)]
         else:
-            modules = [te.Linear(
-                args.hdim, args.hdim, device="cuda", params_dtype=dtype
-            ) for _ in range(args.num_layers)]
+            modules = [Linear(
+                config.h, config.h, device="cuda", params_dtype=dtype
+            ) for _ in range(num_layers)]
 
         # Generate model and wrap API to return graphed version.
-        if args.graph:
+        if graph:
             # Graph entire module at once.
-            if args.graph_mode == "full":
-                model = modules[0] if args.module == "dpa" else torch.nn.Sequential(*modules)
-                model = te.make_graphed_callables(
+            if graph_mode == "full":
+                model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
+                model = make_graphed_callables(
                         model,
-                        generate_data(args, warmup=True),
-                        num_warmup_iters=args.num_warmup_iters,
-                        enabled=args.fp8)
+                        generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", warmup=True),
+                        num_warmup_iters=10,
+                        enabled=fp8)
             else:
-                modules = [te.make_graphed_callables(
+                modules = [make_graphed_callables(
                     module,
-                    generate_data(args, warmup=True),
-                    num_warmup_iters=args.num_warmup_iters,
-                    enabled=args.fp8) for module in modules]
-                model = modules[0] if args.module == "dpa" else torch.nn.Sequential(*modules)
+                    generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", warmup=True),
+                    num_warmup_iters=10,
+                    enabled=fp8) for module in modules]
+                model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
         else:
-            model = modules[0] if args.module == "dpa" else torch.nn.Sequential(*modules)
+            model = modules[0] if module == "dpa" else torch.nn.Sequential(*modules)
 
     # Loss function and optimizer.
     loss_fn = torch.nn.MSELoss()
-    optimizer = str_to_optimizer(args.optimizer)(model.parameters(), lr=0.001)
+    optimizer = optimizer(model.parameters(), lr=0.001)
 
     # Launch.
-    for _ in range(args.steps):
-        inputs, target = generate_data(args, gen_labels=True)
-        with te.fp8_autocast(enabled=args.fp8):
+    for _ in range(10):
+        inputs, target = generate_data(config.s, bs, config.h, config.kv, dtype, dpa=module=="dpa", gen_labels=True)
+        with fp8_autocast(enabled=fp8):
             output = model(*inputs)
         loss = loss_fn(output, target)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-    # Debug.
-    print_values(model, output)
+    return get_outputs(model, output)
 
 
-if __name__ == "__main__":
-    arguments = parse_args()
-    manual_seed(arguments.seed)
-    train(arguments)
+@pytest.mark.parametrize("dtype", dtypes)
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize("model", model_configs.keys())
+@pytest.mark.parametrize("num_layers", [1, 10])
+@pytest.mark.parametrize("fp8", all_boolean)
+@pytest.mark.parametrize("fp8_params", all_boolean)
+@pytest.mark.parametrize("module", modules)
+@pytest.mark.parametrize("optimizer", optimizers)
+def test_gpt_make_graphed_callables(dtype, bs, model, num_layers, fp8, fp8_params, module, optimizer):
+    if fp8 and not fp8_available:
+        pytest.skip(reason_for_no_fp8)
+    if fp8_params and not fp8:
+        pytest.skip("FP8 needed for FP8 parameters.")
+    if module == "dpa" and num_layers > 1:
+        pytest.skip("Max 1 layer for DPA.")
+
+    config = model_configs[model]
+
+    outputs = _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, False, module, optimizer)
+    graph_outputs_mode1 = _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, True, module, optimizer, graph_mode="full")
+    graph_outputs_mode2 = _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, True, module, optimizer, graph_mode="individual")
+
+    # Check that results match
+    assert_all_equal(outputs, graph_outputs_mode1)
+    assert_all_equal(outputs, graph_outputs_mode2)
