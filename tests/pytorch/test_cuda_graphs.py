@@ -35,7 +35,7 @@ class ModelConfig:
         self.s = seq_len
 
 model_configs = {
-    "126m": ModelConfig(768, 12, 64, 2048),
+    "small": ModelConfig(64, 2, 32, 32),
 }
 
 modules = ["transformer", "layernorm_mlp", "layernorm_linear", "linear", "mha", "dpa"]

@@ -5,10 +5,10 @@
 """Methods needed for distributed training (DP/TP)."""
 import warnings
 from contextlib import contextmanager, AbstractContextManager, ContextDecorator
-from typing import Any, Dict, Union, Optional, Callable, Tuple
+from typing import Any, Dict, List, Union, Optional, Callable, Tuple
 
 import torch
-from torch.cuda import _lazy_call
+from torch.cuda import _lazy_call, _lazy_init
 from torch.utils.checkpoint import detach_variable, noop_context_fn
 
 from .utils import safely_set_viewless_tensor_data
@@ -29,6 +29,51 @@ _USE_REENTRANT_ACTIVATION_RECOMPUTE = True
 
 _FP8_ACTIVATION_RECOMPUTE_ENABLED = False
 _FP8_ACTIVATION_RECOMPUTE_PHASE = False
+
+
+_ALL_ACTIVE_RNG_STATES = {}
+
+
+def get_all_rng_states() -> bool:
+    """Returns all generator states used by `CudaRNGStatesTracker`."""
+    return _ALL_ACTIVE_RNG_STATES
+
+
+def set_all_rng_states(states: List) -> None:
+    """Updates all generator states used by `CudaRNGStatesTracker`."""
+    global _ALL_ACTIVE_RNG_STATES
+    _ALL_ACTIVE_RNG_STATES = states
+
+
+def graph_safe_rng_available() -> bool:
+    """Returns whether cuda graph safe RNG state manipulation is supported."""
+    return (hasattr(torch.cuda.CUDAGraph, "register_generator_state")
+            and hasattr(torch.Generator, "graphsafe_set_state")
+            and hasattr(torch.Generator, "graphsafe_get_state"))
+
+
+def _get_cuda_rng_state(device: Union[int, str, torch.device] = "cuda") -> torch.Tensor:
+    r"""Return the random number generator state of the specified GPU as a ByteTensor.
+
+    Args:
+        device (torch.device or int, optional): The device to return the RNG state of.
+            Default: ``'cuda'`` (i.e., ``torch.device('cuda')``, the current CUDA device).
+
+    .. warning::
+        This function eagerly initializes CUDA.
+    """
+    _lazy_init()
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    idx = device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    default_generator = torch.cuda.default_generators[idx]
+    if graph_safe_rng_available():
+        return default_generator.graphsafe_get_state()
+    return default_generator.get_state()
 
 
 def _set_cuda_rng_state(new_state: torch.Tensor, device: Union[int, str] = -1) -> None:
@@ -52,6 +97,8 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: Union[int, str] = -1) -
         if idx is None:
             idx = torch.cuda.current_device()
         default_generator = torch.cuda.default_generators[idx]
+        if graph_safe_rng_available():
+            return default_generator.graphsafe_set_state()
         default_generator.set_state(new_state)
 
     _lazy_call(cb)
@@ -206,7 +253,7 @@ class _CheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
+        ctx.fwd_cuda_rng_state = _get_cuda_rng_state()
         if get_rng_state_tracker is not None:
             ctx.fwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
 
@@ -271,7 +318,7 @@ class _CheckpointFunction(torch.autograd.Function):
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = torch.cuda.get_rng_state()
+        bwd_cuda_rng_state = _get_cuda_rng_state()
         if get_rng_state_tracker is not None:
             bwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
 
@@ -317,6 +364,7 @@ class _CheckpointFunction(torch.autograd.Function):
         )
         return (None, None, None, None, None, None) + grads
 
+
 class _CheckpointFrame:
     """
     Storage frame for forward RNG states and detached activations from the forward recompute.
@@ -338,7 +386,7 @@ class _CheckpointFrame:
         """Cache fwd/bwd RNG states in the frame to restore later."""
         rng_states = (
             torch.get_rng_state(),
-            torch.cuda.get_rng_state(),
+            _get_cuda_rng_state(),
         )
         if self.get_rng_state_tracker is not None:
             rng_states += (self.get_rng_state_tracker().get_states(), )
@@ -604,6 +652,7 @@ def checkpoint(
 
     return out
 
+
 class CudaRNGStatesTracker:
     """
     For model parallelism, multiple RNG states need to simultaneously exist in order
@@ -665,12 +714,14 @@ class CudaRNGStatesTracker:
         if name in self.states_:
             raise Exception(f"cuda rng state {name} already exists")
         # Get the current rng state.
-        orig_rng_state = torch.cuda.get_rng_state()
+        orig_rng_state = _get_cuda_rng_state()
         # Set the new state and store it.
         torch.cuda.manual_seed(seed)
-        self.states_[name] = torch.cuda.get_rng_state()
+        self.states_[name] = _get_cuda_rng_state()
         # Reset rng state to what it was.
         _set_cuda_rng_state(orig_rng_state)
+        # Update global states.
+        set_all_rng_states(self.states_)
 
     @contextmanager
     def fork(self, name: str = "model-parallel-rng"):
@@ -685,7 +736,7 @@ class CudaRNGStatesTracker:
         if name not in self.states_:
             raise Exception(f"cuda rng state {name} is not added")
         # Store current rng state.
-        orig_cuda_rng_state = torch.cuda.get_rng_state()
+        orig_cuda_rng_state = _get_cuda_rng_state()
         # Set rng state to the desired one
         _set_cuda_rng_state(self.states_[name])
         # Do the stuff we wanted to do.
@@ -693,7 +744,27 @@ class CudaRNGStatesTracker:
             yield
         finally:
             # Update the current rng state for later use.
-            self.states_[name] = torch.cuda.get_rng_state()
+            self.states_[name] = _get_cuda_rng_state()
+            # And set the state to the original state we started with.
+            _set_cuda_rng_state(orig_cuda_rng_state)
+
+    @contextmanager
+    @staticmethod
+    def _fork(other, name: str = "model-parallel-rng"):
+        """A copy of 'fork' used for patching instance methods from outside implementations."""
+        # Check if we have added the state
+        if name not in other.states_:
+            raise Exception(f"cuda rng state {name} is not added")
+        # Store current rng state.
+        orig_cuda_rng_state = _get_cuda_rng_state()
+        # Set rng state to the desired one
+        _set_cuda_rng_state(other.states_[name])
+        # Do the stuff we wanted to do.
+        try:
+            yield
+        finally:
+            # Update the current rng state for later use.
+            other.states_[name] = _get_cuda_rng_state()
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
 

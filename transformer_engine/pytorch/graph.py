@@ -13,11 +13,31 @@ from .fp8 import (
     FP8GlobalStateManager,
     get_default_fp8_recipe,
 )
-from .distributed import _set_cuda_rng_state
+from .distributed import get_all_rng_states, graph_safe_rng_available
 from .module.base import TransformerEngineBaseModule
 
 
 __all__ = ["make_graphed_callables"]
+
+
+_IS_GRAPH_CAPTURING = False
+
+
+def set_capture_start() -> None:
+    """Record beginning of `make_graphed_callables`."""
+    global _IS_GRAPH_CAPTURING
+    _IS_GRAPH_CAPTURING = True
+
+
+def set_capture_end() -> None:
+    """Record end of `make_graphed_callables`."""
+    global _IS_GRAPH_CAPTURING
+    _IS_GRAPH_CAPTURING = False
+
+
+def is_graph_capturing() -> None:
+    """Return whether within `make_graphed_callables`."""
+    return _IS_GRAPH_CAPTURING
 
 
 def graph_pool_handle():
@@ -93,6 +113,13 @@ def _make_graphed_callables(
 
     fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(callables))]
     bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(callables))]
+
+    # For cases with multiple active RNG states, e.g. TP.
+    if graph_safe_rng_available():
+        for _, state in get_all_rng_states().items():
+            for fwd_graph, bwd_graph in zip(fwd_graphs, bwd_graphs):
+                fwd_graph.register_generator_state(state)
+                bwd_graph.register_generator_state(state)
 
     mempool = graph_pool_handle()
 
@@ -349,6 +376,7 @@ def make_graphed_callables(
                         must be set to `False` if calculating weight transposes' outside TE, e.g.,
                         in the optimizer step.
     """
+    set_capture_start()
 
     fp8_recipe = get_default_fp8_recipe() if fp8_recipe is None else fp8_recipe
 
@@ -393,7 +421,7 @@ def make_graphed_callables(
         fp8_weight_caching=fp8_weight_caching)
 
     # Ensures warmup does not affect numerics for ops such as dropout.
-    _set_cuda_rng_state(cuda_rng_state)
+    torch.cuda.set_rng_state(cuda_rng_state)
 
     # Reset FP8 gradients.
     for module in modules:
@@ -403,4 +431,5 @@ def make_graphed_callables(
     # Restore FP8 state.
     restore_fp8_tensors(modules, saved_fp8_tensors)
 
+    set_capture_end()
     return graphed_callables
