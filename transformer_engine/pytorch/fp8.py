@@ -117,7 +117,7 @@ class FP8GlobalStateManager:
     def set_skip_fp8_weight_update_tensor(cls, skip: bool) -> None:
         """`skip_fp8_weight_update_tensor` inplace setter."""
         if cls.skip_fp8_weight_update_tensor is None:
-            cls.skip_fp8_weight_update_tensor = torch.empty(1, device="cuda")
+            cls.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
         cls.skip_fp8_weight_update_tensor.fill_(skip)
 
     @classmethod

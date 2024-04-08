@@ -494,16 +494,17 @@ class Float8Tensor(torch.Tensor):
             return self._transpose
 
         # Allocate transpose if needed.
+        data_2d = self._data.reshape(-1, self._data.shape[-1])
         if self._transpose is None:
-            shape = (self._data.shape[1], self._data.shape[0])
+            shape = (data_2d.shape[1], data_2d.shape[0])
             self._transpose = torch.empty(shape, dtype=torch.uint8, device=self._data.device)
 
         # Case: recompute transpose and store cache.
         if noop_flag is None:
-            tex.fp8_transpose_noalloc(self._data, self._transpose, self._fp8_dtype)
+            tex.fp8_transpose_noalloc(data_2d, self._transpose, self._fp8_dtype)
         else:
             # Case: cuda graph capture.
-            tex.fp8_transpose_noalloc_noop(self._data, self._transpose, noop_flag, self._fp8_dtype)
+            tex.fp8_transpose_noalloc_noop(data_2d, self._transpose, noop_flag, self._fp8_dtype)
 
         self._transpose_invalid = False
         return self._transpose

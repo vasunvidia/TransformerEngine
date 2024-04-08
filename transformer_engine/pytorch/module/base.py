@@ -516,7 +516,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.tp_group = tp_group
         self.tp_group_initialized = True
 
-    def get_fp8_params(self) -> Union[List[torch.Tensor], None]:
+    def _get_fp8_params(self) -> Union[List[torch.Tensor], None]:
         """returns the FP8 weights."""
         fp8_params = []
         for param in self.parameters():
@@ -599,7 +599,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
             if self.fp8 and not FP8GlobalStateManager.fp8_graph_capturing():
                 FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                    self.fp8_meta, fp8_weights=self.get_fp8_params())
+                    self.fp8_meta, fp8_weights=self._get_fp8_params())
 
             # Activation recomputation is used and this is the first forward phase.
             if (

@@ -273,7 +273,7 @@ def _make_graphed_callables(
                                 m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                                 m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
                                 FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                    m.fp8_meta, fp8_weights=m.get_fp8_params())
+                                    m.fp8_meta, fp8_weights=m._get_fp8_params())
                         return graphed(*user_args, **user_kwargs)
                     return orig_fwd(*user_args, **user_kwargs)
                 return new_fwd
@@ -318,16 +318,36 @@ def make_graphed_callables(
     sample_args,
     num_warmup_iters=3,
     allow_unused_input=False,
-    enabled=False,
-    calibrating=False,
+    fp8_enabled=False,
+    fp8_calibrating=False,
     fp8_recipe=None,
     fp8_weight_caching=False,
 ):
     """
-    Accepts TransformerEngine modules and returns graphed versions. This function is based
-    on the `torch.cuda.make_graphed_callables` function from PyTorch. See
-    `torch.utils.checkpoint.checkpoint <https://pytorch.org/docs/stable/checkpoint.html>`_
-    for extensive documentation.
+    A version of PyTorch's `make_graphed_callables` utility function with support for
+    TransformerEngine modules and FP8. Please see the original version in upstream PyTorch
+    `here <https://pytorch.org/docs/stable/generated/torch.cuda.make_graphed_callables.html>`_
+    for extensive documentation. The documentation for additional parameters which are
+    specific to FP8 are given below.
+
+    FP8 specific parameters
+    -----------------------
+    fp8_enabled: bool, default = `True`
+                 whether or not to enable fp8
+    fp8_calibrating: bool, default = `False`
+                     calibration mode allows collecting statistics such as amax and scale
+                     data of fp8 tensors even when executing without fp8 enabled. This is
+                     useful for saving an inference ready fp8 checkpoint while training
+                     using a higher precision.
+    fp8_recipe: recipe.DelayedScaling, default = `None`
+                recipe used for FP8 training.
+    fp8_weight_caching: bool, default = `False`
+                        Whether or not to cache FP8 weights across microbatches. if set to `True`,
+                        the `is_first_microbatch` boolean argument must be passed into the forward
+                        method for TransformerEngine modules. When storing primary weights in FP8
+                        using TE's `fp8_model_init` API and using an FP8 aware optimizer, this arg
+                        must be set to `False` if calculating weight transposes' outside TE, e.g.,
+                        in the optimizer step.
     """
 
     fp8_recipe = get_default_fp8_recipe() if fp8_recipe is None else fp8_recipe
@@ -345,8 +365,8 @@ def make_graphed_callables(
     def wrap_autocast(block):
         old_forward = block.forward
         def forward_func(*args, **kwargs):
-            with fp8_autocast(enabled=enabled,
-                              calibrating=calibrating,
+            with fp8_autocast(enabled=fp8_enabled,
+                              calibrating=fp8_calibrating,
                               fp8_recipe=fp8_recipe,
                               _graph=True):
                 outputs = old_forward(*args, **kwargs)
