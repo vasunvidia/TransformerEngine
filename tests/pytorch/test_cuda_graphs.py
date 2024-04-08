@@ -153,13 +153,13 @@ def _test_cuda_graphs(config, bs, num_layers, dtype, fp8, fp8_params, graph, mod
                         model,
                         generate_data(config.s, bs, config.h, config.nheads, config.kv, dtype, dpa=dpa, warmup=True),
                         num_warmup_iters=10,
-                        enabled=fp8)
+                        fp8_enabled=fp8)
             else:
                 modules = [make_graphed_callables(
                     module,
                     generate_data(config.s, bs, config.h, config.nheads, config.kv, dtype, dpa=dpa, warmup=True),
                     num_warmup_iters=10,
-                    enabled=fp8) for module in modules]
+                    fp8_enabled=fp8) for module in modules]
                 model = modules[0] if dpa else torch.nn.Sequential(*modules)
         else:
             model = modules[0] if dpa else torch.nn.Sequential(*modules)
