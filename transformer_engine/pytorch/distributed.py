@@ -98,7 +98,8 @@ def _set_cuda_rng_state(new_state: torch.Tensor, device: Union[int, str] = -1) -
             idx = torch.cuda.current_device()
         default_generator = torch.cuda.default_generators[idx]
         if graph_safe_rng_available():
-            return default_generator.graphsafe_set_state()
+            default_generator.graphsafe_set_state(new_state)
+            return
         default_generator.set_state(new_state)
 
     _lazy_call(cb)
@@ -745,26 +746,6 @@ class CudaRNGStatesTracker:
         finally:
             # Update the current rng state for later use.
             self.states_[name] = _get_cuda_rng_state()
-            # And set the state to the original state we started with.
-            _set_cuda_rng_state(orig_cuda_rng_state)
-
-    @contextmanager
-    @staticmethod
-    def _fork(other, name: str = "model-parallel-rng"):
-        """A copy of 'fork' used for patching instance methods from outside implementations."""
-        # Check if we have added the state
-        if name not in other.states_:
-            raise Exception(f"cuda rng state {name} is not added")
-        # Store current rng state.
-        orig_cuda_rng_state = _get_cuda_rng_state()
-        # Set rng state to the desired one
-        _set_cuda_rng_state(other.states_[name])
-        # Do the stuff we wanted to do.
-        try:
-            yield
-        finally:
-            # Update the current rng state for later use.
-            other.states_[name] = _get_cuda_rng_state()
             # And set the state to the original state we started with.
             _set_cuda_rng_state(orig_cuda_rng_state)
 

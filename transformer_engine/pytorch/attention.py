@@ -2410,11 +2410,9 @@ class DotProductAttention(torch.nn.Module):
         if sequence_parallel or get_rng_state_tracker is None:
             attention_dropout_ctx = nullcontext
         else:
-            # Monkey patch methods for cuda graph support.
             self.rng_states_tracker = get_rng_state_tracker()
             set_all_rng_states(self.rng_states_tracker.get_states())
-            attention_dropout_ctx = functools.partial(
-                CudaRNGStatesTracker._fork, self.rng_states_tracker)
+            attention_dropout_ctx = self.rng_states_tracker.fork
 
         norm_factor = math.sqrt(self.hidden_size_per_attention_head)
 
@@ -2659,6 +2657,9 @@ class DotProductAttention(torch.nn.Module):
             ), f"Attention mask type {attn_mask_type} is not supported!"
 
         if self.rng_states_tracker is not None and is_graph_capturing():
+            assert (
+                isinstance(self.rng_states_tracker, CudaRNGStatesTracker)
+            ), "Unsupported RNG states tracker."
             assert (
                 graph_safe_rng_available()
             ), "Upgrade PyTorch version to get RNG manipulation support for cuda graph capture."
