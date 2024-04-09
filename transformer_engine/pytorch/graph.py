@@ -184,7 +184,7 @@ def _make_graphed_callables(
     # the safest approach is to capture all passes in the same order they'll run:
     # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
 
-    if _order is not None:
+    if _order is not None: # pylint: disable=too-many-nested-blocks
         per_callable_static_outputs = [None] * len(flatten_sample_args)
         per_callable_output_unflatten_spec = [None] * len(flatten_sample_args)
         per_callable_static_grad_outputs = [None] * len(flatten_sample_args)
