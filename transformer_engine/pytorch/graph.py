@@ -50,10 +50,10 @@ def graph_pool_handle():
 def _make_graphed_callables(
     callables,
     sample_args,
-    order=None,
     num_warmup_iters=3,
     allow_unused_input=False,
     fp8_weight_caching=False,
+    _order=None,
 ):
     """
     Helper method for `make_graphed_callables`
@@ -73,17 +73,24 @@ def _make_graphed_callables(
         sample_args = (sample_args,)
 
     flatten_sample_args = []
-    if order is not None:
+    if _order is not None:
         # order is a list containing 1..model_chunk values in the order of microbatch schedule
-        num_model_chunks = max(order)
-        num_microbatches = len(order) // num_model_chunks // 2
-        assert num_model_chunks * num_microbatches * 2 == len(order)
-        assert (len(sample_args)*2 >= len(order)) and (len(sample_args)*2 % len(order) == 0), f'{len(sample_args)} >= {len(order)} and {len(sample_args)} % {len(order)} == 0'
+        num_model_chunks = max(_order)
+        num_microbatches = len(_order) // num_model_chunks // 2
+        assert num_model_chunks * num_microbatches * 2 == len(_order)
+        assert (
+            len(sample_args)*2 >= len(_order)
+            and (len(sample_args)*2 % len(_order) == 0)
+        ), f'{len(sample_args)} >= {len(_order)} and {len(sample_args)} % {len(_order)} == 0'
         num_layers = len(sample_args) // num_model_chunks // num_microbatches
-        assert len(callables) == num_model_chunks*num_layers, (f"Callables should have ({num_model_chunks * num_layers}) "
+        assert (
+            len(callables) == num_model_chunks*num_layers
+        ), (f"Callables should have ({num_model_chunks * num_layers}) "
             + f"entries when order input is provided but got {len(callables)}."
         )
-        assert len(sample_args) == num_model_chunks * num_microbatches * num_layers, (f"Expected {num_model_chunks * num_microbatches}"
+        assert (
+            len(sample_args) == num_model_chunks * num_microbatches * num_layers
+        ), (f"Expected {num_model_chunks * num_microbatches}"
             + f"args tuple, but got {len(sample_args)}."
         )
 
@@ -117,7 +124,7 @@ def _make_graphed_callables(
     # If a callable is an nn.Module, its graph's full input surface is the args the user explicitly
     # passes to forward (ie, its sample_args) AND the module's parameter attributes.
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
-    if order is None:
+    if _order is None:
         per_callable_module_params = [
             tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
             for c in callables
@@ -130,7 +137,9 @@ def _make_graphed_callables(
         per_callable_module_params = []
         for c in callables:
             for i in range(num_microbatches):
-                per_callable_module_params.append(tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ())
+                per_callable_module_params.append(
+                    tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
+                )
         assert len(per_callable_module_params) == len(flatten_sample_args)
         per_callable_static_input_surfaces = [
             flatten_sample_args[i] + per_callable_module_params[i]
@@ -175,20 +184,21 @@ def _make_graphed_callables(
     # the safest approach is to capture all passes in the same order they'll run:
     # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
 
-    if order is not None:
+    if _order is not None:
         per_callable_static_outputs = [None] * len(flatten_sample_args)
         per_callable_output_unflatten_spec = [None] * len(flatten_sample_args)
         per_callable_static_grad_outputs = [None] * len(flatten_sample_args)
         per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
         fwd_idx = [0] * num_model_chunks
         bwd_idx = [0] * num_model_chunks
-        for c_id in order:
+        for c_id in _order:
             if c_id > 0:
                 # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
                 m_chunk = c_id-1
                 for l_no in range(num_layers):
                     func = callables[m_chunk*num_layers + l_no]
-                    per_callable_fwd_idx = m_chunk * num_microbatches * num_layers + fwd_idx[m_chunk] * num_layers + l_no
+                    per_callable_fwd_idx = (m_chunk * num_microbatches * num_layers) \
+                                        + (fwd_idx[m_chunk] * num_layers + l_no)
                     args = sample_args[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     with torch.cuda.graph(fwd_graph, pool=mempool):
@@ -202,7 +212,8 @@ def _make_graphed_callables(
                 # Capture backward graph for model chunk c_id, microbatch bwd_idx[-c_id-1]
                 m_chunk = -c_id-1
                 for l_no in list(reversed(range(num_layers))):
-                    per_callable_bwd_idx = m_chunk * num_microbatches * num_layers + bwd_idx[m_chunk] * num_layers + l_no
+                    per_callable_bwd_idx = (m_chunk * num_microbatches * num_layers) \
+                                        + (bwd_idx[m_chunk] * num_layers + l_no)
                     static_input_surface = per_callable_static_input_surfaces[per_callable_bwd_idx]
                     static_outputs = per_callable_static_outputs[per_callable_bwd_idx]
                     bwd_graph = bwd_graphs[per_callable_bwd_idx]
@@ -219,8 +230,8 @@ def _make_graphed_callables(
                             allow_unused=allow_unused_input,
                         )
                     # Constructs a tuple suitable for returning from Graphed.backward:
-                    # Pads out the actually-needed grads with Nones in gradient slots for inputs that
-                    # don't require grad. I couldn't think of a slick one-liner for this pattern.
+                    # Pads out the actually-needed grads with Nones in gradient slots for inputs
+                    # that don't require grad. I couldn't think of a one-liner for this pattern.
                     static_grad_inputs = []
                     grad_idx = 0
                     for arg in static_input_surface:
@@ -394,7 +405,7 @@ def _make_graphed_callables(
                 return new_fwd
 
             forward = make_graphed_forward(func, func.training, graphed, func.forward)
-            if order is None:
+            if _order is None:
                 func.forward = forward
                 ret.append(func)
             else:
@@ -435,13 +446,13 @@ def restore_fp8_tensors(modules, fp8_tensors):
 def make_graphed_callables(
     modules,
     sample_args,
-    order=None,
     num_warmup_iters=3,
     allow_unused_input=False,
     fp8_enabled=False,
     fp8_calibrating=False,
     fp8_recipe=None,
     fp8_weight_caching=False,
+    _order=None,
 ):
     """
     A version of PyTorch's `make_graphed_callables` utility function with support for
@@ -509,9 +520,9 @@ def make_graphed_callables(
     cuda_rng_state = torch.cuda.get_rng_state()
 
     graphed_callables = _make_graphed_callables(
-        forward_funcs, sample_args, order, num_warmup_iters=num_warmup_iters,
+        forward_funcs, sample_args, num_warmup_iters=num_warmup_iters,
         allow_unused_input=allow_unused_input,
-        fp8_weight_caching=fp8_weight_caching)
+        fp8_weight_caching=fp8_weight_caching, _order=_order)
 
     # Ensures warmup does not affect numerics for ops such as dropout.
     torch.cuda.set_rng_state(cuda_rng_state)
