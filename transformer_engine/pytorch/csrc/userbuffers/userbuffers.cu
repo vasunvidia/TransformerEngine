@@ -1166,18 +1166,42 @@ __global__ void __launch_bounds__(MAX_THREADS)
         const int gpustep, const int mylineoffset, const int totallines, const int rowlines,
         const int skiplines, const int numchunks, void **commbuff, const int handleridx,
         void *outbuf, void *counters, const uint64_t ub_timeout) {
+
+  __shared__ int4 *userptr[RANKS];
+  volatile int *flagptr;
+  int physgpu, targetgpu, *myptr;
+  int *reduceidptr, reduce_id;
+  int lastSM = 0;
+  if (threadIdx.x < RANKS) {
+    physgpu = myrank * gpustep + firstrank;
+    targetgpu = threadIdx.x * gpustep + firstrank;
+    myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
+    reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
+    reduce_id = (*reduceidptr);
+    flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+    userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
+  }
+
+  if (threadIdx.x == 0) {
+    const int adder = blockIdx.x == 0 ? NVTE_MAX_SMS - gridDim.x + 1 : 1;
+    int old_val = atomicAdd(myptr + (NVTE_MAX_NVLINK * 2), numchunks*adder);
+    if (old_val + adder == NVTE_MAX_SMS * (reduce_id+numchunks))
+      lastSM = 1;
+  }
+
+  int warp = blockIdx.x + (threadIdx.x >> 5);
+  int dest[RANKS];
+  #pragma unroll
+      for (int i = 0; i < RANKS; i++)
+        dest[i] = (i + myrank + warp) & (RANKS - 1);
+
+
   for (int chunk_i = 0; chunk_i < numchunks; chunk_i++) {
     if (counters) {
-      if (threadIdx.x == 0) {
+      if (threadIdx.x == 0 && blockIdx.x==0) {
         // spin-lock on counter from producer
         while (0 != (atomicCAS(((unsigned int *)counters) + chunk_i, 0, 0))) {
         }
-
-        // make sure all threadblocks have read/waited on counters.
-        atomicInc(((unsigned int *)counters) + numchunks + chunk_i, gridDim.x - 1);
-        while (0 != (atomicCAS(((unsigned int *)counters) + numchunks + chunk_i, 0, 0))) {
-        }
-
         // reset counter for next producer.
         ((unsigned int *)counters)[chunk_i] = 1;
         asm volatile("fence.sc.gpu;\n");
@@ -1185,23 +1209,12 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     __syncthreads();
 
-    __shared__ int4 *userptr[RANKS];
-    volatile int *flagptr;
-    int physgpu, targetgpu, *myptr;
-    int *reduceidptr, reduce_id;
-    int lastSM = 0;
-
     if (threadIdx.x < RANKS) {
-      physgpu = myrank * gpustep + firstrank;
-      targetgpu = threadIdx.x * gpustep + firstrank;
-      myptr = (reinterpret_cast<int *>(commbuff[physgpu])) + flagoffset;
-      reduceidptr = myptr - NVTE_MAX_OPS;  // +op;
-      reduce_id = (*reduceidptr) + 1;
-      flagptr = (reinterpret_cast<int *>(commbuff[targetgpu])) + flagoffset;
+      reduce_id++;
       if (blockIdx.x == 0)
         flagptr[physgpu] = reduce_id;
       volatile int *flag = (volatile int *)&(myptr[targetgpu]);
-      userptr[threadIdx.x] = reinterpret_cast<int4 *>(commbuff[targetgpu + handleridx]);
+
       clock_t s = clock64();
       while (CHECK_IDS(*flag, reduce_id)) {
         if (CHECK_TIMEOUT(s, ub_timeout)) {
@@ -1212,25 +1225,14 @@ __global__ void __launch_bounds__(MAX_THREADS)
       }
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-      const int adder = blockIdx.x == 0 ? NVTE_MAX_SMS - gridDim.x + 1 : 1;
-      int old_val = atomicAdd(myptr + (NVTE_MAX_NVLINK * 2), adder);
-      if (old_val + adder == NVTE_MAX_SMS * reduce_id)
-        lastSM = 1;
-    }
-
-    int warp = blockIdx.x + (threadIdx.x >> 5);
-    int dest[RANKS];
-#pragma unroll
-    for (int i = 0; i < RANKS; i++)
-      dest[i] = (i + myrank + warp) & (RANKS - 1);
 
     for (int line = threadIdx.x + blockDim.x * blockIdx.x; line < totallines;
          line += blockDim.x * gridDim.x) {
       int4 val[RANKS];
-      int index_in = chunk_i * mylineoffset + myrank * (totallines * skiplines / rowlines) +
+      const int index_in = chunk_i * mylineoffset + myrank * (totallines * skiplines / rowlines) +
                      (line / rowlines) * skiplines + (line % rowlines);
 
+      const int index_out = chunk_i * mylineoffset + (line / rowlines) * skiplines + (line % rowlines);
 #pragma unroll
       for (int i = 0; i < RANKS; i++) {
         val[i] = userptr[dest[i]][index_in];
@@ -1247,12 +1249,12 @@ __global__ void __launch_bounds__(MAX_THREADS)
           s[j] += x[j];
       }
 
-      int index_out = chunk_i * mylineoffset + (line / rowlines) * skiplines + (line % rowlines);
+
       (reinterpret_cast<int4 *>(outbuf))[index_out] = sum;
     }
-    if (threadIdx.x == 0 && lastSM)
-      *reduceidptr = reduce_id;
   }
+  if (threadIdx.x == 0 && lastSM)
+    *reduceidptr = reduce_id;
 }  // fp16 reduce-scatter kernel (out of place) fp16
 
 template <int RANKS>
