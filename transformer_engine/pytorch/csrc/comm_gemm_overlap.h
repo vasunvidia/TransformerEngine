@@ -563,7 +563,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       create_communicator_grouped2(&_ub_comm, 1, 1, tp_size, 1);
       comm_created = true;
     }
-    use_ce = 1;
+    use_ce = transformer_engine::getenv<int>("NVTE_USE_CE_P2P", 1);
     sms = 1;
     cga_size = 1;
 
@@ -581,7 +581,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
     _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
                                               _ub_comm, true);
     if (rank == 0) {
-      printf("!!! [UBP2P] Register UBuf %d\n", _ub_reg);
+      printf("!!! [UBP2P] Register UBuf %d (USE_CE %d)\n", _ub_reg, use_ce);
     }
 
     _ubuf = torch::from_blob(
