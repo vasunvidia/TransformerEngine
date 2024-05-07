@@ -564,7 +564,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       comm_created = true;
     }
     use_ce = transformer_engine::getenv<int>("NVTE_USE_CE_P2P", 1);
-    sms = 1;
+    sms = num_comm_sm;
     cga_size = 1;
 
     _empty_tensor = empty_tensor;
