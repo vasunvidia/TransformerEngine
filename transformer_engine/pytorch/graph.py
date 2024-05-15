@@ -169,7 +169,7 @@ def _make_graphed_callables(
         end_microbatch = [(num_microbatches if e > num_microbatches else e) \
                             for e in end_microbatch]
         arg_index = 0
-        for m in order:
+        for m in _order:
             if m < 0:
                 continue
             cur_model_chunk = m-1
@@ -315,7 +315,7 @@ def _make_graphed_callables(
                         static_grad_outputs = tuple(
                             torch.empty_like(o) if o.requires_grad else None for o in static_outputs
                         )
-                        with torch.cuda.graph(bwd_graph, pool=mempool_bwd):
+                        with torch.cuda.graph(bwd_graph, pool=mempool):
                             grad_inputs = torch.autograd.grad(
                                 outputs=tuple(o for o in static_outputs if o.requires_grad),
                                 inputs=tuple(i for i in static_input_surface if i.requires_grad),
