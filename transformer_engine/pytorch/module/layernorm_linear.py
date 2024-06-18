@@ -175,7 +175,7 @@ class _LayerNormLinear(torch.autograd.Function):
                         tex.FP8FwdTensors.GEMM1_INPUT,
                         fp8_dtype_forward,
                         out=ln_out_fp8)
-                    ln_out = ln_out_fp8
+                    ln_out = torch.empty_like(ln_out_fp8)
                 else:
                     ln_out_total = tex.cast_to_fp8(
                         ln_out_total,
