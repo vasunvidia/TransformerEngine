@@ -13,6 +13,7 @@ from torch.nn import init
 
 from .base import (
     get_workspace,
+    _ub_communicators,
     get_ub,
     TransformerEngineBaseModule,
     _2X_ACC_FPROP,
@@ -1324,7 +1325,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
         # GEMM-GELU fusion is currently only supported with split GEMM-AG overlap
         self.gemm_gelu_fusion = \
             (bool(int(os.getenv("NVTE_GEMM_GELU_FUSION", "0"))) and
-            self.activation == 'gelu' and not get_ub("fc1_fprop").is_atomic_gemm())
+            self.activation == 'gelu' and ((_ub_communicators is None) or (not get_ub("fc1_fprop").is_atomic_gemm())))
 
         if any([ub_bulk_wgrad, ub_bulk_dgrad, ub_overlap_rs, ub_overlap_ag, ub_overlap_rs_dgrad]):
             assert (

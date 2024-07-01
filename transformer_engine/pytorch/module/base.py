@@ -36,8 +36,8 @@ from ..constants import dist_group_type
 from ..float8_tensor import Float8Tensor
 
 _2X_ACC_FPROP = False
-_2X_ACC_DGRAD = True
-_2X_ACC_WGRAD = True
+_2X_ACC_DGRAD = False
+_2X_ACC_WGRAD = False
 _cublas_workspace = None
 _ub_communicators = None
 _NUM_MAX_UB_STREAMS = 3
