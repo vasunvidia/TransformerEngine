@@ -5,6 +5,7 @@
 """Functions for CUDA Graphs support in FP8"""
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
+import os
 import torch
 from torch.utils._pytree import tree_flatten as _tree_flatten
 from torch.utils._pytree import tree_unflatten as _tree_unflatten
@@ -192,6 +193,11 @@ def _make_graphed_callables(
             for fwd_graph, bwd_graph in zip(fwd_graphs, bwd_graphs):
                 fwd_graph.register_generator_state(state)
                 bwd_graph.register_generator_state(state)
+    if os.getenv('CG_DEBUG_MODE', '0') == '1':
+        print (f'Enabling CG Debug Mode')
+        for fwd_graph, bwd_graph in zip(fwd_graphs, bwd_graphs):
+            fwd_graph.enable_debug_mode()
+            bwd_graph.enable_debug_mode()
 
     mempool = graph_pool_handle()
 
@@ -201,6 +207,7 @@ def _make_graphed_callables(
     torch.cuda.synchronize()
     with torch.cuda.stream(torch.cuda.Stream()):
         for func_idx, func in enumerate(callables):
+            torch.cuda.nvtx.range_push(f'CG warmup for layer {func_idx}')
             args = sample_args[func_idx]
             kwargs = sample_kwargs[func_idx]
             static_input_surface = per_callable_static_input_surfaces[func_idx]
@@ -213,6 +220,7 @@ def _make_graphed_callables(
                     only_inputs=True,
                     allow_unused=allow_unused_input,
                 )
+            torch.cuda.nvtx.range_pop()
             del outputs, grad_inputs
     torch.cuda.synchronize()
 
@@ -239,6 +247,7 @@ def _make_graphed_callables(
                     args = sample_args[per_callable_fwd_idx]
                     kwargs = sample_kwargs[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
+                    print (f'capture fwd_graph[{per_callable_fwd_idx}]')
                     with torch.cuda.graph(fwd_graph, pool=mempool):
                         outputs = func(*args, **kwargs)
                     flatten_outputs, spec = _tree_flatten(outputs)
@@ -256,6 +265,7 @@ def _make_graphed_callables(
                     static_input_surface = per_callable_static_input_surfaces[per_callable_bwd_idx]
                     static_outputs = per_callable_static_outputs[per_callable_bwd_idx]
                     bwd_graph = bwd_graphs[per_callable_bwd_idx]
+                    print (f'capture bwd_graph[{per_callable_bwd_idx}]')
                     # For now, assumes all static_outputs require grad
                     static_grad_outputs = tuple(
                         torch.empty_like(o) if o.requires_grad else None for o in static_outputs
@@ -356,13 +366,15 @@ def _make_graphed_callables(
             """Autograd function for graph replay."""
 
             @staticmethod
-            def forward(ctx, skip_fp8_weight_update, *inputs):
+            def forward(ctx, skip_fp8_weight_update, debug_dump, layer_number, *inputs):
 
                 # Set flag for whether to update FP8 weight updates
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
                 if ctx.is_first_module and skip_fp8_weight_update is not None:
                     FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(skip_fp8_weight_update)
 
+                if debug_dump:
+                    fwd_graph.debug_dump(f'/results/fwd_graph_{layer_number}.dot')
                 # Copy values from new tensors into static tensors
                 for i in range(len_user_args):
                     if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
@@ -370,6 +382,8 @@ def _make_graphed_callables(
 
                 # Replay forward graph
                 fwd_graph.replay()
+                ctx.debug_dump = debug_dump
+                ctx.layer_number = layer_number
                 assert isinstance(static_outputs, tuple)
                 return tuple(o.detach() for o in static_outputs)
 
@@ -377,6 +391,8 @@ def _make_graphed_callables(
             @torch.autograd.function.once_differentiable
             def backward(ctx, *grads):
 
+                if ctx.debug_dump:
+                    bwd_graph.debug_dump(f'/results/bwd_graph_{ctx.layer_number}.dot')
                 # Replay backward graph
                 assert len(grads) == len(static_grad_outputs)
                 for g, grad in zip(static_grad_outputs, grads):
@@ -393,12 +409,20 @@ def _make_graphed_callables(
 
                 # Input args that didn't require grad expect a None gradient.
                 assert isinstance(static_grad_inputs, tuple)
-                return (None,) + tuple(
+                return (None, None, None,) + tuple(
                     b.detach() if b is not None else b for b in static_grad_inputs
                 )
 
         def functionalized(*user_args, **user_kwargs):
 
+            debug_dump = False
+            layer_number = 0
+            if "debug_dump" in user_kwargs and isinstance(user_kwargs["debug_dump"], bool):
+                assert os.getenv('CG_DEBUG_MODE', '0') == '1'
+                assert "layer_number" in user_kwargs
+                debug_dump = user_kwargs['debug_dump']
+                layer_number = user_kwargs['layer_number']
+                
             # Decide whether to update FP8 weights
             skip_fp8_weight_update = None
             if fp8_weight_caching:
@@ -423,7 +447,7 @@ def _make_graphed_callables(
             flatten_user_args, _ = _tree_flatten(user_args)
             flatten_user_kwargs, _ = _tree_flatten([user_kwargs[key] for key in kwargs_keys])
             func_args = tuple(flatten_user_args) + tuple(flatten_user_kwargs) + module_params
-            out = Graphed.apply(skip_fp8_weight_update, *func_args)
+            out = Graphed.apply(skip_fp8_weight_update, debug_dump, layer_number, *func_args)
             return _tree_unflatten(out, output_unflatten_spec)
 
         return functionalized
