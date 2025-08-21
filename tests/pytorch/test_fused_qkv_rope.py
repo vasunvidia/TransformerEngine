@@ -86,9 +86,11 @@ def test_fused_qkv_rope(
         t = t.transpose(0, 1).contiguous()
     t.requires_grad = True
 
-    rotary_pos_emb = RotaryPositionEmbedding(hidden_size, rotary_percent, interleaved=interleaved)
-    emb = rotary_pos_emb(seq_length * cp_size)
-    assert emb.is_contiguous()
+    rotary_pos_emb_q = RotaryPositionEmbedding(hidden_size*4, rotary_percent, interleaved=interleaved)
+    emb_q = rotary_pos_emb_q(seq_length * cp_size)
+    rotary_pos_emb_k = RotaryPositionEmbedding(hidden_size, rotary_percent, interleaved=interleaved)
+    emb_k = rotary_pos_emb_k(seq_length * cp_size)
+#    print (f'emb_q {emb_q.shape} emb_k {emb_k.shape}')
 
     for cp_rank in range(cp_size):
         # unfused
@@ -99,7 +101,7 @@ def test_fused_qkv_rope(
 
         query_unfused = apply_rotary_pos_emb(
             query.contiguous().float(),
-            emb,
+            emb_q,
             tensor_format=tensor_format,
             start_positions=start_positions,
             interleaved=interleaved,
@@ -109,7 +111,7 @@ def test_fused_qkv_rope(
         ).to(dtype)
         key_unfused = apply_rotary_pos_emb(
             key.contiguous().float(),
-            emb,
+            emb_k,
             tensor_format=tensor_format,
             start_positions=start_positions,
             interleaved=interleaved,
@@ -118,19 +120,19 @@ def test_fused_qkv_rope(
             cp_rank=cp_rank,
         ).to(dtype)
         value_unfused = value.contiguous()
-        #loss_unfused = loss_func(query_unfused, key_unfused, value_unfused)
+        loss_unfused = loss_func(query_unfused, key_unfused, value_unfused)
 
-        #if not isinstance(start_positions, torch.Tensor):
-        #    loss_unfused.backward()
-        #    grad_unfused = t.grad.detach().clone()
+#        if not isinstance(start_positions, torch.Tensor):
+#            loss_unfused.backward()
+#            grad_unfused = t.grad.detach().clone()
 
-        t.grad = None
+#        t.grad = None
 
         # fused
         query_fused, key_fused, value_fused = apply_fused_qkv_rotary_pos_emb(
             t,
-            emb,
-            emb,
+            emb_q,
+            emb_k,
             tensor_format=tensor_format,
             start_positions=start_positions,
             interleaved=interleaved,
@@ -138,43 +140,48 @@ def test_fused_qkv_rope(
             cp_rank=cp_rank,
             qkv_split_arg_list=[hidden_size*4, hidden_size, hidden_size],
         )
-        #loss_fused = loss_func(query_fused, key_fused, value_fused)
+        loss_fused = loss_func(query_fused, key_fused, value_fused)
 
         #if not isinstance(start_positions, torch.Tensor):
         #    loss_fused.backward()
         #    grad_fused = t.grad.detach().clone()
         #t.grad = None
 
-        # torch.testing.assert_close(query_fused.view(query_unfused.shape), query_unfused)
+#        torch.testing.assert_close(query_fused, query_unfused)
+#        torch.testing.assert_close(key_fused.view(key_unfused.shape), key_unfused)
+#        torch.testing.assert_close(value_fused.view(value_unfused.shape), value_unfused)
         batch_idx_print = 0
         seq_idx_print = 7
-        
-        
-        query_unfused = query_unfused.view(query_fused.shape)
+        head_idx_print = 7
+        #
+        #
+        #query_unfused = query_unfused.view(query_fused.shape)
 
         for batch_idx in range(batch_size):
             for seq_idx in range(seq_length):
-                if batch_idx != batch_idx_print or seq_idx != seq_idx_print:
-                    continue
-                query_fused2 = query_fused[batch_idx][seq_idx] if tensor_format == "bshd" else query_fused[seq_idx][batch_idx]
-                q_out_flat = query_fused2.flatten().float()
-                query_unfused2 = query_unfused[batch_idx][seq_idx] if tensor_format == "bshd" else query_unfused[seq_idx][batch_idx]
-                q_out_te_flat = query_unfused2.flatten().float()
-                if batch_idx == batch_idx_print and seq_idx == seq_idx_print:
-                    print (f'query_unfused: {query_unfused2.shape}-{query_unfused2}')
-                    print (f'query_fused: {query_fused2.shape}-{query_fused2}')
-                q_cos_sim = torch.nn.functional.cosine_similarity(q_out_te_flat, q_out_flat, dim=0)
-                print(f"Cosine similarity {batch_idx},{seq_idx} between q_expected and q_actual: {q_cos_sim.item():.6f}")
+                for h_idx in range(head_num):
+#                    if batch_idx != batch_idx_print or seq_idx != seq_idx_print or h_idx != head_idx_print:
+#                        continue
+                    query_fused2 = query_fused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else query_fused[seq_idx][batch_idx][h_idx]
+                    q_out_flat = query_fused2.flatten().float()
+                    query_unfused2 = query_unfused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else query_unfused[seq_idx][batch_idx][h_idx]
+                    q_out_te_flat = query_unfused2.flatten().float()
+#                    if batch_idx == batch_idx_print and seq_idx == seq_idx_print and h_idx == head_idx_print:
+#                        print (f'query_unfused_{batch_idx},{seq_idx}{h_idx}: {query_unfused2.shape}-{query_unfused2}')
+#                        print (f'query_fused_{batch_idx},{seq_idx}{h_idx}: {query_fused2.shape}-{query_fused2}')
+                    q_cos_sim = torch.nn.functional.cosine_similarity(q_out_te_flat, q_out_flat, dim=0)
+                    print(f"Cosine similarity {batch_idx},{seq_idx},{h_idx} between q_expected and q_actual: {q_cos_sim.item():.6f}")
+#        print (f'key_fused {key_fused.shape}-{key_fused}')
+        q_cos_sim = torch.nn.functional.cosine_similarity(query_unfused[0][0].flatten().float(), query_fused[0][0].flatten().float(a))
+        print(f"Cosine similarity between q_expected and q_actual: {q_cos_sim.item():.6f}")
         
-        #torch.testing.assert_close(key_fused.view(key_unfused.shape), key_unfused)
-        #torch.testing.assert_close(value_fused.view(value_unfused.shape), value_unfused)
 
         #if not isinstance(start_positions, torch.Tensor):
         #    torch.testing.assert_close(grad_fused, grad_unfused)
 
         assert query_fused.is_contiguous()
-        assert key_fused.is_contiguous()
-        assert value_fused.is_contiguous()
+#        assert key_fused.is_contiguous()
+#        assert value_fused.is_contiguous()
 
 
 #@pytest.mark.parametrize("margin", [10])

@@ -43,9 +43,9 @@ __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs
                            : static_cast<float>(src[offset_src - stride_d]);
       }
       dst[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
-      if (s_id == 7 && threadIdx.x == 0 && threadIdx.y == 0) {
-        printf ("fused_rope_block_forward  ID[%d,%d],[%d,%d] offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)dst[offset_dst]);
-      }
+//      if (s_id == 7 && threadIdx.y == 3 && h_id==7) {
+//        printf ("fused_rope_block_forward  ID[%d,%d],[%d,%d] h_id: %d, d_id: %doffset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)dst[offset_dst]);
+//      }
     }
   }
 
@@ -122,19 +122,19 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
                                          const int h, const int d, const int d2, const int row_offset, const int row_length) {
     // d_id: tid.x -> 128
     extern __shared__ float shared_mem_cos_sin[];
-    //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-    //    printf ("row_offset: %d, row_length: %d, offset_block: %d, offset_block_dst: %d\n", row_offset, row_length, offset_block, offset_block_dst);
-    //}
-    // Split the shared memory into cos and sin parts
-    float* shared_mem_cos = shared_mem_cos_sin;
-    float* shared_mem_sin = shared_mem_cos_sin + d2;
-    if (freqs != nullptr) {
-        int tid = threadIdx.x * blockDim.y + threadIdx.y;
-        for (int i = tid; i < d2; i+=blockDim.x * blockDim.y) {
-            sincosf(freqs[s_id * d2 + i], &shared_mem_sin[i], &shared_mem_cos[i]);
-        }
-    }
-    __syncthreads();
+//    if (threadIdx.x == 0 && threadIdx.y == 7 && s_id == 7) {
+//        printf ("fused_qkv_rope_block_forward row_offset: %d, row_length: %d, offset_block: %d, offset_block_dst: %d\n", row_offset, row_length, offset_block, offset_block_dst);
+//    }
+//    // Split the shared memory into cos and sin parts
+//    float* shared_mem_cos = shared_mem_cos_sin;
+//    float* shared_mem_sin = shared_mem_cos_sin + d2;
+//    if (freqs != nullptr) {
+//        int tid = threadIdx.x * blockDim.y + threadIdx.y;
+//        for (int i = tid; i < d2; i+=blockDim.x * blockDim.y) {
+//            sincosf(freqs[s_id * d2 + i], &shared_mem_sin[i], &shared_mem_cos[i]);
+//        }
+//    }
+//    __syncthreads();
 
     #pragma unroll
     for (int h_id = threadIdx.y; h_id < h; h_id += blockDim.y) {
@@ -150,8 +150,9 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
 
                 if (freqs != nullptr) {
                     float v_cos, v_sin;
-                    v_cos = shared_mem_cos[d_id];
-                    v_sin = shared_mem_sin[d_id];
+                    //v_cos = shared_mem_cos[d_id];
+                    //v_sin = shared_mem_sin[d_id];
+		    sincosf(freqs[s_id * d2 + d_id], &v_sin, &v_cos);
                     //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
                     //    printf ("h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, src: %f freq: %f sin: %f cos: %f\n", h_id, i, d_id, offset_src, offset_dst, (float)src[offset_src], freqs[s_id * d2 + d_id], v_sin, v_cos);
                     //}    
@@ -160,9 +161,9 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
                                  ? -static_cast<float>(src[offset_src + (d2 / 2)])
                                  : static_cast<float>(src[offset_src + (d2 / 2 - d2)]);
                     out[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
-                    if (s_id == 7 && threadIdx.x == 0 && threadIdx.y == 0) {
-                      printf ("fused_qkv_rope_block_forward  ID[%d,%d],[%d,%d] offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)out[offset_dst]);
-                    }
+//                    if (s_id == 7 && threadIdx.y == 7) {
+//                      printf ("fused_qkv_rope_block_forward SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)out[offset_dst]);
+//                    }
                 } else {
                     out[offset_dst] = src[offset_src];
                 }
@@ -211,9 +212,9 @@ __global__ void fused_rope_forward_kernel(const scalar_t *src, const int *cu_seq
     int begin_offset = (start_positions == nullptr) ? 0 : start_positions[b_id];
     s_id_for_freqs = s_id + begin_offset;
   }
-  //if (s_id == 7 && b_id == 0) {
-  //  printf ("Size [%d,%d] ID[%d,%d] fused_rope_forward_kernel s_id: %d, b_id: %d, s_id_for_freqs: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, s_id, b_id, s_id_for_freqs);
-  //}
+//  if (s_id == 7 && b_id == 0 && threadIdx.x==0 && threadIdx.y==0) {
+//    printf ("Size [%d,%d] ID[%d,%d] fused_rope_forward_kernel s_id: %d, b_id: %d, s_id_for_freqs: %d, d %d d2 %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, s_id, b_id, s_id_for_freqs, d, d2);
+//  }
   fused_rope_block_forward(src, freqs, dst, interleaved, s_id_for_freqs, offset_block,
                            offset_block_dst, h, d, d2, stride_h, stride_d, o_stride_h, o_stride_d);
 }
@@ -376,9 +377,9 @@ __global__ void fused_qkv_rope_backward_kernel(const scalar_t *grad_out_q, const
     }
     int q_limit = q_split_arg;
     int k_limit = q_limit + k_split_arg;
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-      printf("q_limit: %d, k_limit: %d, h: %d, d: %d, d2: %d, q_split_arg: %d, k_split_arg: %d, v_split_arg: %d\n", q_limit, k_limit, h, d, d2, q_split_arg, k_split_arg, v_split_arg);
-    }
+//    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+//      printf("q_limit: %d, k_limit: %d, h: %d, d: %d, d2: %d, q_split_arg: %d, k_split_arg: %d, v_split_arg: %d\n", q_limit, k_limit, h, d, d2, q_split_arg, k_split_arg, v_split_arg);
+//    }
     fused_qkv_rope_block_backward(
         grad_out_q, q_freqs, qkv_grad,
         s_id, offset_block, offset_block_dst_q,
@@ -466,7 +467,7 @@ void fused_qkv_rope_forward_launcher(const scalar_t *qkv_input, const float *q_f
                                  const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d,
                                  const int d2, const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
                                  cudaStream_t stream) {
-  const int shared_mem_size = 2 * d2 * sizeof(float);  // cos + sin
+  const int shared_mem_size = 2 * d2 * sizeof(float);  // (cos, sin)
   const int THREADS_PER_WARP = 32;
   int warps_per_block = (h <= 8)? h:8;
   dim3 blocks(s, b);
@@ -485,7 +486,7 @@ void fused_qkv_rope_backward_launcher(const scalar_t *q_grad_out, const scalar_t
     const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
     cudaStream_t stream) {
 
-  const int shared_mem_size = 2 * d2 * sizeof(float);  // cos + sin
+  const int shared_mem_size = 2 * d2 * sizeof(float);  // (cos, sin)
   const int THREADS_PER_WARP = 32;
   const int warps_per_block = (h <= 8)? h:8;
   dim3 blocks(s, b);

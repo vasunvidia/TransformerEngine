@@ -200,9 +200,9 @@ class FusedQKVRoPEFunc(torch.autograd.Function):
             "bshd",
         ), f"Unsupported tensor_format: {tensor_format}."
         #import pdb; pdb.set_trace()
-        qkv = qkv.contiguous()
-        q_freqs = q_freqs.contiguous()
-        k_freqs = k_freqs.contiguous()
+        assert qkv.is_contiguous(), "QKV Tensor should be contiguous."
+        assert q_freqs.is_contiguous(), "q_freqs Tensor should be contiguous."
+        assert k_freqs.is_contiguous(), "k_freqs Tensor should be contiguous."
         output = tex.fused_qkv_rope_forward(
             qkv,
             q_freqs,

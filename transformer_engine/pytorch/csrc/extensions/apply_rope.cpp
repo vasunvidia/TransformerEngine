@@ -118,8 +118,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::
     // output
     auto act_options = at::TensorOptions().dtype(qkv_input.scalar_type()).device(qkv_input.device());
     auto q_out_size = qkv_input.sizes().vec();
-    q_out_size[2] = q_out_size[2] * qkv_split_arg_list[0] / qkv_split_arg_list[1];
-    q_out_size[3] = qkv_split_arg_list[1];
+    printf ("qkv_size %d,%d,%d,%d qkv_split_arg_list %d,%d,%d\n", q_out_size[0], q_out_size[1], q_out_size[2], q_out_size[3], qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2]);
+//    q_out_size[2] = q_out_size[2] * qkv_split_arg_list[0] / qkv_split_arg_list[1];
+    q_out_size[3] = qkv_split_arg_list[0];
     auto q_out = at::empty(q_out_size, act_options);
     auto k_out_size = qkv_input.sizes().vec();
     k_out_size[3] = qkv_split_arg_list[1];
@@ -259,7 +260,7 @@ at::Tensor fused_qkv_rope_backward(const at::Tensor &q_grad_out, const at::Tenso
     const int d = qkv_grad_input.size(3);
     const int d2 = q_freqs.size(3);
 
-    printf ("qkv_grad_size: %d, %d, %d, %d q_grad_out.contiguous: %d, q_freqs.contiguous: %d, k_freqs.contiguous: %d, qkv_grad_input.contiguous: %d\n", qkv_grad_size[0], qkv_grad_size[1], qkv_grad_size[2], qkv_grad_size[3], q_grad_out.is_contiguous(), q_freqs.is_contiguous(), k_freqs.is_contiguous(), qkv_grad_input.is_contiguous());
+    //printf ("qkv_grad_size: %d, %d, %d, %d q_grad_out.contiguous: %d, q_freqs.contiguous: %d, k_freqs.contiguous: %d, qkv_grad_input.contiguous: %d\n", qkv_grad_size[0], qkv_grad_size[1], qkv_grad_size[2], qkv_grad_size[3], q_grad_out.is_contiguous(), q_freqs.is_contiguous(), k_freqs.is_contiguous(), qkv_grad_input.is_contiguous());
     auto q_grad_out_cu = makeTransformerEngineTensor(q_grad_out);
     auto k_grad_out_cu = makeTransformerEngineTensor(k_grad_out);
     auto v_grad_out_cu = makeTransformerEngineTensor(v_grad_out);
