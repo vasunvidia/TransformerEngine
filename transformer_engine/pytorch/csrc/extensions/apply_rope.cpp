@@ -118,9 +118,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::
     // output
     auto act_options = at::TensorOptions().dtype(qkv_input.scalar_type()).device(qkv_input.device());
     auto q_out_size = qkv_input.sizes().vec();
-    printf ("qkv_size %d,%d,%d,%d qkv_split_arg_list %d,%d,%d\n", q_out_size[0], q_out_size[1], q_out_size[2], q_out_size[3], qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2]);
-//    q_out_size[2] = q_out_size[2] * qkv_split_arg_list[0] / qkv_split_arg_list[1];
-    q_out_size[3] = qkv_split_arg_list[0];
+    //printf ("qkv_size %d,%d,%d,%d qkv_split_arg_list %d,%d,%d\n", q_out_size[0], q_out_size[1], q_out_size[2], q_out_size[3], qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2]);
+    q_out_size[2] = q_out_size[2] * qkv_split_arg_list[0] / qkv_split_arg_list[1];
+    q_out_size[3] = qkv_split_arg_list[1];
     auto q_out = at::empty(q_out_size, act_options);
     auto k_out_size = qkv_input.sizes().vec();
     k_out_size[3] = qkv_split_arg_list[1];

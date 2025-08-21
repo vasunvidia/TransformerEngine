@@ -221,10 +221,10 @@ class FusedQKVRoPEFunc(torch.autograd.Function):
         """Fused RoPE backward."""
         q_freqs, k_freqs = ctx.saved_tensors
 
-        print (f'grad_output_q: {grad_output_q.shape}, grad_output_k: {grad_output_k.shape}, grad_output_v: {grad_output_v.shape}')
-        print (f'q_freqs: {q_freqs.shape}, k_freqs: {k_freqs.shape}')
-        print (f'qkv_split_arg_list: {ctx.qkv_split_arg_list}')
-        print (f'tensor_format: {ctx.tensor_format}')
+        #print (f'grad_output_q: {grad_output_q.shape}, grad_output_k: {grad_output_k.shape}, grad_output_v: {grad_output_v.shape}')
+        #print (f'q_freqs: {q_freqs.shape}, k_freqs: {k_freqs.shape}')
+        #print (f'qkv_split_arg_list: {ctx.qkv_split_arg_list}')
+        #print (f'tensor_format: {ctx.tensor_format}')
 
         grad_output_q = grad_output_q.contiguous()
         grad_output_k = grad_output_k.contiguous()

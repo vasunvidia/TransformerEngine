@@ -19,8 +19,10 @@ def _overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.Tenso
 
 # Gradient is a full tensor
 def _non_overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    t = torch.ones_like(query)
-    return torch.sum(query * t) + torch.sum(key * t) + torch.sum(value * t)
+    t1 = torch.ones_like(query)
+    t2 = torch.ones_like(key)
+    t3 = torch.ones_like(value)
+    return torch.sum(query * t1) + torch.sum(key * t2) + torch.sum(value * t3)
 
 # @pytest.mark.parametrize("start_positions", [True, False])
 # @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -41,8 +43,8 @@ def _non_overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.T
 @pytest.mark.parametrize("rotary_percent", [1.0])
 @pytest.mark.parametrize("margin", [0])
 #@pytest.mark.parametrize("transpose", [None, (0, 1), (2, 3)])
-@pytest.mark.parametrize("tensor_format", ["sbhd"])
-@pytest.mark.parametrize("loss_func", [_overlapping_grad])
+@pytest.mark.parametrize("tensor_format", ["sbhd", "bshd"])
+@pytest.mark.parametrize("loss_func", [_overlapping_grad, _non_overlapping_grad])
 @pytest.mark.parametrize("cp_size", [1])
 @pytest.mark.parametrize("interleaved", [False])
 def test_fused_qkv_rope(
@@ -86,21 +88,22 @@ def test_fused_qkv_rope(
         t = t.transpose(0, 1).contiguous()
     t.requires_grad = True
 
-    rotary_pos_emb_q = RotaryPositionEmbedding(hidden_size*4, rotary_percent, interleaved=interleaved)
+    rotary_pos_emb_q = RotaryPositionEmbedding(hidden_size, rotary_percent, interleaved=interleaved)
     emb_q = rotary_pos_emb_q(seq_length * cp_size)
     rotary_pos_emb_k = RotaryPositionEmbedding(hidden_size, rotary_percent, interleaved=interleaved)
     emb_k = rotary_pos_emb_k(seq_length * cp_size)
-#    print (f'emb_q {emb_q.shape} emb_k {emb_k.shape}')
 
     for cp_rank in range(cp_size):
         # unfused
         # The fused kernel computes in float32 internally, so we force the unfused func to use float32
         # for more accurate comparison
 
-        (query, key, value) = torch.split(t, [hidden_size*4, hidden_size, hidden_size], dim=3)
+        t_clone = t.clone()
+        (query, key, value) = torch.split(t_clone, [hidden_size*4, hidden_size, hidden_size], dim=3)
+        query = query.reshape(query.shape[0], query.shape[1], head_num*4, hidden_size)
 
         query_unfused = apply_rotary_pos_emb(
-            query.contiguous().float(),
+            query,
             emb_q,
             tensor_format=tensor_format,
             start_positions=start_positions,
@@ -109,8 +112,9 @@ def test_fused_qkv_rope(
             cp_size=cp_size,
             cp_rank=cp_rank,
         ).to(dtype)
+
         key_unfused = apply_rotary_pos_emb(
-            key.contiguous().float(),
+            key,
             emb_k,
             tensor_format=tensor_format,
             start_positions=start_positions,
@@ -119,14 +123,14 @@ def test_fused_qkv_rope(
             cp_size=cp_size,
             cp_rank=cp_rank,
         ).to(dtype)
-        value_unfused = value.contiguous()
+        value_unfused = value
         loss_unfused = loss_func(query_unfused, key_unfused, value_unfused)
 
-#        if not isinstance(start_positions, torch.Tensor):
-#            loss_unfused.backward()
-#            grad_unfused = t.grad.detach().clone()
+        if not isinstance(start_positions, torch.Tensor):
+            loss_unfused.backward()
+            grad_unfused = t.grad.detach().clone()
 
-#        t.grad = None
+        t.grad = None
 
         # fused
         query_fused, key_fused, value_fused = apply_fused_qkv_rotary_pos_emb(
@@ -142,46 +146,59 @@ def test_fused_qkv_rope(
         )
         loss_fused = loss_func(query_fused, key_fused, value_fused)
 
-        #if not isinstance(start_positions, torch.Tensor):
-        #    loss_fused.backward()
-        #    grad_fused = t.grad.detach().clone()
-        #t.grad = None
+        if not isinstance(start_positions, torch.Tensor):
+            loss_fused.backward()
+            grad_fused = t.grad.detach().clone()
+        t.grad = None
 
-#        torch.testing.assert_close(query_fused, query_unfused)
-#        torch.testing.assert_close(key_fused.view(key_unfused.shape), key_unfused)
-#        torch.testing.assert_close(value_fused.view(value_unfused.shape), value_unfused)
+
         batch_idx_print = 0
-        seq_idx_print = 7
-        head_idx_print = 7
-        #
-        #
-        #query_unfused = query_unfused.view(query_fused.shape)
-
-        for batch_idx in range(batch_size):
-            for seq_idx in range(seq_length):
-                for h_idx in range(head_num):
-#                    if batch_idx != batch_idx_print or seq_idx != seq_idx_print or h_idx != head_idx_print:
-#                        continue
-                    query_fused2 = query_fused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else query_fused[seq_idx][batch_idx][h_idx]
-                    q_out_flat = query_fused2.flatten().float()
-                    query_unfused2 = query_unfused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else query_unfused[seq_idx][batch_idx][h_idx]
-                    q_out_te_flat = query_unfused2.flatten().float()
-#                    if batch_idx == batch_idx_print and seq_idx == seq_idx_print and h_idx == head_idx_print:
-#                        print (f'query_unfused_{batch_idx},{seq_idx}{h_idx}: {query_unfused2.shape}-{query_unfused2}')
-#                        print (f'query_fused_{batch_idx},{seq_idx}{h_idx}: {query_fused2.shape}-{query_fused2}')
-                    q_cos_sim = torch.nn.functional.cosine_similarity(q_out_te_flat, q_out_flat, dim=0)
-                    print(f"Cosine similarity {batch_idx},{seq_idx},{h_idx} between q_expected and q_actual: {q_cos_sim.item():.6f}")
-#        print (f'key_fused {key_fused.shape}-{key_fused}')
-        q_cos_sim = torch.nn.functional.cosine_similarity(query_unfused[0][0].flatten().float(), query_fused[0][0].flatten().float(a))
-        print(f"Cosine similarity between q_expected and q_actual: {q_cos_sim.item():.6f}")
+        seq_idx_print = 0
+        h_idx_print = 0
         
+        def print_diff(out_unfused, out_fused, name, verbose=False, batch_idx_print=0, seq_idx_print=0, h_idx_print=0):
+            out_flat = out_fused.flatten().float()
+            out_te_flat = out_unfused.flatten().float()
+            # Find the index for max. difference between query_unfused and query_fused
+            diff = (out_te_flat - out_flat).abs()
+            max_diff, max_idx = diff.max(0)
+            print(f"Max difference between {name}_unfused and {name}_fused: {max_diff.item():.6f} at flat index {max_idx.item()}")
+            max_idx = max_idx.item()
+            d2 = out_unfused.shape[-1]
+            max_seq_idx = max_idx // (batch_size * head_num * d2)
+            max_batch_idx = (max_idx - max_seq_idx * batch_size * head_num * d2) // (head_num * d2)
+            max_h_idx = (max_idx - max_seq_idx * batch_size * head_num * d2 - max_batch_idx * head_num * d2) // d2
+            max_d_idx = max_idx - max_seq_idx * batch_size * head_num * d2 - max_batch_idx * head_num * d2 - max_h_idx * d2
+            print(f"{name}_unfused.shape: {out_unfused.shape} max_idx4d: {max_seq_idx},{max_batch_idx},{max_h_idx},{max_d_idx}")
+            print(f"{name}_fused.shape: {out_fused.shape}")
+            print(f"{name}_unfused[{max_seq_idx},{max_batch_idx},{max_h_idx},{max_d_idx}]: {out_unfused[max_seq_idx][max_batch_idx][max_h_idx][max_d_idx].item()}, {name}_fused[{max_seq_idx},{max_batch_idx},{max_h_idx},{max_d_idx}]: {out_fused[max_seq_idx][max_batch_idx][max_h_idx][max_d_idx].item()}")
 
-        #if not isinstance(start_positions, torch.Tensor):
-        #    torch.testing.assert_close(grad_fused, grad_unfused)
+            if verbose:
+                for batch_idx in range(batch_size):
+                    for seq_idx in range(seq_length):
+                        for h_idx in range(head_num):
+                            if batch_idx != batch_idx_print or seq_idx != seq_idx_print or h_idx != h_idx_print:
+                                continue
+                            out_fused2 = out_fused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else out_fused[seq_idx][batch_idx][h_idx]
+                            out_fused_flat = out_fused2.flatten().float()
+                            out_unfused2 = out_unfused[batch_idx][seq_idx][h_idx] if tensor_format == "bshd" else out_unfused[seq_idx][batch_idx][h_idx]
+                            out_unfused_flat = out_unfused2.flatten().float()
+                            if batch_idx == batch_idx_print and seq_idx == seq_idx_print and h_idx == h_idx_print:
+                                print (f'{name}_unfused: {out_unfused2.shape}-{out_unfused2}')
+                                print (f'{name}_fused: {out_fused2.shape}-{out_fused2}')
+                            cos_sim = torch.nn.functional.cosine_similarity(out_unfused_flat, out_fused_flat, dim=0)
+                            print(f"Cosine similarity {batch_idx},{seq_idx},{h_idx} between {name}_expected and {name}_actual: {cos_sim.item():.6f}")
+            out_flat = out_fused.flatten().float()
+            out_unfused_flat = out_unfused.flatten().float()
+            cos_sim = torch.nn.functional.cosine_similarity(out_unfused_flat, out_flat, dim=0)
+            print(f"Cosine similarity {batch_idx_print},{seq_idx_print} between {name}_expected {out_unfused_flat} and {name}_actual {out_flat}: {cos_sim.item():.6f}")
 
-        assert query_fused.is_contiguous()
-#        assert key_fused.is_contiguous()
-#        assert value_fused.is_contiguous()
+        torch.testing.assert_close(query_fused, query_unfused)
+        torch.testing.assert_close(key_fused, key_unfused)
+        torch.testing.assert_close(value_fused, value_unfused)
+
+        if not isinstance(start_positions, torch.Tensor):
+            torch.testing.assert_close(grad_fused, grad_unfused)
 
 
 #@pytest.mark.parametrize("margin", [10])
