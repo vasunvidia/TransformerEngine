@@ -59,7 +59,6 @@ at::Tensor fused_rope_forward(const at::Tensor &input, const at::Tensor &freqs,
     const int d2 = freqs.size(3);
 
     auto cu_seqlens_cu = makeTransformerEngineTensor(cu_seqlens.value());
-
     nvte_fused_rope_forward(input_cu.data(), cu_seqlens_cu.data(), freqs_cu.data(),
                             start_positions_cu.data(), output_cu.data(), qkv_format, interleaved,
                             cp_size, cp_rank, max_s, b, h, d, d2, stride_t, /*stride_b=*/0,
@@ -94,6 +93,7 @@ at::Tensor fused_rope_forward(const at::Tensor &input, const at::Tensor &freqs,
               "greater than the freqs tensor");
 
   auto cu_seqlens_cu = TensorWrapper();  // empty cu_seqlens tensor
+
   nvte_fused_rope_forward(input_cu.data(), cu_seqlens_cu.data(), freqs_cu.data(),
                           start_positions_cu.data(), output_cu.data(), qkv_format, interleaved,
                           cp_size, cp_rank, s, b, h, d, d2, stride_s, stride_b, stride_h, stride_d,
@@ -143,7 +143,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::
     const int s = is_sbhd ? qkv_input.size(0) : qkv_input.size(1);
     const int b = is_sbhd ? qkv_input.size(1) : qkv_input.size(0);
     const int h = qkv_input.size(2);
-    const int d = qkv_input.size(3);
+    const int d = qkv_split_arg_list[2];
     const int d2 = q_freqs.size(3);
 
     nvte_fused_qkv_rope_forward(qkv_cu.data(), q_freqs_cu.data(), k_freqs_cu.data(),
@@ -257,7 +257,7 @@ at::Tensor fused_qkv_rope_backward(const at::Tensor &q_grad_out, const at::Tenso
     const int s = is_sbhd ? q_grad_out.size(0) : q_grad_out.size(1);
     const int b = is_sbhd ? q_grad_out.size(1) : q_grad_out.size(0);
     const int h = qkv_grad_input.size(2);
-    const int d = qkv_grad_input.size(3);
+    const int d = qkv_split_arg_list[2];
     const int d2 = q_freqs.size(3);
 
     //printf ("qkv_grad_size: %d, %d, %d, %d q_grad_out.contiguous: %d, q_freqs.contiguous: %d, k_freqs.contiguous: %d, qkv_grad_input.contiguous: %d\n", qkv_grad_size[0], qkv_grad_size[1], qkv_grad_size[2], qkv_grad_size[3], q_grad_out.is_contiguous(), q_freqs.is_contiguous(), k_freqs.is_contiguous(), qkv_grad_input.is_contiguous());

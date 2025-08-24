@@ -21,6 +21,9 @@ __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs
                                          const int h, const int d, const int d2, const int stride_h,
                                          const int stride_d, const int o_stride_h,
                                          const int o_stride_d) {
+  //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+  //  printf ("fused_rope_block_forward h: %d, d: %d, d2: %d\n", h, d, d2);
+  //}
 #pragma unroll
   for (int d_id = threadIdx.x; d_id < d2; d_id += blockDim.x) {
     float v_cos, v_sin;
@@ -43,9 +46,9 @@ __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs
                            : static_cast<float>(src[offset_src - stride_d]);
       }
       dst[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
-//      if (s_id == 0 && threadIdx.y == 0 && h_id==0) {
-//        printf ("fused_rope_block_forward  ID[%d,%d],[%d,%d] h_id: %d, d_id: %doffset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)dst[offset_dst]);
-//      }
+ //     if (s_id == 2 && threadIdx.y == 0 && h_id==0) {
+ //       printf ("fused_rope_block_forward SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, d_id: %doffset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)dst[offset_dst]);
+ //     }
     }
   }
 
@@ -58,7 +61,11 @@ __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs
 #pragma unroll
       for (int d_id = d2 + threadIdx.x; d_id < d; d_id += blockDim.x) {
         dst[offset_head_dst + d_id * o_stride_d] = src[offset_head + d_id * stride_d];
+ //       if (s_id == 2 && threadIdx.y == 0 && h_id==0) {
+ //         printf ("fused_rope_block_forward_copy SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, d_id: %doffset_src: %d, offset_dst: %d, dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, d_id, offset_head + d_id * stride_d, offset_head_dst + d_id * o_stride_d, (float)dst[offset_head_dst + d_id * o_stride_d]);
+ //       }
       }
+
     }
   }
 }
@@ -119,7 +126,7 @@ __device__ void fused_rope_block_backward(const scalar_t *src, const float *freq
 template <typename scalar_t>
 __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *freqs, scalar_t *out,
                                          const int s_id, const int offset_block, const int offset_block_dst,
-                                         const int h, const int d, const int d2, const int row_offset, const int row_length) {
+                                         const int h, const int d, const int d2, const int row_offset, const int in_row_length, const int out_row_length) {
     // d_id: tid.x -> 128
 //    extern __shared__ float shared_mem_cos_sin[];
 //    if (threadIdx.x == 0 && threadIdx.y == 7 && s_id == 7) {
@@ -135,17 +142,19 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
 //        }
 //    }
 //    __syncthreads();
-
+  //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+  //  printf ("fused_qkv_rope_block_forward h: %d, d: %d, d2: %d\n", h, d, d2);
+  //}
     #pragma unroll
     for (int h_id = threadIdx.y; h_id < h; h_id += blockDim.y) {
         #pragma unroll
-        for (int i = 0; i < row_length; i+=d2) {
+        for (int i = 0; i < out_row_length; i+=d) {
             #pragma unroll
             for (int d_id = threadIdx.x; d_id < d2; d_id += blockDim.x) {
       
         // h_id: tid.y -> 8
-                int offset_src = offset_block + h_id * d + (row_offset + i) + d_id;
-                int offset_dst = offset_block_dst + h_id * row_length + i + d_id;
+                int offset_src = offset_block + h_id * in_row_length + (row_offset + i) + d_id;
+                int offset_dst = offset_block_dst + h_id * out_row_length + i + d_id;
 
 
                 if (freqs != nullptr) {
@@ -161,14 +170,24 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
                                  ? -static_cast<float>(src[offset_src + (d2 / 2)])
                                  : static_cast<float>(src[offset_src + (d2 / 2 - d2)]);
                     out[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
-//                    if (s_id == 0 && threadIdx.y == 0 && h_id==0) {
-//                      printf ("fused_qkv_rope_block_forward SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)out[offset_dst]);
-//                    }
+ //                   if (s_id == 2 && threadIdx.y == 0 && h_id==0) {
+ //                     printf ("fused_qkv_rope_block_forward SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)out[offset_dst]);
+ //                   }
                 } else {
                     out[offset_dst] = src[offset_src];
                 }
 
             }
+              // copy the rest
+            if (d > d2) {
+              #pragma unroll
+              for (int d_id = d2 + threadIdx.x; d_id < d; d_id += blockDim.x) {
+                int offset_src = offset_block + h_id * in_row_length + (row_offset + i) + d_id;
+                int offset_dst = offset_block_dst + h_id * out_row_length + i + d_id;
+                out[offset_dst] = src[offset_src];
+              }
+            }
+            // end of copy the rest
         }
     }
 }
@@ -182,6 +201,10 @@ __global__ void fused_rope_forward_kernel(const scalar_t *src, const int *cu_seq
                                           const int stride_h, const int stride_d,
                                           const int o_stride_s_or_t, const int o_stride_b,
                                           const int o_stride_h, const int o_stride_d) {
+
+  //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+  //  printf ("fused_rope_forward_kernel h: %d, d: %d, d2: %d\n", h, d, d2);
+  //}
   int s_id = blockIdx.x, b_id = blockIdx.y;
   int offset_block, offset_block_dst;
   int cur_seqlens;
@@ -273,14 +296,15 @@ __global__ void fused_qkv_rope_forward_kernel(const scalar_t *qkv_input, const f
     //if (s_id == 7 && b_id == 0) {
     //  printf ("Size [%d,%d] ID[%d,%d] fused_qkv_rope_forward_kernel s_id: %d, b_id: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, s_id, b_id);
     //}
+    int total_d = q_split_arg + k_split_arg + v_split_arg;
     int offset_block, offset_block_dst_q, offset_block_dst_k, offset_block_dst_v;
     if (qkv_format == NVTE_QKV_Format::NVTE_SBHD) {
-        offset_block = s_id * b * h * d + b_id * h * d;
+        offset_block = s_id * b * h * total_d + b_id * h * total_d;
         offset_block_dst_q = s_id * b * h * q_split_arg + b_id * h * q_split_arg;
         offset_block_dst_k = s_id * b * h * k_split_arg + b_id * h * k_split_arg;
         offset_block_dst_v = s_id * b * h * v_split_arg + b_id * h * v_split_arg;
     } else {
-        offset_block = b_id * s * h * d + s_id * h * d;
+        offset_block = b_id * s * h * total_d + s_id * h * total_d;
         offset_block_dst_q = b_id * s * h * q_split_arg + s_id * h * q_split_arg;
         offset_block_dst_k = b_id * s * h * k_split_arg + s_id * h * k_split_arg;
         offset_block_dst_v = b_id * s * h * v_split_arg + s_id * h * v_split_arg;
@@ -294,22 +318,22 @@ __global__ void fused_qkv_rope_forward_kernel(const scalar_t *qkv_input, const f
     fused_qkv_rope_block_forward(
         qkv_input, q_freqs, q_out,
         s_id, offset_block, offset_block_dst_q,
-        h, d, d2, 0, q_split_arg);
+        h, d, d2, 0, total_d, q_split_arg);
     fused_qkv_rope_block_forward(
         qkv_input, k_freqs, k_out,
         s_id, offset_block, offset_block_dst_k,
-        h, d, d2, q_limit, k_split_arg);
+        h, d, d2, q_limit, total_d, k_split_arg);
     fused_qkv_rope_block_forward(
         qkv_input, nullptr, v_out,
         s_id, offset_block, offset_block_dst_v,
-        h, d, d2, k_limit, v_split_arg);
+        h, d, d2, k_limit, total_d, v_split_arg);
 
 }
 
 template <typename scalar_t>
 __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const float *freqs, scalar_t *out,
                                          const int s_id, const int offset_block, const int offset_block_dst,
-                                         const int h, const int d, const int d2, const int row_offset, const int row_length) {
+                                         const int h, const int d, const int d2, const int row_offset, const int in_row_length, const int out_row_length) {
     //extern __shared__ float shared_mem_cos_sin[];
     
     // Split the shared memory into cos and sin parts
@@ -322,15 +346,19 @@ __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const fl
     //    }
     //}
     //__syncthreads();
+    //if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+    //  printf ("fused_qkv_rope_block_backward1 SIZE [%d,%d] Tid [%d,%d] s_id: %d, h: %d, d: %d, d2: %d, row_offset: %d, in_row_length: %d, out_row_length: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, s_id, h, d, d2, row_offset, in_row_length, out_row_length);
+    //}
     #pragma unroll
     for (int h_id = threadIdx.y; h_id < h; h_id += blockDim.y) {
         #pragma unroll
-        for (int i = 0; i < row_length; i+=d2) {
+        for (int i = 0; i < out_row_length; i+=d) {
             #pragma unroll
             for (int d_id = threadIdx.x; d_id < d2; d_id += blockDim.x) {
       
-                int offset_dst = offset_block + h_id * d + (row_offset + i) + d_id;
-                int offset_src = offset_block_dst + h_id * row_length + i + d_id;
+                int offset_dst = offset_block + h_id * in_row_length + (row_offset + i) + d_id;
+                int offset_src = offset_block_dst + h_id * out_row_length + i + d_id;
+
                 //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 1) {
                 //    printf("h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, grad_out: %f, freqs: %f\n", h_id, i, d_id, offset_src, offset_dst, (float)grad_out[offset_src]);
                 //}
@@ -340,8 +368,8 @@ __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const fl
                     v_cos = cosf(freqs[s_id * d2 + d_id]);
                     //v_sin = shared_mem_sin[d_id];
                     v_sin = (d_id + d2 / 2 < d2) ? sinf(freqs[s_id * d2 + d_id + d2 / 2]) : -sinf(freqs[s_id * d2 + d_id + d2 / 2 - d2]);
-                    //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-                    //    printf ("h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, src: %f freq: %f sin: %f cos: %f\n", h_id, i, d_id, offset_src, offset_dst, (float)src[offset_src], freqs[s_id * d2 + d_id], v_sin, v_cos);
+                    //if (blockIdx.x == 0 && blockIdx.y == 0) {
+                    //    printf ("fused_qkv_rope_block_backward2 SIZE [%d,%d] Tid [%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, src: %f freq: %f sin: %f cos: %f\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, (float)grad_out[offset_src], freqs[s_id * d2 + d_id], v_sin, v_cos);
                     //}    
                     float v_src = grad_out[offset_src];
                     float v_src_rotate = (d_id + d2 / 2 < d2)
@@ -352,6 +380,17 @@ __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const fl
                     out[offset_dst] = grad_out[offset_src];
                 }
             }
+
+            // copy the rest
+            if (d > d2) {
+              #pragma unroll
+              for (int d_id = d2 + threadIdx.x; d_id < d; d_id += blockDim.x) {
+                int offset_dst = offset_block + h_id * in_row_length + (row_offset + i) + d_id;
+                int offset_src = offset_block_dst + h_id * out_row_length + i + d_id;
+                out[offset_dst] = grad_out[offset_src];
+              }
+            }
+            // end of copy the rest
         }
     }
 }
@@ -364,35 +403,35 @@ __global__ void fused_qkv_rope_backward_kernel(const scalar_t *grad_out_q, const
 
     int s_id = blockIdx.x, b_id = blockIdx.y;
     int offset_block, offset_block_dst_q, offset_block_dst_k, offset_block_dst_v;
-
+    int total_d = q_split_arg + k_split_arg + v_split_arg;
     if (qkv_format == NVTE_QKV_Format::NVTE_SBHD) {
-        offset_block = s_id * b * h * d + b_id * h * d;
+        offset_block = s_id * b * h * total_d + b_id * h * total_d;
         offset_block_dst_q = s_id * b * h * q_split_arg + b_id * h * q_split_arg;
         offset_block_dst_k = s_id * b * h * k_split_arg + b_id * h * k_split_arg;
         offset_block_dst_v = s_id * b * h * v_split_arg + b_id * h * v_split_arg;
     } else {
-        offset_block = b_id * s * h * d + s_id * h * d;
+        offset_block = b_id * s * h * total_d + s_id * h * total_d;
         offset_block_dst_q = b_id * s * h * q_split_arg + s_id * h * q_split_arg;
         offset_block_dst_k = b_id * s * h * k_split_arg + s_id * h * k_split_arg;
         offset_block_dst_v = b_id * s * h * v_split_arg + s_id * h * v_split_arg;
     }
     int q_limit = q_split_arg;
     int k_limit = q_limit + k_split_arg;
-//    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-//      printf("q_limit: %d, k_limit: %d, h: %d, d: %d, d2: %d, q_split_arg: %d, k_split_arg: %d, v_split_arg: %d\n", q_limit, k_limit, h, d, d2, q_split_arg, k_split_arg, v_split_arg);
-//    }
+    //if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
+    //  printf("fused_qkv_rope_backward_kernel SIZE [%d,%d] Tid [%d,%d] q_limit: %d, k_limit: %d, h: %d, d: %d, d2: %d, q_split_arg: %d, k_split_arg: %d, v_split_arg: %d total_d: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, q_limit, k_limit, h, d, d2, q_split_arg, k_split_arg, v_split_arg, total_d);
+    //}
     fused_qkv_rope_block_backward(
         grad_out_q, q_freqs, qkv_grad,
         s_id, offset_block, offset_block_dst_q,
-        h, d, d2, 0, q_split_arg);
+        h, d, d2, 0, total_d, q_split_arg);
     fused_qkv_rope_block_backward(
         grad_out_k, k_freqs, qkv_grad,
         s_id, offset_block, offset_block_dst_k,
-        h, d, d2, q_limit, k_split_arg);
+        h, d, d2, q_limit, total_d, k_split_arg);
     fused_qkv_rope_block_backward(
         grad_out_v, nullptr, qkv_grad,
         s_id, offset_block, offset_block_dst_v,
-        h, d, d2, k_limit, v_split_arg);
+        h, d, d2, k_limit, total_d, v_split_arg);
         
 }
 

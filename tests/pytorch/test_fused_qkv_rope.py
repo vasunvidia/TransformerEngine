@@ -38,10 +38,10 @@ def _non_overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.T
 
 @pytest.mark.parametrize("start_positions", [False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("seq_length", [8, 2048, 4096])
+@pytest.mark.parametrize("seq_length", [2, 8, 2048, 4096])
 @pytest.mark.parametrize("hidden_size", [64, 128, 256])
-@pytest.mark.parametrize("rotary_percent", [1.0])
-@pytest.mark.parametrize("margin", [0])
+@pytest.mark.parametrize("rotary_percent", [0.5, 1.0])
+@pytest.mark.parametrize("margin", [0, 10])
 #@pytest.mark.parametrize("transpose", [None, (0, 1), (2, 3)])
 @pytest.mark.parametrize("tensor_format", ["sbhd", "bshd"])
 @pytest.mark.parametrize("loss_func", [_overlapping_grad, _non_overlapping_grad])
@@ -69,8 +69,12 @@ def test_fused_qkv_rope(
         # `start_positions` is only supported for `cp_size=1` and inference.
         pytest.skip("Skipping test with cp_size>1 and start_positions=True")
 
+    if seq_length - margin < 0:
+        pytest.skip("Skipping test with seq_length - margin < 0")
+
     device = torch.device("cuda:0")
-    batch_size, head_num = 1, 8
+    batch_size, head_num = 2, 64
+
     t = torch.rand(
         (seq_length - margin, batch_size, head_num, hidden_size*6),
         dtype=dtype,
@@ -123,6 +127,7 @@ def test_fused_qkv_rope(
             cp_size=cp_size,
             cp_rank=cp_rank,
         ).to(dtype)
+
         value_unfused = value
         loss_unfused = loss_func(query_unfused, key_unfused, value_unfused)
 
@@ -152,10 +157,6 @@ def test_fused_qkv_rope(
         t.grad = None
 
 
-        batch_idx_print = 0
-        seq_idx_print = 0
-        h_idx_print = 0
-        
         def print_diff(out_unfused, out_fused, name, verbose=False, batch_idx_print=0, seq_idx_print=0, h_idx_print=0):
             out_flat = out_fused.flatten().float()
             out_te_flat = out_unfused.flatten().float()
@@ -193,9 +194,21 @@ def test_fused_qkv_rope(
             cos_sim = torch.nn.functional.cosine_similarity(out_unfused_flat, out_flat, dim=0)
             print(f"Cosine similarity {batch_idx_print},{seq_idx_print} between {name}_expected {out_unfused_flat} and {name}_actual {out_flat}: {cos_sim.item():.6f}")
 
+        batch_idx_print = 0
+        seq_idx_print = 0
+        h_idx_print = 1
+        #print_diff(key_unfused, key_fused, "key", verbose=True, batch_idx_print=batch_idx_print, seq_idx_print=seq_idx_print, h_idx_print=h_idx_print)
         torch.testing.assert_close(query_fused, query_unfused)
         torch.testing.assert_close(key_fused, key_unfused)
         torch.testing.assert_close(value_fused, value_unfused)
+
+        #grad_q_unfused, grad_k_unfused, grad_v_unfused = torch.split(grad_unfused, [hidden_size*4, hidden_size, hidden_size], dim=3)
+        #grad_q_fused, grad_k_fused, grad_v_fused = torch.split(grad_fused, [hidden_size*4, hidden_size, hidden_size], dim=3)
+        #torch.testing.assert_close(grad_q_fused, grad_q_unfused)
+        #torch.testing.assert_close(grad_k_fused, grad_k_unfused)
+        #torch.testing.assert_close(grad_v_fused, grad_v_unfused)
+
+#        print_diff(grad_v_unfused, grad_v_fused, "grad_v", verbose=True, batch_idx_print=batch_idx_print, seq_idx_print=seq_idx_print, h_idx_print=h_idx_print)
 
         if not isinstance(start_positions, torch.Tensor):
             torch.testing.assert_close(grad_fused, grad_unfused)
