@@ -187,7 +187,12 @@ class FusedQKVRoPEFunc(torch.autograd.Function):
         q_freqs: torch.Tensor,
         k_freqs: torch.Tensor,
         qkv_split_arg_list: List[int],
+        start_positions: Union[torch.Tensor, None] = None,
         tensor_format: str = "sbhd",
+        interleaved: bool = False,
+        cu_seqlens: Union[torch.Tensor, None] = None,
+        cp_size: int = 1,
+        cp_rank: int = 0,
     ) -> torch.Tensor:
         """Fused RoPE forward."""
 
@@ -207,19 +212,26 @@ class FusedQKVRoPEFunc(torch.autograd.Function):
             qkv,
             q_freqs,
             k_freqs,
+            start_positions,
             qkv_split_arg_list,
             QKVFormat[tensor_format],
+            interleaved,
+            cu_seqlens,
+            cp_size,
+            cp_rank,
         )
-        ctx.save_for_backward(q_freqs, k_freqs)
+        ctx.save_for_backward(q_freqs, k_freqs, cu_seqlens)
         ctx.tensor_format = tensor_format
         ctx.qkv_split_arg_list = qkv_split_arg_list
-
+        ctx.cp_size = cp_size
+        ctx.cp_rank = cp_rank
+        ctx.interleaved = interleaved
         return output
 
     @staticmethod
     def backward(ctx, grad_output_q: torch.Tensor, grad_output_k: torch.Tensor, grad_output_v: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         """Fused RoPE backward."""
-        q_freqs, k_freqs = ctx.saved_tensors
+        q_freqs, k_freqs, cu_seqlens = ctx.saved_tensors
 
         #print (f'grad_output_q: {grad_output_q.shape}, grad_output_k: {grad_output_k.shape}, grad_output_v: {grad_output_v.shape}')
         #print (f'q_freqs: {q_freqs.shape}, k_freqs: {k_freqs.shape}')
@@ -238,9 +250,13 @@ class FusedQKVRoPEFunc(torch.autograd.Function):
             k_freqs,
             ctx.qkv_split_arg_list,
             QKVFormat[ctx.tensor_format],
+            ctx.interleaved,
+            cu_seqlens,
+            ctx.cp_size,
+            ctx.cp_rank,
         )
 
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None, None, None
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -515,12 +531,11 @@ def apply_fused_qkv_rotary_pos_emb(
     start_positions: torch.Tensor, default = None.
         Tokens in a sequence `i` should be applied with position encoding offset by
         `start_positions[i]`. If `start_positions=None`, there's no offset.
-        This is not supported currently.
     tensor_format: {'sbhd', 'bshd'}, default = 'sbhd'
         is `bshd` if `qkv` is of shape `[bs, seq, ...]`, or `sbhd` if `qkv` is
         of shape `[seq, bs, ...]`.
     interleaved: bool, default = False
-        Whether to use interleaved rotary position embedding. This is not supported currently.
+        Whether to use interleaved rotary position embedding.
     cu_seqlens: torch.Tensor, default = None.
         Cumulative sum of sequence lengths in a batch for `qkv`, with shape [b + 1] and
         dtype torch.int32. Only valid when `tensor_format` is 'thd'.
@@ -532,18 +547,14 @@ def apply_fused_qkv_rotary_pos_emb(
     """
 
     # `start_positions` is only supported for `cp_size=1` and inference.
-    assert (
-        cp_size == 1 and start_positions is None
-    ), "CP SIZE > 1 is not supported!"
+    assert not (
+        cp_size > 1 and start_positions is not None
+    ), """start_positions != None with CP SIZE > 1 is not supported!"""
 
     assert (
         tensor_format != "thd" and cu_seqlens is None
     ), "'thd' tensor_format and cu_seqlens not supported currently."
-
-    assert (
-        interleaved == False
-    ), "interleaved=True is not supported currently."
     
     return FusedQKVRoPEFunc.apply(
-        qkv, q_freqs, k_freqs, qkv_split_arg_list, tensor_format
+        qkv, q_freqs, k_freqs, qkv_split_arg_list, start_positions, tensor_format, interleaved, cu_seqlens, cp_size, cp_rank
     )

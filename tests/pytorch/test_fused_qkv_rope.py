@@ -36,7 +36,7 @@ def _non_overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.T
 # @pytest.mark.parametrize("cp_size", [1, 2])
 # @pytest.mark.parametrize("interleaved", [True, False])
 
-@pytest.mark.parametrize("start_positions", [False])
+@pytest.mark.parametrize("start_positions", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seq_length", [2, 8, 2048, 4096])
 @pytest.mark.parametrize("hidden_size", [64, 128, 256])
@@ -45,8 +45,8 @@ def _non_overlapping_grad(query: torch.Tensor, key: torch.Tensor, value: torch.T
 #@pytest.mark.parametrize("transpose", [None, (0, 1), (2, 3)])
 @pytest.mark.parametrize("tensor_format", ["sbhd", "bshd"])
 @pytest.mark.parametrize("loss_func", [_overlapping_grad, _non_overlapping_grad])
-@pytest.mark.parametrize("cp_size", [1])
-@pytest.mark.parametrize("interleaved", [False])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("interleaved", [True, False])
 def test_fused_qkv_rope(
     dtype: torch.dtype,
     seq_length: int,

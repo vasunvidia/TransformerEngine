@@ -103,8 +103,9 @@ at::Tensor fused_rope_forward(const at::Tensor &input, const at::Tensor &freqs,
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::Tensor &qkv_input, const at::Tensor &q_freqs,
-  const at::Tensor &k_freqs, const std::vector<int> &qkv_split_arg_list,
-  const NVTE_QKV_Format qkv_format) {
+  const at::Tensor &k_freqs, const std::optional<at::Tensor> start_positions, const std::vector<int> &qkv_split_arg_list,
+  const NVTE_QKV_Format qkv_format, const bool interleaved, const std::optional<at::Tensor> cu_seqlens, const int cp_size,
+  const int cp_rank) {
     TORCH_CHECK(q_freqs.dim() == 4, "expected 4D tensor");
     TORCH_CHECK(q_freqs.size(1) == 1 && q_freqs.size(2) == 1,
               "expected the second and third dims of the freqs tensor equal 1");
@@ -135,6 +136,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::
     auto q_out_cu = makeTransformerEngineTensor(q_out);
     auto k_out_cu = makeTransformerEngineTensor(k_out);
     auto v_out_cu = makeTransformerEngineTensor(v_out);
+
+    auto start_positions_cu = TensorWrapper();  // empty cu_seqlens tensor
+    if (start_positions) {
+      start_positions_cu = makeTransformerEngineTensor(start_positions.value());
+    }
     
     TORCH_CHECK(qkv_input.dim() == 4, "expected 4D input tensor");
     TORCH_CHECK(qkv_input.is_contiguous(), "input tensor must be contiguous");
@@ -146,8 +152,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(const at::
     const int d = qkv_split_arg_list[2];
     const int d2 = q_freqs.size(3);
 
-    nvte_fused_qkv_rope_forward(qkv_cu.data(), q_freqs_cu.data(), k_freqs_cu.data(),
-    q_out_cu.data(), k_out_cu.data(), v_out_cu.data(), qkv_format, s, b, h, d, d2, qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2], at::cuda::getCurrentCUDAStream());
+    auto cu_seqlens_cu = TensorWrapper();  // empty cu_seqlens tensor
+    if (cu_seqlens) {
+      cu_seqlens_cu = makeTransformerEngineTensor(cu_seqlens.value());
+    }
+
+    nvte_fused_qkv_rope_forward(qkv_cu.data(), cu_seqlens_cu.data(), q_freqs_cu.data(), k_freqs_cu.data(),
+    start_positions_cu.data(), q_out_cu.data(), k_out_cu.data(), v_out_cu.data(),
+    qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2, qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2],
+    at::cuda::getCurrentCUDAStream());
     
     return std::make_tuple(q_out, k_out, v_out);
 }
@@ -245,7 +258,8 @@ at::Tensor fused_rope_backward(const at::Tensor &output_grads, const at::Tensor 
 
 at::Tensor fused_qkv_rope_backward(const at::Tensor &q_grad_out, const at::Tensor &k_grad_out, const at::Tensor &v_grad_out,
                                    const at::Tensor &q_freqs, const at::Tensor &k_freqs, const std::vector<int> &qkv_split_arg_list,
-                                   const NVTE_QKV_Format qkv_format) {
+                                   const NVTE_QKV_Format qkv_format, const bool interleaved, const std::optional<at::Tensor> cu_seqlens, const int cp_size,
+                                   const int cp_rank) {
     auto act_options = at::TensorOptions().dtype(q_grad_out.scalar_type()).device(q_grad_out.device());
     auto qkv_grad_size = q_grad_out.sizes().vec();
     auto total_hd = (q_grad_out.size(2) + k_grad_out.size(2) + v_grad_out.size(2)) * q_grad_out.size(3);
@@ -267,11 +281,17 @@ at::Tensor fused_qkv_rope_backward(const at::Tensor &q_grad_out, const at::Tenso
     auto q_freqs_cu = makeTransformerEngineTensor(q_freqs);
     auto k_freqs_cu = makeTransformerEngineTensor(k_freqs);
     auto qkv_grad_cu = makeTransformerEngineTensor(qkv_grad_input);
+
+    auto cu_seqlens_cu = TensorWrapper();  // empty cu_seqlens tensor
+    if (cu_seqlens) {
+      cu_seqlens_cu = makeTransformerEngineTensor(cu_seqlens.value());
+    }
     
     nvte_fused_qkv_rope_backward(q_grad_out_cu.data(), k_grad_out_cu.data(), v_grad_out_cu.data(),
-                                 q_freqs_cu.data(), k_freqs_cu.data(), qkv_grad_cu.data(),
-                                 qkv_format, s, b, h, d, d2, 
-                                 qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2], at::cuda::getCurrentCUDAStream());
+                                 cu_seqlens_cu.data(), q_freqs_cu.data(), k_freqs_cu.data(),
+                                 qkv_grad_cu.data(), qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2,
+                                 qkv_split_arg_list[0], qkv_split_arg_list[1], qkv_split_arg_list[2],
+                                 at::cuda::getCurrentCUDAStream());
     
     return qkv_grad_input;
 }

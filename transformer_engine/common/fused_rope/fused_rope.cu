@@ -125,7 +125,7 @@ __device__ void fused_rope_block_backward(const scalar_t *src, const float *freq
 
 template <typename scalar_t>
 __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *freqs, scalar_t *out,
-                                         const int s_id, const int offset_block, const int offset_block_dst,
+                                         const bool interleaved, const int s_id, const int offset_block, const int offset_block_dst,
                                          const int h, const int d, const int d2, const int row_offset, const int in_row_length, const int out_row_length) {
     // d_id: tid.x -> 128
 //    extern __shared__ float shared_mem_cos_sin[];
@@ -166,9 +166,16 @@ __device__ void fused_qkv_rope_block_forward(const scalar_t *src, const float *f
                     //    printf ("h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, src: %f freq: %f sin: %f cos: %f\n", h_id, i, d_id, offset_src, offset_dst, (float)src[offset_src], freqs[s_id * d2 + d_id], v_sin, v_cos);
                     //}    
                     float v_src = src[offset_src];
-                    float v_src_rotate = (d_id + d2 / 2 < d2)
-                                 ? -static_cast<float>(src[offset_src + (d2 / 2)])
-                                 : static_cast<float>(src[offset_src + (d2 / 2 - d2)]);
+                    float v_src_rotate;
+                    if (!interleaved) {
+                        v_src_rotate = (d_id + d2 / 2 < d2)
+                                     ? -static_cast<float>(src[offset_src + (d2 / 2)])
+                                     : static_cast<float>(src[offset_src + (d2 / 2 - d2)]);
+                    } else {
+                        v_src_rotate = (d_id % 2 == 0)
+                                   ? -static_cast<float>(src[offset_src + 1])
+                                   : static_cast<float>(src[offset_src - 1]);
+                    }
                     out[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
  //                   if (s_id == 2 && threadIdx.y == 0 && h_id==0) {
  //                     printf ("fused_qkv_rope_block_forward SIZE [%d,%d] ID[%d,%d],[%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, v_src: %f, v_cos: %f, v_sin: %f, v_src_rotate: %f dst_value: %f\n", blockDim.x, blockDim.y, blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, v_src, v_cos, v_sin, v_src_rotate, (float)out[offset_dst]);
@@ -284,15 +291,16 @@ __global__ void fused_rope_backward_kernel(
 }
 
 template <typename scalar_t>
-__global__ void fused_qkv_rope_forward_kernel(const scalar_t *qkv_input, const float *q_freqs, const float *k_freqs,
-    scalar_t *q_out, scalar_t *k_out, scalar_t *v_out,
-    const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d,
+__global__ void fused_qkv_rope_forward_kernel(const scalar_t *qkv_input, const int *cu_seqlens, const float *q_freqs, const float *k_freqs,
+    const int *start_positions, scalar_t *q_out, scalar_t *k_out, scalar_t *v_out,
+    const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d,
     const int d2, const int q_split_arg, const int k_split_arg, const int v_split_arg) {
     //if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
     //    printf("gridDim: %d, %d\n", gridDim.x, gridDim.y);
     //    printf("blockDim: %d, %d\n", blockDim.x, blockDim.y);
     //}
     int s_id = blockIdx.x, b_id = blockIdx.y;
+    int cur_seqlens = s;
     //if (s_id == 7 && b_id == 0) {
     //  printf ("Size [%d,%d] ID[%d,%d] fused_qkv_rope_forward_kernel s_id: %d, b_id: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, s_id, b_id);
     //}
@@ -312,27 +320,40 @@ __global__ void fused_qkv_rope_forward_kernel(const scalar_t *qkv_input, const f
     
     int q_limit = q_split_arg;
     int k_limit = q_limit + k_split_arg;
+    int s_id_for_freqs;
+    if (cp_size > 1) {
+      assert(cur_seqlens % 2 == 0);
+      if (s_id < cur_seqlens / 2) {
+        s_id_for_freqs = s_id + cp_rank * cur_seqlens / 2;
+      } else {
+        s_id_for_freqs =
+            cur_seqlens * cp_size - (cp_rank + 1) * cur_seqlens / 2 + s_id - cur_seqlens / 2;
+      }
+    } else {
+        int begin_offset = (start_positions == nullptr) ? 0 : start_positions[b_id];
+        s_id_for_freqs = s_id + begin_offset;
+    }
         //if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x < 16 && blockIdx.y < 2) {
         //printf("[%d,%d] offset_block: %d, offset_block_dst_q: %d, offset_block_dst_k: %d, offset_block_dst_v: %d\n", blockIdx.x, blockIdx.y, offset_block, offset_block_dst_q, offset_block_dst_k, offset_block_dst_v);
     //}
     fused_qkv_rope_block_forward(
-        qkv_input, q_freqs, q_out,
-        s_id, offset_block, offset_block_dst_q,
+        qkv_input, q_freqs, q_out, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_q,
         h, d, d2, 0, total_d, q_split_arg);
     fused_qkv_rope_block_forward(
-        qkv_input, k_freqs, k_out,
-        s_id, offset_block, offset_block_dst_k,
+        qkv_input, k_freqs, k_out, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_k,
         h, d, d2, q_limit, total_d, k_split_arg);
     fused_qkv_rope_block_forward(
-        qkv_input, nullptr, v_out,
-        s_id, offset_block, offset_block_dst_v,
+        qkv_input, nullptr, v_out, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_v,
         h, d, d2, k_limit, total_d, v_split_arg);
 
 }
 
 template <typename scalar_t>
 __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const float *freqs, scalar_t *out,
-                                         const int s_id, const int offset_block, const int offset_block_dst,
+                                         const bool interleaved, const int s_id, const int offset_block, const int offset_block_dst,
                                          const int h, const int d, const int d2, const int row_offset, const int in_row_length, const int out_row_length) {
     //extern __shared__ float shared_mem_cos_sin[];
     
@@ -367,14 +388,27 @@ __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const fl
                     //v_cos = shared_mem_cos[d_id];
                     v_cos = cosf(freqs[s_id * d2 + d_id]);
                     //v_sin = shared_mem_sin[d_id];
-                    v_sin = (d_id + d2 / 2 < d2) ? sinf(freqs[s_id * d2 + d_id + d2 / 2]) : -sinf(freqs[s_id * d2 + d_id + d2 / 2 - d2]);
+                    if (!interleaved) {
+                        v_sin = (d_id + d2 / 2 < d2) ? sinf(freqs[s_id * d2 + d_id + d2 / 2])
+                                                     : -sinf(freqs[s_id * d2 + d_id + d2 / 2 - d2]);
+                    } else {
+                        v_sin = (d_id % 2 == 0) ? sinf(freqs[s_id * d2 + d_id + 1])
+                                               : -sinf(freqs[s_id * d2 + d_id - 1]);
+                    }
                     //if (blockIdx.x == 0 && blockIdx.y == 0) {
                     //    printf ("fused_qkv_rope_block_backward2 SIZE [%d,%d] Tid [%d,%d] h_id: %d, i: %d, d_id: %d, offset_src: %d, offset_dst: %d, src: %f freq: %f sin: %f cos: %f\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, h_id, i, d_id, offset_src, offset_dst, (float)grad_out[offset_src], freqs[s_id * d2 + d_id], v_sin, v_cos);
                     //}    
                     float v_src = grad_out[offset_src];
-                    float v_src_rotate = (d_id + d2 / 2 < d2)
-                                 ? static_cast<float>(grad_out[offset_src + (d2 / 2)])
-                                 : static_cast<float>(grad_out[offset_src + (d2 / 2 - d2)]);
+                    float v_src_rotate;
+                    if (!interleaved) {
+                        v_src_rotate = (d_id + d2 / 2 < d2)
+                                     ? static_cast<float>(grad_out[offset_src + (d2 / 2)])
+                                     : static_cast<float>(grad_out[offset_src + (d2 / 2 - d2)]);
+                    } else {
+                        v_src_rotate = (d_id % 2 == 0)
+                                   ? static_cast<float>(grad_out[offset_src + 1])
+                                   : static_cast<float>(grad_out[offset_src - 1]);
+                    }
                     out[offset_dst] = v_src * v_cos + v_src_rotate * v_sin;
                 } else {
                     out[offset_dst] = grad_out[offset_src];
@@ -397,11 +431,12 @@ __device__ void fused_qkv_rope_block_backward(const scalar_t *grad_out, const fl
 
 template <typename scalar_t>
 __global__ void fused_qkv_rope_backward_kernel(const scalar_t *grad_out_q, const scalar_t *grad_out_k, const scalar_t *grad_out_v,
-    const float *q_freqs, const float *k_freqs, scalar_t *qkv_grad,
-    const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d,
+    const int *cu_seqlens, const float *q_freqs, const float *k_freqs, scalar_t *qkv_grad,
+    const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d,
     const int d2, const int q_split_arg, const int k_split_arg, const int v_split_arg) {
 
     int s_id = blockIdx.x, b_id = blockIdx.y;
+    int cur_seqlens = s;
     int offset_block, offset_block_dst_q, offset_block_dst_k, offset_block_dst_v;
     int total_d = q_split_arg + k_split_arg + v_split_arg;
     if (qkv_format == NVTE_QKV_Format::NVTE_SBHD) {
@@ -417,20 +452,32 @@ __global__ void fused_qkv_rope_backward_kernel(const scalar_t *grad_out_q, const
     }
     int q_limit = q_split_arg;
     int k_limit = q_limit + k_split_arg;
+    int s_id_for_freqs;
+    if (cp_size > 1) {
+      assert(cur_seqlens % 2 == 0);
+      if (s_id < cur_seqlens / 2) {
+        s_id_for_freqs = s_id + cp_rank * cur_seqlens / 2;
+      } else {
+        s_id_for_freqs =
+            cur_seqlens * cp_size - (cp_rank + 1) * cur_seqlens / 2 + s_id - cur_seqlens / 2;
+      }
+    } else {
+      s_id_for_freqs = s_id;
+    }
     //if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
     //  printf("fused_qkv_rope_backward_kernel SIZE [%d,%d] Tid [%d,%d] q_limit: %d, k_limit: %d, h: %d, d: %d, d2: %d, q_split_arg: %d, k_split_arg: %d, v_split_arg: %d total_d: %d\n", blockDim.x, blockDim.y, threadIdx.x, threadIdx.y, q_limit, k_limit, h, d, d2, q_split_arg, k_split_arg, v_split_arg, total_d);
     //}
     fused_qkv_rope_block_backward(
-        grad_out_q, q_freqs, qkv_grad,
-        s_id, offset_block, offset_block_dst_q,
+        grad_out_q, q_freqs, qkv_grad, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_q,
         h, d, d2, 0, total_d, q_split_arg);
     fused_qkv_rope_block_backward(
-        grad_out_k, k_freqs, qkv_grad,
-        s_id, offset_block, offset_block_dst_k,
+        grad_out_k, k_freqs, qkv_grad, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_k,
         h, d, d2, q_limit, total_d, k_split_arg);
     fused_qkv_rope_block_backward(
-        grad_out_v, nullptr, qkv_grad,
-        s_id, offset_block, offset_block_dst_v,
+        grad_out_v, nullptr, qkv_grad, interleaved,
+        s_id_for_freqs, offset_block, offset_block_dst_v,
         h, d, d2, k_limit, total_d, v_split_arg);
         
 }
@@ -502,9 +549,9 @@ void fused_rope_backward_launcher(const scalar_t *output_grads, const int *cu_se
 }
 
 template <typename scalar_t>
-void fused_qkv_rope_forward_launcher(const scalar_t *qkv_input, const float *q_freqs, const float *k_freqs,
-                                 scalar_t *q_out, scalar_t *k_out, scalar_t *v_out,
-                                 const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d,
+void fused_qkv_rope_forward_launcher(const scalar_t *qkv_input, const int *cu_seqlens, const float *q_freqs, const float *k_freqs,
+                                 const int *start_positions, scalar_t *q_out, scalar_t *k_out, scalar_t *v_out,
+                                 const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d,
                                  const int d2, const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
                                  cudaStream_t stream) {
   const int shared_mem_size = 2 * d2 * sizeof(float);  // (cos, sin)
@@ -514,15 +561,15 @@ void fused_qkv_rope_forward_launcher(const scalar_t *qkv_input, const float *q_f
   dim3 threads(THREADS_PER_WARP, warps_per_block);
 
   fused_qkv_rope_forward_kernel<<<blocks, threads, shared_mem_size, stream>>>(
-      qkv_input, q_freqs, k_freqs, q_out, k_out, v_out, qkv_format, s, b, h, d, d2,
+      qkv_input, cu_seqlens, q_freqs, k_freqs, start_positions, q_out, k_out, v_out, qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2,
       qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
 template <typename scalar_t>
 void fused_qkv_rope_backward_launcher(const scalar_t *q_grad_out, const scalar_t *k_grad_out, const scalar_t *v_grad_out,
-    const float *q_freqs, const float *k_freqs, scalar_t *qkv_grad_input,
-    const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d, const int d2,
+    const int *cu_seqlens, const float *q_freqs, const float *k_freqs, scalar_t *qkv_grad_input,
+    const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d, const int d2,
     const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
     cudaStream_t stream) {
 
@@ -533,7 +580,7 @@ void fused_qkv_rope_backward_launcher(const scalar_t *q_grad_out, const scalar_t
   dim3 threads(THREADS_PER_WARP, warps_per_block);
 
   fused_qkv_rope_backward_kernel<<<blocks, threads, shared_mem_size, stream>>>(
-      q_grad_out, k_grad_out, v_grad_out, q_freqs, k_freqs, qkv_grad_input, qkv_format, s, b, h, d, d2,
+      q_grad_out, k_grad_out, v_grad_out, cu_seqlens, q_freqs, k_freqs, qkv_grad_input, qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2,
       qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
@@ -571,26 +618,28 @@ void fused_rope_backward(const Tensor &output_grads, const Tensor &cu_seqlens, c
                                    stride_b, stride_h, stride_d, stream););
 }
 
-void fused_qkv_rope_forward(const Tensor &qkv_input, const Tensor &q_freqs, const Tensor &k_freqs,
-  Tensor *q_out, Tensor *k_out, Tensor *v_out,
-  const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d,
+void fused_qkv_rope_forward(const Tensor &qkv_input, const Tensor &cu_seqlens, const Tensor &q_freqs, const Tensor &k_freqs,
+  const Tensor &start_positions, Tensor *q_out, Tensor *k_out, Tensor *v_out,
+  const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d,
   const int d2, const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
   cudaStream_t stream) {
 TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
 qkv_input.data.dtype, scalar_t,
 fused_qkv_rope_forward_launcher(reinterpret_cast<const scalar_t *>(qkv_input.data.dptr),
+            reinterpret_cast<const int *>(cu_seqlens.data.dptr),
             reinterpret_cast<const float *>(q_freqs.data.dptr),
             reinterpret_cast<const float *>(k_freqs.data.dptr),
+            reinterpret_cast<const int *>(start_positions.data.dptr),
             reinterpret_cast<scalar_t *>(q_out->data.dptr),
             reinterpret_cast<scalar_t *>(k_out->data.dptr),
             reinterpret_cast<scalar_t *>(v_out->data.dptr), qkv_format,
-            s, b, h, d, d2, qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2,
+            interleaved, cp_size, cp_rank, s, b, h, d, d2, qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2,
             stream););
 }
 
 void fused_qkv_rope_backward(const Tensor &q_grad_out, const Tensor &k_grad_out, const Tensor &v_grad_out,
-                             const Tensor &q_freqs, const Tensor &k_freqs, Tensor *qkv_grad_input,
-                             const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d, const int d2,
+                             const Tensor &cu_seqlens, const Tensor &q_freqs, const Tensor &k_freqs, Tensor *qkv_grad_input,
+                             const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d, const int d2,
                              const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
                              cudaStream_t stream) {
   TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
@@ -598,9 +647,11 @@ void fused_qkv_rope_backward(const Tensor &q_grad_out, const Tensor &k_grad_out,
       fused_qkv_rope_backward_launcher(reinterpret_cast<const scalar_t *>(q_grad_out.data.dptr),
                                        reinterpret_cast<const scalar_t *>(k_grad_out.data.dptr),
                                        reinterpret_cast<const scalar_t *>(v_grad_out.data.dptr),
+                                       reinterpret_cast<const int *>(cu_seqlens.data.dptr),
                                        reinterpret_cast<const float *>(q_freqs.data.dptr),
                                        reinterpret_cast<const float *>(k_freqs.data.dptr),
-                                       reinterpret_cast<scalar_t *>(qkv_grad_input->data.dptr), qkv_format, s, b, h, d, d2,
+                                       reinterpret_cast<scalar_t *>(qkv_grad_input->data.dptr), qkv_format, interleaved, cp_size, cp_rank,
+                                       s, b, h, d, d2,
                                        qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2, stream););
 }
 }  // end namespace transformer_engine
@@ -635,27 +686,27 @@ void nvte_fused_rope_backward(const NVTETensor output_grads, const NVTETensor cu
                       stride_b, stride_h, stride_d, stream);
 }
 
-void nvte_fused_qkv_rope_forward(const NVTETensor qkv_input, const NVTETensor q_freqs,
-                                 const NVTETensor k_freqs, NVTETensor q_out, NVTETensor k_out, NVTETensor v_out, 
-                                 const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d, const int d2,
+void nvte_fused_qkv_rope_forward(const NVTETensor qkv_input, const NVTETensor cu_seqlens, const NVTETensor q_freqs, const NVTETensor k_freqs,
+                                 const NVTETensor start_positions, NVTETensor q_out, NVTETensor k_out, NVTETensor v_out,
+                                 const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d, const int d2,
                                  const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
                                  cudaStream_t stream) {
   NVTE_API_CALL(nvte_fused_qkv_rope_forward);
   using namespace transformer_engine;
-  fused_qkv_rope_forward(*convertNVTETensorCheck(qkv_input), *convertNVTETensorCheck(q_freqs),
-                         *convertNVTETensorCheck(k_freqs), convertNVTETensorCheck(q_out),
-                         convertNVTETensorCheck(k_out), convertNVTETensorCheck(v_out), qkv_format, s, b, h, d, d2,
+  fused_qkv_rope_forward(*convertNVTETensorCheck(qkv_input), *convertNVTETensorCheck(cu_seqlens), *convertNVTETensorCheck(q_freqs),
+                         *convertNVTETensorCheck(k_freqs),  *convertNVTETensorCheck(start_positions), convertNVTETensorCheck(q_out),
+                         convertNVTETensorCheck(k_out), convertNVTETensorCheck(v_out), qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2,
                          qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2, stream);
 }
 
 void nvte_fused_qkv_rope_backward(const NVTETensor q_grad_out, const NVTETensor k_grad_out, const NVTETensor v_grad_out,
-                                 const NVTETensor q_freqs, const NVTETensor k_freqs, NVTETensor qkv_grad_input,
-                                 const NVTE_QKV_Format qkv_format, const int s, const int b, const int h, const int d, const int d2,
+                                 const NVTETensor cu_seqlens, const NVTETensor q_freqs, const NVTETensor k_freqs, NVTETensor qkv_grad_input,
+                                 const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank, const int s, const int b, const int h, const int d, const int d2,
                                  const int qkv_split_arg_list_0, const int qkv_split_arg_list_1, const int qkv_split_arg_list_2,
                                  cudaStream_t stream) {
   NVTE_API_CALL(nvte_fused_qkv_rope_backward);
   using namespace transformer_engine;
   fused_qkv_rope_backward(*convertNVTETensorCheck(q_grad_out), *convertNVTETensorCheck(k_grad_out), *convertNVTETensorCheck(v_grad_out),
-                         *convertNVTETensorCheck(q_freqs), *convertNVTETensorCheck(k_freqs), convertNVTETensorCheck(qkv_grad_input), qkv_format, s, b, h, d, d2,
+                         *convertNVTETensorCheck(cu_seqlens), *convertNVTETensorCheck(q_freqs), *convertNVTETensorCheck(k_freqs), convertNVTETensorCheck(qkv_grad_input), qkv_format, interleaved, cp_size, cp_rank, s, b, h, d, d2,
                          qkv_split_arg_list_0, qkv_split_arg_list_1, qkv_split_arg_list_2, stream);
 }
