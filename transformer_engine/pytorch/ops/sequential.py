@@ -36,6 +36,7 @@ class Sequential(torch.nn.Module):
         # List of modules, with fusible operations grouped together
         self._module_groups: Optional[list[OperationFuser | torch.nn.Module]]
         self._module_groups = None
+        self._replaced_modules = None
 
         # Global state of last iteration
         self._last_global_state = None
@@ -149,8 +150,12 @@ class Sequential(torch.nn.Module):
     ) -> list[OperationFuser | torch.nn.Module]:
         """Make list of modules, with fusible operations grouped together"""
 
+        def dummy_forward(self, inp):
+            # Do nothing or return dummy output
+            return inp
         # Group fusible operations together
         groups = []
+        replaced_modules = []
         for module in modules:
             if isinstance(module, FusibleOperation):
                 if not groups or not isinstance(groups[-1], list):
@@ -160,9 +165,12 @@ class Sequential(torch.nn.Module):
                 groups.append(module)
         for idx, group in enumerate(groups):
             if isinstance(group, list):
+                for m in group:
+                    m.forward = dummy_forward.__get__(m, m.__class__)
+                    replaced_modules.append(m)
                 groups[idx] = OperationFuser(group)
 
-        return groups
+        return groups, replaced_modules
 
     def forward(
         self,
@@ -173,10 +181,12 @@ class Sequential(torch.nn.Module):
 
         # Create module groups if needed
         if self._module_groups is None:
-            self._module_groups = self._make_module_groups(self._modules.values())
+            self._module_groups, self._replaced_modules = self._make_module_groups(self._modules.values())
 
         # Forward pass for each module group
         x = input
+        for m in self._replaced_modules:
+            x = m(x)
         extra_outputs: list[torch.Tensor] = []
         for module_group in self._module_groups:
             if isinstance(module_group, OperationFuser):
