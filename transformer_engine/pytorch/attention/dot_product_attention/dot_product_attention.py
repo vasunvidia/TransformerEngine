@@ -1470,7 +1470,44 @@ class DotProductAttention(TransformerEngineBaseModule):
                         softmax_offset=softmax_offset,
                         fp8_output=fp8_output,
                     )
-                return self.fused_attention(
+                if os.getenv("SKIP_CORRECTION_STATS", "0") == "1" and not self.training:
+                    print (f'TE fused attention query_layer.shape: {query_layer.shape} key_layer.shape: {key_layer.shape} value_layer.shape: {value_layer.shape}')
+                    k_repeat = query_layer.size(2) // key_layer.size(2)
+                    # repeat head dimension of key_layer
+                    key_layer2 = key_layer.repeat_interleave(k_repeat, dim=2)
+                    # Q [s, b, h, d] -> [s, b*h, d] -> [b*h, s, d]
+                    query_layer_t = query_layer.view(query_layer.size(0), query_layer.size(1)*query_layer.size(2), query_layer.size(3)).transpose(0,1)
+                    # K [s, b, h, d] -> [s, b*h, d] -> [b*h, s, d] -> [b*h, d, s]
+                    key_layer_t = key_layer2.view(key_layer2.size(0), key_layer2.size(1)*key_layer2.size(2), key_layer2.size(3)).transpose(0,1).transpose(1,2)
+                    # bmm1 [b*h, s, s]
+                    bmm1 = query_layer_t.bmm(key_layer_t)
+                    q_len = query_layer.size(0)
+                    k_len = key_layer.size(0)
+                    # causal mask [s, s]
+                    causal_mask=torch.triu(torch.ones(q_len, k_len, device=bmm1.device), diagonal=1).bool()
+                    assert attn_mask_type == 'causal'
+                    masked_bmm1 = bmm1.masked_fill(causal_mask[None, :, :], float('-inf'))
+                    br, bc = 128, 128
+                    assert masked_bmm1.size(1) % br == 0
+                    assert masked_bmm1.size(2) % bc == 0
+                    num_block_rows = (q_len + br - 1) // br # 8192/128 = 64
+                    num_block_cols = (k_len + bc - 1) // bc # 8192/128 = 64
+                    # blocked_attn [b*h, 64, 128, 64, 128]
+                    blocked_attn = masked_bmm1.view(masked_bmm1.size(0),num_block_rows,br,num_block_cols,bc)
+                    # block_max [b*h, 64, 128, 64]
+                    block_max = blocked_attn.max(dim=-1)[0]
+                    block_max_cummax = block_max.cummax(dim=-1)[0]
+                    block_max_larger = torch.ones_like(block_max)
+                    # True indicates block max is larger than the previous blocks' max
+                    # block_max_larger [b*h, 64, 128, 64]
+                    block_max_larger[..., 1:] = (block_max[..., 1:] - block_max_cummax[..., :-1]) > 0
+                    # block_max_any_larger [b*h, 64, 64]
+                    block_max_any_larger = block_max_larger.any(dim=-2).float()
+                    cf_change_ratio = float(torch.sum(block_max_larger.float()) / torch.numel(block_max_larger)) * 2 * num_block_rows / (num_block_rows + 1)
+                    cf_block_change_ratio = float(torch.sum(block_max_any_larger) / torch.numel(block_max_any_larger)) * 2 * num_block_rows / (num_block_rows + 1)
+                    print (f'query_layer {query_layer_t.shape}-{query_layer_t.dtype} key_layer {key_layer_t.shape}-{key_layer_t.dtype} cf_change_ratio {cf_change_ratio} cf_block_change_ratio {cf_block_change_ratio}')
+
+                attn_out = self.fused_attention(
                     query_layer,
                     key_layer,
                     value_layer,
@@ -1500,6 +1537,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     softmax_offset=softmax_offset,
                     fp8_output=fp8_output,
                 )
+                return attn_out
 
             if use_unfused_attention:
                 allow_emulation = os.getenv("NVTE_UnfusedDPA_Emulate_FP8", "0") == "1"
