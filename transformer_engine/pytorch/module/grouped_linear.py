@@ -148,11 +148,12 @@ class _GroupedLinear(torch.autograd.Function):
             # Disable bulk allocation when CPU offloading is active: offloading skips small
             # tensors (like scales), but bulk allocation shares storage across all tensors,
             # so if scales can't be offloaded, nothing in the group can be offloaded.
+            use_unfused_split_quantize = os.getenv('USE_UNFUSED_SPLIT_QUANTIZE', '0')=='1'
             inputmats = tex.split_quantize(
                 inp_view,
                 m_splits,
                 input_quantizers,
-                disable_bulk_allocation=cpu_offloading,
+                disable_bulk_allocation=cpu_offloading or use_unfused_split_quantize,
             )
         elif debug:
             inputmats = DebugQuantizer.multi_tensor_quantize(
@@ -360,10 +361,12 @@ class _GroupedLinear(torch.autograd.Function):
                         )
                 else:
                     # Multi-tensor quantize
+                    use_unfused_split_quantize = os.getenv('USE_UNFUSED_SPLIT_QUANTIZE', '0')=='1'
                     grad_output = tex.split_quantize(
                         grad_output_view,
                         ctx.m_splits,
                         ctx.grad_output_quantizers,
+                        disable_bulk_allocation=use_unfused_split_quantize,
                     )
             elif ctx.debug:
                 grad_output_mats = torch.split(grad_output_view, ctx.m_splits)
