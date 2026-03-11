@@ -9,6 +9,7 @@ import warnings
 
 import functools
 import torch
+import os
 
 import transformer_engine_torch as tex
 
