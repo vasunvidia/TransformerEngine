@@ -22,6 +22,82 @@ def _permutation_autotune_configs():
     return [triton.Config({"BLOCK_SIZE": bs}) for bs in _PERMUTATION_AUTOTUNE_BLOCK_SIZES]
 
 
+def permutation_autotune_config(block_size: int):
+    """The autotune config of the permutation kernels whose ``BLOCK_SIZE`` is ``block_size``.
+
+    Launching a kernel with this config compiles and runs exactly the variant that autotuning
+    runs when it selects this tile.
+    """
+    for config in _permutation_autotune_configs():
+        if config.kwargs["BLOCK_SIZE"] == block_size:
+            return config
+    raise ValueError(
+        f"BLOCK_SIZE {block_size} is not one of the permutation tiles"
+        f" {_PERMUTATION_AUTOTUNE_BLOCK_SIZES}"
+    )
+
+
+def permutation_block_size(
+    kernel: str,
+    hidden_size: int,
+    *,
+    permute_probs: bool = False,
+    merging_probs: bool = False,
+) -> int:
+    """Deterministic ``BLOCK_SIZE`` of a permutation kernel, chosen from the shape alone.
+
+    Used instead of autotuning on request (PyTorch: ``NVTE_PERMUTATION_BLOCK_SIZE=heuristic``).
+    Autotuning measures the tiles at the first call of every process, so concurrent processes
+    (for example the ranks of a data-parallel job, whose first calls overlap communication) can
+    select different tiles and run at different speeds. This rule returns the same tile for the
+    same arguments in every process. The tile only splits the hidden dimension of a row, so it
+    does not change any output bit, except the merging-probability gradient of
+    ``_unpermute_bwd_with_merging_probs_kernel`` (a reduction over the hidden dimension).
+
+    Rule, with ``P = next_power_of_2(hidden_size)`` (at least 64):
+
+    * ``unpermute`` without probabilities (a plain sum of the routed rows): ``min(P, 1024)``.
+      Tiles above 1024 elements were slower at every measured hidden size.
+    * ``unpermute_bwd_with_merging_probs`` (one program per token, looping over the hidden
+      dimension): ``max(P, 2048)`` up to a hidden size of 4096, else 2048.
+    * Every other kernel (row copies, and sums that also move per-token probabilities): one tile
+      per row, ``P``, up to a hidden size of 4096. Above that, 4096 if it masks no more lanes
+      than 2048 (``ceil(H / 4096) * 4096 == ceil(H / 2048) * 2048``), else 2048.
+
+    Basis: the BF16 kernels timed with every tile on GB300 (32 experts, top-4, 24576 and 4096
+    tokens, hidden sizes 1024 to 7168, CUDA-graph replay; 8 kernel variants x 8 shapes). The
+    rule's tile was the fastest tile or within 1.8% of it in 62 of 64 cases; the other two were
+    5.8% and 5.9% slower (``unpermute`` with merging probabilities, 4096 tokens).
+
+    Parameters
+    ----------
+    kernel : str
+        ``"permute"``, ``"unpermute"``, ``"unpermute_bwd_with_merging_probs"`` or
+        ``"sort_chunks"``.
+    hidden_size : int
+        Hidden size of the permuted rows (the autotune key).
+    permute_probs : bool
+        Whether the kernel also permutes or unpermutes per-token probabilities
+        (``PERMUTE_PROBS``).
+    merging_probs : bool
+        Whether ``_unpermute_kernel`` weights the rows with merging probabilities
+        (``WITH_MERGING_PROBS``).
+    """
+    if kernel not in ("permute", "unpermute", "unpermute_bwd_with_merging_probs", "sort_chunks"):
+        raise ValueError(f"unknown permutation kernel {kernel!r}")
+    min_tile, max_tile = _PERMUTATION_AUTOTUNE_BLOCK_SIZES[0], _PERMUTATION_AUTOTUNE_BLOCK_SIZES[-1]
+    row_tile = max(min_tile, triton.next_power_of_2(max(hidden_size, 1)))
+    if kernel == "unpermute" and not (permute_probs or merging_probs):
+        return min(row_tile, 1024)
+    if kernel == "unpermute_bwd_with_merging_probs":
+        return max(row_tile, 2048) if hidden_size <= max_tile else 2048
+    if hidden_size <= max_tile:
+        return row_tile
+    if triton.cdiv(hidden_size, max_tile) * max_tile == triton.cdiv(hidden_size, 2048) * 2048:
+        return max_tile
+    return 2048
+
+
 # The following three argsort related kernels are adapted from
 # the issue https://github.com/triton-lang/triton/issues/3698
 

@@ -393,6 +393,12 @@ Kernel Configuration
    :Default: ``0``
    :Description: Use the faster NVFP4 4over6 candidate error path that compares candidates in the E4M3-scaled domain after the E2M1 x E4M3 product is rounded to FP16. Error differences and accumulation remain FP32. By default, 4over6 error comparison uses the original input-domain path; ``NVTE_USE_FAST_MATH`` does not control this error-comparison path.
 
+.. envvar:: NVTE_PERMUTATION_BLOCK_SIZE
+
+   :Type: ``str`` (``autotune``, ``heuristic``, or one of ``64``, ``128``, ``256``, ``512``, ``1024``, ``2048``, ``4096``)
+   :Default: ``autotune``
+   :Description: Tile (``BLOCK_SIZE``, elements of the hidden dimension per program) of the MoE permutation Triton kernels of the PyTorch mask-map ``moe_permute`` / ``moe_unpermute`` / ``moe_sort_chunks_by_index`` paths. ``autotune`` (default, also when unset) lets Triton benchmark every tile at the first call of each process, so concurrent processes, such as the ranks of a data-parallel job, may select different tiles and run at different speeds. ``heuristic`` selects the tile from the kernel and the hidden size with a fixed rule (``permutation_block_size`` in ``transformer_engine/common/triton/permutation.py``), the same in every process and run; a number selects that tile for every permutation kernel. A fixed tile skips autotuning entirely. Outputs are bitwise identical for every tile, except the merging-probability gradient of ``moe_unpermute`` (its reduction over the hidden dimension follows the tile).
+
 Torch Compilation and Fusion
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

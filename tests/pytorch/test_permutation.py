@@ -2268,6 +2268,411 @@ def test_chunk_permutation_empty_input(te_dtype, use_torch_compile):
     )
 
 
+# ---------------------------------------------------------------------------------------------
+# Deterministic tile selection of the permutation Triton kernels (NVTE_PERMUTATION_BLOCK_SIZE)
+# ---------------------------------------------------------------------------------------------
+
+from transformer_engine.common.triton import permutation as _te_triton_perm_common
+from transformer_engine.pytorch.triton import permutation as _te_triton_perm
+
+_TILE_ENV = "NVTE_PERMUTATION_BLOCK_SIZE"
+_TILES = _te_triton_perm_common._PERMUTATION_AUTOTUNE_BLOCK_SIZES
+# Every fixed tile, the shape rule, and Triton's autotuning (the default).
+_TILE_MODES = [str(t) for t in _TILES] + ["heuristic", "autotune"]
+# (kernel, hidden_size, flags, tile) of the shape rule (see permutation_block_size).
+_PP = {"permute_probs": True}
+_MP = {"merging_probs": True}
+_HEURISTIC_EXPECTED = [
+    ("unpermute", 2880, {}, 1024),
+    ("unpermute", 7168, {}, 1024),
+    ("unpermute", 512, {}, 512),
+    ("unpermute", 100, {}, 128),
+    ("unpermute", 1, {}, 64),
+    ("unpermute", 2880, _PP, 4096),
+    ("unpermute", 2880, _MP, 4096),
+    ("unpermute", 1000, _PP, 1024),
+    ("unpermute", 5120, _PP, 2048),
+    ("unpermute", 7168, _MP, 4096),
+    ("permute", 2880, {}, 4096),
+    ("permute", 2880, _PP, 4096),
+    ("permute", 2048, {}, 2048),
+    ("permute", 6144, _PP, 2048),
+    ("permute", 16384, {}, 4096),
+    ("sort_chunks", 2880, {}, 4096),
+    ("sort_chunks", 5120, _PP, 2048),
+    ("unpermute_bwd_with_merging_probs", 1024, {}, 2048),
+    ("unpermute_bwd_with_merging_probs", 2880, {}, 4096),
+    ("unpermute_bwd_with_merging_probs", 7168, {}, 2048),
+]
+_tile_dtypes = [torch.float32, torch.float16]
+if te.is_bf16_available():
+    _tile_dtypes.append(torch.bfloat16)
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """Integer view of a tensor, so that comparisons are bitwise (-0 != +0, NaN payloads)."""
+    int_dtype = {4: torch.int32, 2: torch.int16, 1: torch.int8}[t.element_size()]
+    return t.contiguous().view(int_dtype)
+
+
+def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str):
+    assert actual.shape == expected.shape, f"{what}: shape {actual.shape} != {expected.shape}"
+    diff = int((_bits(actual) != _bits(expected)).sum())
+    assert diff == 0, f"{what}: {diff} of {actual.numel()} elements differ bitwise"
+
+
+def _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype, seed=1234):
+    """A mask-map ``row_id_map`` plus inputs that stress the per-element summation.
+
+    Tokens with 0 routes, 1 route and up to ``top_k`` routes; experts in ascending order and
+    distinct random source rows. Inputs span a wide exponent range and contain -0 rows, subnormals
+    of ``dtype`` and, for 64 tokens, the rows (1, 2^-24, 2^-24, -1), whose fp32 sum is 0 in map
+    order and 2^-23 in the reverse order (so a different summation order would be detected).
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    n = torch.randint(1, top_k + 1, (num_tokens,), device="cuda", generator=g, dtype=torch.int32)
+    n[: num_tokens // 16] = 0
+    n[num_tokens // 16 : num_tokens // 16 + 64] = top_k
+    experts = (
+        torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+        .argsort(dim=-1)[:, :top_k]
+        .sort(dim=-1)
+        .values
+    )
+    num_rows = num_tokens * top_k
+    rows = torch.randperm(num_rows, device="cuda", generator=g).view(num_tokens, top_k)
+    row_id_map = torch.full((num_tokens, 2 * num_experts + 1), -1, dtype=torch.int32, device="cuda")
+    row_id_map[:, :top_k] = rows.int()
+    row_id_map[:, num_experts : num_experts + top_k] = experts.int()
+    row_id_map[:, 2 * num_experts] = n
+
+    max_exp = 8 if dtype == torch.float16 else 24
+    x = torch.randn(num_rows, hidden_size, device="cuda", generator=g)
+    x = x * torch.exp2(
+        torch.randint(-max_exp, max_exp + 1, x.shape, device="cuda", generator=g).float()
+    )
+    x = x.to(dtype)
+    x[::7] = -0.0
+    x[1::11, ::3] = torch.finfo(dtype).tiny / 4  # subnormal in dtype
+    x[2::13, 1::5] = -torch.finfo(dtype).tiny / 8
+    special = rows[num_tokens // 16 : num_tokens // 16 + 64]
+    for k, value in enumerate((1.0, 2.0**-24, 2.0**-24, -1.0)[:top_k]):
+        x[special[:, k]] = value
+    return n, experts, rows, row_id_map, x
+
+
+def _ref_unpermute_rows(x, rows, n, num_tokens, hidden_size):
+    """fp32 sum of the routed rows from +0, in map order, rounded once (the kernel's contract)."""
+    acc = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
+    for k in range(rows.size(1)):
+        routed = (n > k).unsqueeze(-1)
+        acc = acc + torch.where(routed, x[rows[:, k]].float(), 0.0)
+    return acc.to(x.dtype)
+
+
+def _assert_close_to_scale(actual, expected, scale, rel, dtype):
+    """|actual - expected| <= rel * scale + the smallest normal of dtype (scale: sum of |terms|)."""
+    err = (actual.float() - expected.float()).abs()
+    bound = rel * scale.float() + torch.finfo(dtype).tiny
+    bad = int((err > bound).sum())
+    assert bad == 0, f"{bad} elements exceed rel {rel} of the term magnitude"
+
+
+def _run_tile_modes(monkeypatch, fn):
+    """Run ``fn`` under every NVTE_PERMUTATION_BLOCK_SIZE mode; returns {mode: outputs}."""
+    outs = {}
+    for mode in _TILE_MODES:
+        monkeypatch.setenv(_TILE_ENV, mode)
+        outs[mode] = fn()
+    monkeypatch.delenv(_TILE_ENV, raising=False)
+    outs["unset"] = fn()
+    return outs
+
+
+def test_permutation_block_size_env(monkeypatch):
+    """Parsing of NVTE_PERMUTATION_BLOCK_SIZE."""
+    fixed = _te_triton_perm._fixed_block_size
+    monkeypatch.delenv(_TILE_ENV, raising=False)
+    assert fixed("unpermute", 2880) is None
+    for unset in ("", "autotune", " AutoTune "):
+        monkeypatch.setenv(_TILE_ENV, unset)
+        assert fixed("unpermute", 2880) is None
+    for tile in _TILES:
+        monkeypatch.setenv(_TILE_ENV, str(tile))
+        assert fixed("unpermute", 2880, permute_probs=True) == tile
+        assert fixed("unpermute_bwd_with_merging_probs", 7168) == tile
+    monkeypatch.setenv(_TILE_ENV, "heuristic")
+    for kernel in ("permute", "unpermute", "unpermute_bwd_with_merging_probs", "sort_chunks"):
+        for hidden_size in (1, 63, 1000, 2880, 4096, 7168, 16384):
+            for permute_probs in (False, True):
+                tile = fixed(kernel, hidden_size, permute_probs=permute_probs)
+                assert tile in _TILES
+                assert tile == _te_triton_perm_common.permutation_block_size(
+                    kernel, hidden_size, permute_probs=permute_probs
+                )
+    for bad in ("1", "32", "100", "8192", "-1024", "fixed", "1024.0"):
+        monkeypatch.setenv(_TILE_ENV, bad)
+        with pytest.raises(ValueError, match=_TILE_ENV):
+            fixed("unpermute", 2880)
+    with pytest.raises(ValueError):
+        _te_triton_perm_common.permutation_block_size("unknown_kernel", 2880)
+    with pytest.raises(ValueError):
+        _te_triton_perm_common.permutation_autotune_config(96)
+
+
+def test_permutation_block_size_heuristic_rule():
+    """The documented tiles of the shape rule (common/triton/permutation.py)."""
+    rule = _te_triton_perm_common.permutation_block_size
+    for kernel, hidden_size, flags, expected in _HEURISTIC_EXPECTED:
+        assert rule(kernel, hidden_size, **flags) == expected, (kernel, hidden_size, flags)
+
+
+@pytest.mark.parametrize("dtype", _tile_dtypes)
+@pytest.mark.parametrize("hidden_size", [2880, 1000])
+@pytest.mark.parametrize("variant", ["rows", "permute_probs", "merging_probs"])
+def test_unpermute_bitwise_across_block_sizes(monkeypatch, dtype, hidden_size, variant):
+    """_unpermute_kernel: the tile only splits the hidden dimension, so every tile (fixed, the
+    shape rule, or autotuned) gives the same bits; rows-only sums equal an fp32 map-order
+    reference bit for bit."""
+    num_tokens, num_experts, top_k = 1024, 32, 4
+    n, experts, rows, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype)
+    g = torch.Generator(device="cuda").manual_seed(99)
+    permuted_probs = merging_probs = None
+    if variant == "permute_probs":
+        permuted_probs = torch.rand(x.size(0), device="cuda", generator=g)
+        permuted_probs[::5] = -0.0
+        permuted_probs[1::9] = 2.0**-140  # fp32 subnormal
+    if variant == "merging_probs":
+        merging_probs = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+
+    def run():
+        out, out_probs = _te_triton_perm.unpermute_with_mask_map(
+            x, row_id_map, merging_probs, permuted_probs, None, num_tokens, num_experts, hidden_size
+        )
+        return out, out_probs
+
+    outs = _run_tile_modes(monkeypatch, run)
+    ref_out, ref_probs = outs["64"]
+    for mode, (out, out_probs) in outs.items():
+        _assert_bitwise(out, ref_out, f"{variant} output, mode {mode} vs 64")
+        if permuted_probs is not None:
+            _assert_bitwise(out_probs, ref_probs, f"unpermuted probs, mode {mode} vs 64")
+        else:
+            assert out_probs is None
+
+    if variant != "merging_probs":
+        expected = _ref_unpermute_rows(x, rows, n, num_tokens, hidden_size)
+        _assert_bitwise(ref_out, expected, "output vs fp32 map-order reference")
+    else:
+        acc = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
+        abs_acc = torch.zeros_like(acc)
+        for k in range(top_k):
+            p = merging_probs.gather(1, experts[:, k : k + 1])
+            term = torch.where((n > k).unsqueeze(-1), x[rows[:, k]].float() * p, 0.0)
+            acc += term
+            abs_acc += term.abs()
+        # The kernel may contract the multiply-add (FMA): compare against the magnitude of the
+        # terms rather than bitwise.
+        _assert_close_to_scale(ref_out.float(), acc, abs_acc, 2.0**-6, dtype)
+    if permuted_probs is not None:
+        expected_probs = torch.zeros(num_tokens, num_experts, device="cuda")
+        for k in range(top_k):
+            tok = torch.nonzero(n > k).squeeze(-1)
+            expected_probs[tok, experts[tok, k]] = permuted_probs[rows[tok, k]]
+        _assert_bitwise(ref_probs, expected_probs, "unpermuted probs vs reference")
+
+
+@pytest.mark.parametrize("dtype", _tile_dtypes)
+@pytest.mark.parametrize("hidden_size", [2880, 1000])
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_permute_bitwise_across_block_sizes(monkeypatch, dtype, hidden_size, with_probs):
+    """_permute_kernel copies rows: identical bits for every tile, equal to the source rows."""
+    num_tokens, num_experts, top_k = 1024, 32, 4
+    n, experts, rows, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype)
+    inp = x[:num_tokens].contiguous()
+    probs = None
+    if with_probs:
+        probs = torch.rand(num_tokens, num_experts, device="cuda") + 0.5  # no zero probs
+    num_out_tokens = num_tokens * top_k
+    routed = torch.cat([rows[n > k, k] for k in range(top_k)])
+
+    def run():
+        out, _, out_probs = _te_triton_perm.permute_with_mask_map(
+            inp,
+            row_id_map,
+            probs,
+            None,
+            None,
+            num_tokens,
+            num_experts,
+            num_out_tokens,
+            hidden_size,
+            0,
+        )
+        # Rows that no token routes to stay uninitialised: compare the routed rows only.
+        return out[routed], (out_probs[routed] if out_probs is not None else None)
+
+    outs = _run_tile_modes(monkeypatch, run)
+    expected = torch.cat([inp[n > k] for k in range(top_k)])
+    for mode, (out, out_probs) in outs.items():
+        _assert_bitwise(out, expected, f"permuted rows, mode {mode}")
+        if with_probs:
+            exp_probs = torch.cat(
+                [probs[n > k].gather(1, experts[n > k, k : k + 1]).squeeze(1) for k in range(top_k)]
+            )
+            _assert_bitwise(out_probs, exp_probs, f"permuted probs, mode {mode}")
+
+
+@pytest.mark.parametrize("dtype", _tile_dtypes)
+@pytest.mark.parametrize("hidden_size", [2880, 1000])
+def test_unpermute_bwd_with_merging_probs_block_sizes(monkeypatch, dtype, hidden_size):
+    """_unpermute_bwd_with_merging_probs_kernel: the activation gradient is elementwise (same bits
+    for every tile). The merging-prob gradient is a reduction over the hidden dimension whose order
+    follows the tile, so it may differ in the last bits between tiles; with a fixed tile or the
+    shape rule it is reproducible."""
+    num_tokens, num_experts, top_k = 1024, 32, 4
+    n, experts, rows, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype)
+    g = torch.Generator(device="cuda").manual_seed(7)
+    grad = torch.randn(num_tokens, hidden_size, device="cuda", generator=g).to(dtype)
+    merging_probs = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    routed = torch.cat([rows[n > k, k] for k in range(top_k)])
+
+    def run():
+        act_grad, probs_grad = _te_triton_perm.unpermute_with_mask_map_bwd_with_merging_probs(
+            grad,
+            row_id_map,
+            x,
+            merging_probs,
+            None,
+            num_tokens,
+            num_experts,
+            x.size(0),
+            hidden_size,
+        )
+        return act_grad[routed], probs_grad
+
+    outs = _run_tile_modes(monkeypatch, run)
+    # Magnitude of the dot-product terms of every (token, expert) prob gradient.
+    abs_dot = torch.zeros(num_tokens, num_experts, device="cuda")
+    for k in range(top_k):
+        tok = torch.nonzero(n > k).squeeze(-1)
+        abs_dot[tok, experts[tok, k]] = (x[rows[tok, k]].float() * grad[tok].float()).abs().sum(-1)
+    ref_act, ref_probs_grad = outs["64"]
+    for mode, (act_grad, probs_grad) in outs.items():
+        _assert_bitwise(act_grad, ref_act, f"act grad, mode {mode} vs 64")
+        _assert_close_to_scale(probs_grad, ref_probs_grad, abs_dot, 1e-4, torch.float32)
+    monkeypatch.setenv(_TILE_ENV, "heuristic")
+    again = run()
+    rule_tile = _te_triton_perm_common.permutation_block_size(
+        "unpermute_bwd_with_merging_probs", hidden_size
+    )
+    _assert_bitwise(again[1], outs["heuristic"][1], "probs grad, heuristic run-to-run")
+    _assert_bitwise(again[1], outs[str(rule_tile)][1], "probs grad, heuristic vs its tile")
+
+
+@pytest.mark.parametrize("dtype", _tile_dtypes)
+@pytest.mark.parametrize("with_probs", [False, True])
+@pytest.mark.parametrize("is_forward", [False, True])
+def test_sort_chunks_bitwise_across_block_sizes(monkeypatch, dtype, with_probs, is_forward):
+    """_sort_chunks_by_map_kernel copies rows: identical bits for every tile."""
+    num_rows, hidden_size = 4096, 2880
+    _, _, _, _, x = _tile_case(1024, 32, 4, hidden_size, dtype)
+    perm = torch.randperm(num_rows, device="cuda").int()
+    probs = torch.rand(num_rows, device="cuda") if with_probs else None
+
+    def run():
+        return _te_triton_perm.sort_chunks_by_map(x, perm, probs, num_rows, hidden_size, is_forward)
+
+    outs = _run_tile_modes(monkeypatch, run)
+    if is_forward:
+        expected = torch.empty_like(x)
+        expected[perm.long()] = x
+    else:
+        expected = x[perm.long()]
+    for mode, (out, out_probs) in outs.items():
+        _assert_bitwise(out, expected, f"sorted rows, mode {mode}")
+        if with_probs:
+            exp_probs = torch.empty_like(probs)
+            if is_forward:
+                exp_probs[perm.long()] = probs
+            else:
+                exp_probs = probs[perm.long()]
+            _assert_bitwise(out_probs, exp_probs, f"sorted probs, mode {mode}")
+
+
+@pytest.mark.parametrize("with_merging_probs", [False, True])
+def test_permutation_block_size_public_api(monkeypatch, with_merging_probs):
+    """moe_permute_with_probs + moe_unpermute forward and backward through the public API: the
+    same bits with every tile mode (the merging-prob gradient is compared with a tolerance, see
+    test_unpermute_bwd_with_merging_probs_block_sizes)."""
+    dtype = torch.bfloat16 if te.is_bf16_available() else torch.float16
+    num_tokens, num_experts, top_k, hidden_size = 1024, 32, 4, 2880
+    g = torch.Generator(device="cuda").manual_seed(3)
+    scores = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+    routing_map.scatter_(1, scores.topk(top_k, dim=-1).indices, True)
+    routing_map[: num_tokens // 16] = False  # tokens routed nowhere
+    num_out_tokens = int(routing_map.sum())
+    inp0 = torch.randn(num_tokens, hidden_size, device="cuda", generator=g).to(dtype)
+    probs0 = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    w_out = torch.randn(num_tokens, hidden_size, device="cuda", generator=g).to(dtype)
+    w_probs = torch.randn(num_out_tokens, device="cuda", generator=g)
+    merging0 = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+
+    def run():
+        inp = inp0.clone().requires_grad_(True)
+        probs = probs0.clone().requires_grad_(True)
+        merging = merging0.clone().requires_grad_(True) if with_merging_probs else None
+        permuted, permuted_probs, row_id_map = te_permute_with_probs(
+            inp, probs, routing_map, num_out_tokens=num_out_tokens
+        )
+        out = te_unpermute(permuted, row_id_map, merging_probs=merging, restore_shape=inp.shape)
+        loss = (out.float() * w_out.float()).sum() + (permuted_probs * w_probs).sum()
+        loss.backward()
+        return out, inp.grad, probs.grad, (merging.grad if merging is not None else None)
+
+    outs = _run_tile_modes(monkeypatch, run)
+    ref = outs["64"]
+    for mode, (out, inp_grad, probs_grad, merging_grad) in outs.items():
+        _assert_bitwise(out, ref[0], f"unpermuted output, mode {mode}")
+        _assert_bitwise(inp_grad, ref[1], f"input grad, mode {mode}")
+        _assert_bitwise(probs_grad, ref[2], f"probs grad, mode {mode}")
+        if with_merging_probs:
+            torch.testing.assert_close(merging_grad, ref[3], atol=1e-2, rtol=1e-3)
+
+
+def test_permutation_fixed_block_size_skips_autotuning(monkeypatch):
+    """With a fixed tile the autotuner is not consulted (no benchmarking, no cache entry); unset
+    restores autotuning."""
+    num_tokens, num_experts, top_k = 256, 32, 4
+    hidden_size = 2888  # a hidden size no other test uses: a fresh autotune key
+    _, _, _, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, torch.float32)
+    kernel = _te_triton_perm_common._unpermute_kernel
+    if not hasattr(kernel, "cache"):
+        pytest.skip("_unpermute_kernel is not wrapped by triton.autotune")
+
+    def keys():
+        return {k for k in kernel.cache if hidden_size in tuple(k)}
+
+    def run():
+        return _te_triton_perm.unpermute_with_mask_map(
+            x, row_id_map, None, None, None, num_tokens, num_experts, hidden_size
+        )[0]
+
+    assert not keys()
+    monkeypatch.setenv(_TILE_ENV, "heuristic")
+    fixed = run()
+    monkeypatch.setenv(_TILE_ENV, "128")
+    fixed_128 = run()
+    torch.cuda.synchronize()
+    assert not keys(), "a fixed tile must not run the autotuner"
+    monkeypatch.delenv(_TILE_ENV)
+    tuned = run()
+    assert keys(), "unset must autotune"
+    _assert_bitwise(fixed, tuned, "heuristic vs autotuned")
+    _assert_bitwise(fixed_128, tuned, "128 vs autotuned")
+
+
 @pytest.mark.skipif(
     os.getenv("RUN_BENCHMARK_TESTS", "0") != "1",
     reason="Benchmark test - run with: RUN_BENCHMARK_TESTS=1 pytest -k single_case",

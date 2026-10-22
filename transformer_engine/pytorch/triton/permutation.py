@@ -4,13 +4,18 @@
 
 """PyTorch wrapper functions for Permutation Triton kernels."""
 
-from typing import Union
+import os
+from typing import Optional, Union
 
 import torch
 import triton
+from triton.runtime.autotuner import Autotuner
 
 from transformer_engine.pytorch.device import te_device_type
 from transformer_engine.common.triton.permutation import (
+    _PERMUTATION_AUTOTUNE_BLOCK_SIZES,
+    permutation_autotune_config,
+    permutation_block_size,
     _row_id_map_pass_1_kernel,
     _row_id_map_pass_2_kernel,
     _row_id_map_pass_3_kernel,
@@ -20,6 +25,51 @@ from transformer_engine.common.triton.permutation import (
     _make_chunk_sort_map_kernel,
     _sort_chunks_by_map_kernel,
 )
+
+
+_BLOCK_SIZE_ENV = "NVTE_PERMUTATION_BLOCK_SIZE"
+
+
+def _fixed_block_size(
+    kernel: str,
+    hidden_size: int,
+    permute_probs: bool = False,
+    merging_probs: bool = False,
+) -> Optional[int]:
+    """The ``BLOCK_SIZE`` requested by ``NVTE_PERMUTATION_BLOCK_SIZE``, or None to autotune.
+
+    ``NVTE_PERMUTATION_BLOCK_SIZE``:
+      * unset, empty or ``autotune`` (default): Triton autotunes the tile at the first call of
+        every process (per kernel variant and hidden size).
+      * ``heuristic``: the tile of ``permutation_block_size`` (a rule on the shape), identical in
+        every process and run.
+      * one of the autotune tiles (64 ... 4096): that tile for every permutation kernel.
+    """
+    mode = os.getenv(_BLOCK_SIZE_ENV, "").strip().lower()
+    if mode in ("", "autotune"):
+        return None
+    if mode == "heuristic":
+        return permutation_block_size(
+            kernel, hidden_size, permute_probs=permute_probs, merging_probs=merging_probs
+        )
+    block_size = int(mode) if mode.isdigit() else None
+    if block_size not in _PERMUTATION_AUTOTUNE_BLOCK_SIZES:
+        raise ValueError(
+            f"{_BLOCK_SIZE_ENV}={mode!r}: expected 'autotune' (default), 'heuristic' or one of"
+            f" {_PERMUTATION_AUTOTUNE_BLOCK_SIZES}"
+        )
+    return block_size
+
+
+def _launch(kernel, grid, block_size: Optional[int], *args, **kwargs):
+    """Launch a permutation kernel: autotuned when ``block_size`` is None, else with the
+    autotune config of that tile (no autotuning, no benchmarking)."""
+    if block_size is None:
+        kernel[grid](*args, **kwargs)
+        return
+    config_kwargs = permutation_autotune_config(block_size).all_kwargs()
+    jit_fn = kernel.fn if isinstance(kernel, Autotuner) else kernel
+    jit_fn[grid](*args, **kwargs, **config_kwargs)
 
 
 def make_row_id_map(
@@ -181,7 +231,11 @@ def permute_with_mask_map(
     )
     # pylint: disable=unnecessary-lambda-assignment
     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
-    _permute_kernel[grid](
+    block_size = _fixed_block_size("permute", hidden_size, permute_probs=probs is not None)
+    _launch(
+        _permute_kernel,
+        grid,
+        block_size,
         inp,
         row_id_map,
         probs,
@@ -262,7 +316,16 @@ def unpermute_with_mask_map(
         unpermuted_probs = None
     # pylint: disable=unnecessary-lambda-assignment
     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
-    _unpermute_kernel[grid](
+    block_size = _fixed_block_size(
+        "unpermute",
+        hidden_size,
+        permute_probs=permuted_probs is not None,
+        merging_probs=merging_probs is not None,
+    )
+    _launch(
+        _unpermute_kernel,
+        grid,
+        block_size,
         inp,
         row_id_map,
         merging_probs,
@@ -342,7 +405,11 @@ def unpermute_with_mask_map_bwd_with_merging_probs(
         (num_tokens, num_experts), dtype=merging_probs.dtype, device=te_device_type()
     )
     grid = (num_tokens,)
-    _unpermute_bwd_with_merging_probs_kernel[grid](
+    block_size = _fixed_block_size("unpermute_bwd_with_merging_probs", hidden_size)
+    _launch(
+        _unpermute_bwd_with_merging_probs_kernel,
+        grid,
+        block_size,
         fwd_output_grad,
         fwd_input,
         merging_probs,
@@ -435,7 +502,11 @@ def sort_chunks_by_map(
         permuted_probs = None
     # pylint: disable=unnecessary-lambda-assignment
     grid = lambda META: (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
-    _sort_chunks_by_map_kernel[grid](
+    block_size = _fixed_block_size("sort_chunks", hidden_size, permute_probs=probs is not None)
+    _launch(
+        _sort_chunks_by_map_kernel,
+        grid,
+        block_size,
         inp,
         row_id_map,
         probs,
