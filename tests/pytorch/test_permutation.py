@@ -2673,6 +2673,237 @@ def test_permutation_fixed_block_size_skips_autotuning(monkeypatch):
     _assert_bitwise(fixed_128, tuned, "128 vs autotuned")
 
 
+# ---------------------------------------------------------------------------------------------
+# Residual add fused into the mask-map unpermute (moe_unpermute(..., residual=))
+# ---------------------------------------------------------------------------------------------
+
+
+def _residual_for(num_tokens, hidden_size, dtype, seed=4321):
+    """A residual over the same wide exponent range as the rows of _tile_case, so that rounding
+    the row sum before the add (as a separate add does) changes many results; with -0 rows
+    (also on tokens routed nowhere, where -0 + +0 = +0) and subnormals of ``dtype``."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    max_exp = 8 if dtype == torch.float16 else 24
+    r = torch.randn(num_tokens, hidden_size, device="cuda", generator=g)
+    r = r * torch.exp2(
+        torch.randint(-max_exp, max_exp + 1, r.shape, device="cuda", generator=g).float()
+    )
+    r = r.to(dtype)
+    r[::5] = -0.0
+    r[3::17, ::7] = torch.finfo(dtype).tiny / 2
+    r[4::19, 1::3] = -torch.finfo(dtype).tiny / 4
+    return r
+
+
+@pytest.mark.parametrize("dtype", _tile_dtypes)
+@pytest.mark.parametrize("hidden_size", [2880, 1000])
+@pytest.mark.parametrize("variant", ["rows", "merging_probs", "strided_residual"])
+def test_unpermute_residual_bitwise(monkeypatch, dtype, hidden_size, variant):
+    """unpermute_with_mask_map(..., residual=r) == r + unpermute_with_mask_map(...) bit for bit,
+    for every tile mode (fixed tiles, the shape rule, autotuning). The row sum is rounded to the
+    data type before the add, as in the separate add; the inputs are chosen so that adding the
+    unrounded fp32 sum instead changes the result."""
+    num_tokens, num_experts, top_k = 1024, 32, 4
+    n, experts, rows, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype)
+    residual = _residual_for(num_tokens, hidden_size, dtype)
+    if variant == "strided_residual":
+        # A column slice of a wider buffer: token stride != hidden size.
+        wide = torch.zeros(num_tokens, hidden_size + 64, dtype=dtype, device="cuda")
+        wide[:, 32 : 32 + hidden_size] = residual
+        residual = wide[:, 32 : 32 + hidden_size]
+        assert not residual.is_contiguous()
+    merging_probs = None
+    if variant == "merging_probs":
+        g = torch.Generator(device="cuda").manual_seed(5)
+        merging_probs = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+
+    def run():
+        fused, fused_probs = _te_triton_perm.unpermute_with_mask_map(
+            x,
+            row_id_map,
+            merging_probs,
+            None,
+            None,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            residual=residual,
+        )
+        assert fused_probs is None
+        unfused, _ = _te_triton_perm.unpermute_with_mask_map(
+            x, row_id_map, merging_probs, None, None, num_tokens, num_experts, hidden_size
+        )
+        return fused, residual + unfused
+
+    outs = _run_tile_modes(monkeypatch, run)
+    ref_fused = outs["64"][0]
+    for mode, (fused, unfused_add) in outs.items():
+        _assert_bitwise(fused, unfused_add, f"{variant}: fused vs unpermute + add, mode {mode}")
+        _assert_bitwise(fused, ref_fused, f"{variant}: mode {mode} vs 64")
+
+    if variant != "merging_probs":
+        row_sum = _ref_unpermute_rows(x, rows, n, num_tokens, hidden_size)
+        expected = (row_sum.float() + residual.float()).to(dtype)
+        _assert_bitwise(ref_fused, expected, "fused vs the double-rounded reference")
+        if dtype != torch.float32:
+            # The inputs exercise the first rounding: one rounding of the fp32 sum differs.
+            acc = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
+            for k in range(top_k):
+                acc = acc + torch.where((n > k).unsqueeze(-1), x[rows[:, k]].float(), 0.0)
+            single = (acc + residual.float()).to(dtype)
+            assert int((_bits(single) != _bits(ref_fused)).sum()) > 0
+        # Tokens routed nowhere: residual + (+0), i.e. -0 becomes +0.
+        idle = n == 0
+        _assert_bitwise(
+            ref_fused[idle], residual[idle] + torch.zeros_like(residual[idle]), "unrouted tokens"
+        )
+
+
+@pytest.mark.parametrize("hidden_size", [2880, 1000, 7168])
+def test_unpermute_residual_uses_block_size_rule(monkeypatch, hidden_size):
+    """The residual variant is launched like the plain unpermute: NVTE_PERMUTATION_BLOCK_SIZE
+    applies, and 'heuristic' gives the shape rule's tile of the unpermute without probabilities
+    (no autotuning)."""
+    num_tokens, num_experts, top_k = 256, 32, 4
+    dtype = torch.float32
+    _, _, _, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, dtype)
+    residual = _residual_for(num_tokens, hidden_size, dtype)
+    launched = []
+    real_launch = _te_triton_perm._launch
+
+    def recording_launch(kernel, grid, block_size, *args, **kwargs):
+        launched.append((kernel, block_size, kwargs.get("WITH_RESIDUAL")))
+        return real_launch(kernel, grid, block_size, *args, **kwargs)
+
+    monkeypatch.setattr(_te_triton_perm, "_launch", recording_launch)
+
+    def run():
+        launched.clear()
+        out = _te_triton_perm.unpermute_with_mask_map(
+            x,
+            row_id_map,
+            None,
+            None,
+            None,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            residual=residual,
+        )[0]
+        assert len(launched) == 1 and launched[0][0] is _te_triton_perm._unpermute_kernel
+        assert launched[0][2] is True
+        return out, launched[0][1]
+
+    monkeypatch.setenv(_TILE_ENV, "heuristic")
+    out_rule, tile_rule = run()
+    assert tile_rule == _te_triton_perm_common.permutation_block_size("unpermute", hidden_size)
+    monkeypatch.setenv(_TILE_ENV, "256")
+    out_256, tile_256 = run()
+    assert tile_256 == 256
+    monkeypatch.delenv(_TILE_ENV)
+    out_tuned, tile_tuned = run()
+    assert tile_tuned is None
+    _assert_bitwise(out_rule, out_tuned, "heuristic vs autotuned")
+    _assert_bitwise(out_256, out_tuned, "256 vs autotuned")
+
+
+@pytest.mark.parametrize("with_merging_probs", [False, True])
+def test_moe_unpermute_residual_public_api(monkeypatch, with_merging_probs):
+    """moe_unpermute(..., residual=r) through the public API, forward and backward, against
+    r + moe_unpermute(...): output, input grad, probs grad, residual grad and the merging-prob
+    grad are bitwise equal (the residual's gradient is the incoming gradient, as for an add)."""
+    monkeypatch.setenv(_TILE_ENV, "heuristic")  # one tile for the merging-prob gradient
+    dtype = torch.bfloat16 if te.is_bf16_available() else torch.float16
+    num_tokens, num_experts, top_k, hidden_size = 1024, 32, 4, 2880
+    g = torch.Generator(device="cuda").manual_seed(11)
+    scores = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+    routing_map.scatter_(1, scores.topk(top_k, dim=-1).indices, True)
+    routing_map[: num_tokens // 16] = False  # tokens routed nowhere
+    num_out_tokens = int(routing_map.sum())
+    inp0 = torch.randn(num_tokens, hidden_size, device="cuda", generator=g).to(dtype)
+    probs0 = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    merging0 = torch.rand(num_tokens, num_experts, device="cuda", generator=g)
+    res0 = _residual_for(num_tokens, hidden_size, dtype)
+    w_out = torch.randn(num_tokens, hidden_size, device="cuda", generator=g).to(dtype)
+    w_probs = torch.randn(num_out_tokens, device="cuda", generator=g)
+
+    def run(fused):
+        inp = inp0.clone().requires_grad_(True)
+        probs = probs0.clone().requires_grad_(True)
+        res = res0.clone().requires_grad_(True)
+        merging = merging0.clone().requires_grad_(True) if with_merging_probs else None
+        permuted, permuted_probs, row_id_map = te_permute_with_probs(
+            inp, probs, routing_map, num_out_tokens=num_out_tokens
+        )
+        if fused:
+            out = te_unpermute(
+                permuted, row_id_map, merging_probs=merging, restore_shape=inp.shape, residual=res
+            )
+        else:
+            out = res + te_unpermute(
+                permuted, row_id_map, merging_probs=merging, restore_shape=inp.shape
+            )
+        loss = (out.float() * w_out.float()).sum() + (permuted_probs * w_probs).sum()
+        loss.backward()
+        grads = [inp.grad, probs.grad, res.grad]
+        if with_merging_probs:
+            grads.append(merging.grad)
+        return [out] + grads
+
+    fused, unfused = run(True), run(False)
+    names = ["output", "input grad", "probs grad", "residual grad", "merging-prob grad"]
+    for name, a, b in zip(names, fused, unfused):
+        assert a is not None and b is not None, name
+        _assert_bitwise(a, b, f"{name}: fused vs unfused")
+
+    # restore_shape defaults to the residual's shape.
+    with torch.no_grad():
+        permuted, _, row_id_map = te_permute_with_probs(
+            inp0, probs0, routing_map, num_out_tokens=num_out_tokens
+        )
+        out_default = te_unpermute(
+            permuted,
+            row_id_map,
+            merging_probs=merging0 if with_merging_probs else None,
+            residual=res0,
+        )
+    _assert_bitwise(out_default, fused[0].detach(), "output with the default restore_shape")
+
+
+def test_moe_unpermute_residual_empty_input():
+    """No permuted rows: the result is residual + 0 (-0 becomes +0), the input gradient is empty
+    and the residual gradient is the incoming gradient."""
+    dtype = torch.bfloat16 if te.is_bf16_available() else torch.float16
+    num_tokens, num_experts, hidden_size = 64, 8, 256
+    # A mask map of tokens routed nowhere (n = 0 everywhere) and no permuted rows.
+    row_id_map = torch.full(
+        (num_tokens, 2 * num_experts + 1), -1, dtype=torch.int32, device="cuda"
+    )
+    row_id_map[:, 2 * num_experts] = 0
+    permuted = torch.empty(0, hidden_size, dtype=dtype, device="cuda", requires_grad=True)
+    res = _residual_for(num_tokens, hidden_size, dtype).requires_grad_(True)
+    out = te_unpermute(permuted, row_id_map, restore_shape=res.shape, residual=res)
+    _assert_bitwise(out, res.detach() + torch.zeros_like(res), "empty input: output")
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    assert permuted.grad.shape == permuted.shape
+    _assert_bitwise(res.grad, grad, "empty input: residual grad")
+
+
+def test_moe_unpermute_residual_rejects_bad_inputs():
+    """The residual must have the output's shape and the input's dtype, and needs the mask map."""
+    num_tokens, num_experts, top_k, hidden_size = 64, 8, 2, 256
+    _, _, _, row_id_map, x = _tile_case(num_tokens, num_experts, top_k, hidden_size, torch.float32)
+    good = torch.zeros(num_tokens, hidden_size, device="cuda")
+    with pytest.raises(ValueError, match="shape"):
+        te_unpermute(x, row_id_map, restore_shape=good.shape, residual=good[:, :128])
+    with pytest.raises(ValueError, match="dtype"):
+        te_unpermute(x, row_id_map, restore_shape=good.shape, residual=good.half())
+    with pytest.raises(ValueError, match="mask"):
+        te_unpermute(x, row_id_map, map_type="index", residual=good)
+
+
 @pytest.mark.skipif(
     os.getenv("RUN_BENCHMARK_TESTS", "0") != "1",
     reason="Benchmark test - run with: RUN_BENCHMARK_TESTS=1 pytest -k single_case",

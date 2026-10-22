@@ -1034,12 +1034,17 @@ class UnpermuteWithMaskMapPrimitive(BasePrimitive):
                 "stride_permuted_probs_token": permuted_probs_stride_token,
                 "stride_unpermuted_probs_token": unpermuted_probs_stride_token,
                 "stride_unpermuted_probs_expert": unpermuted_probs_stride_expert,
+                # The fused residual add (PyTorch only) is compiled out.
+                "residual_ptr": None,
+                "stride_residual_token": 0,
+                "stride_residual_hidden": 0,
                 "num_experts": num_experts,
                 "hidden_size": hidden_size,
                 "PROBS_LOAD_WIDTH": triton.next_power_of_2(num_experts),
                 "WITH_MERGING_PROBS": with_merging_probs,
                 "PERMUTE_PROBS": with_probs,
                 "FUSION_UNPAD": with_unpad,
+                "WITH_RESIDUAL": False,
                 "BLOCK_SIZE": block_size,
             },
         )

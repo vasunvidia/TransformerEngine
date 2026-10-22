@@ -876,6 +876,91 @@ moe_unpermute_mask_map_forward.register_autograd(
     setup_context=_moe_unpermute_mask_map_setup_context,
 )
 
+
+# ============ _moe_unpermute_mask_map with a fused residual add, custom op ============
+
+
+@torch.library.custom_op("te_moe::unpermute_mask_map_add_residual_fwd", mutates_args=[])
+def moe_unpermute_mask_map_add_residual_forward(
+    inp: torch.Tensor,
+    row_id_map: torch.Tensor,
+    merging_probs: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    pad_offsets: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Forward pass for MoE unpermute with mask router map plus a residual:
+    ``residual + unpermute(inp)`` in one kernel, bitwise equal to the separate add."""
+    if not inp.numel():
+        # No permuted rows: every unpermuted row is +0.
+        return residual + torch.zeros_like(residual)
+    assert not isinstance(
+        inp, QuantizedTensor
+    ), "The forward of moe_unpermute does not support FP8."
+    output, _ = triton_permutation.unpermute_with_mask_map(
+        inp,
+        row_id_map,
+        merging_probs,
+        None,
+        pad_offsets,
+        num_tokens,
+        num_experts,
+        hidden_size,
+        residual=residual,
+    )
+    return output
+
+
+@moe_unpermute_mask_map_add_residual_forward.register_fake
+def _moe_unpermute_mask_map_add_residual_forward_fake(  # pylint: disable=unused-argument
+    inp: torch.Tensor,
+    row_id_map: torch.Tensor,
+    merging_probs: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    pad_offsets: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fake implementation for shape inference."""
+    return torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device=inp.device)
+
+
+def _moe_unpermute_mask_map_add_residual_setup_context(ctx, inputs, output):
+    """Save context for backward pass."""
+    inp, row_id_map, merging_probs, _, num_tokens, num_experts, hidden_size, pad_offsets = inputs
+    _moe_unpermute_mask_map_setup_context(
+        ctx,
+        (inp, row_id_map, merging_probs, num_tokens, num_experts, hidden_size, pad_offsets),
+        output,
+    )
+    ctx.inp_shape = inp.shape
+
+
+def _moe_unpermute_mask_map_add_residual_backward_wrapper(ctx, unpermuted_act_grad):
+    """Backward of ``residual + unpermute(inp)``: the unpermute backward for ``inp`` (and the
+    merging probabilities), and the incoming gradient itself for the residual, as the backward
+    of a separate add passes it on."""
+    if ctx.empty_input:
+        act_grad = unpermuted_act_grad.new_zeros(ctx.inp_shape)
+        probs_grad = None
+        if ctx.with_probs and ctx.needs_probs_grad:
+            _, _, merging_probs, _ = ctx.saved_tensors
+            probs_grad = torch.zeros_like(merging_probs)
+    else:
+        act_grad, _, probs_grad, *_ = _moe_unpermute_mask_map_backward_wrapper(
+            ctx, unpermuted_act_grad
+        )
+    return act_grad, None, probs_grad, unpermuted_act_grad, None, None, None, None
+
+
+moe_unpermute_mask_map_add_residual_forward.register_autograd(
+    _moe_unpermute_mask_map_add_residual_backward_wrapper,
+    setup_context=_moe_unpermute_mask_map_add_residual_setup_context,
+)
+
 # Register all te_moe custom ops as passthrough in QuantizedTensor.__torch_dispatch__
 # so that FP8 tensors are not unwrapped before entering these ops.
 _quantized_tensor_passthrough_ops.update(
@@ -883,6 +968,7 @@ _quantized_tensor_passthrough_ops.update(
         torch.ops.te_moe.permute_mask_map_fwd.default,
         torch.ops.te_moe.permute_mask_map_bwd.default,
         torch.ops.te_moe.unpermute_mask_map_fwd.default,
+        torch.ops.te_moe.unpermute_mask_map_add_residual_fwd.default,
         torch.ops.te_moe.unpermute_mask_map_bwd_with_probs.default,
         torch.ops.te_moe.unpermute_mask_map_bwd_no_probs.default,
     }
@@ -1047,10 +1133,11 @@ def moe_unpermute(
     map_type: str = "mask",
     probs: Optional[torch.Tensor] = None,
     pad_offsets: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Unpermute a tensor with permuted tokens, and optionally merge the tokens with their
-    corresponding probabilities.
+    corresponding probabilities and add a residual.
 
     Parameters
     ----------
@@ -1074,6 +1161,13 @@ def moe_unpermute(
         Tensor of per-expert cumulative padding offsets used to remove padding added
         during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
         and is required when unpermuting padded outputs.
+    residual : torch.Tensor, default = None
+        Only for map_type 'mask'. A tensor with the output's shape and the dtype of `inp`
+        (`restore_shape` defaults to its shape). If provided, the result is
+        `residual + unpermuted`, computed in the same kernel and bitwise equal to adding the
+        residual to the output of `moe_unpermute` in a separate operation: every unpermuted row is
+        rounded to the data type before it is added to the residual in fp32 and rounded again.
+        The gradient of the residual is the gradient of the result.
     """
     if probs is not None:
         if merging_probs is not None:
@@ -1082,6 +1176,23 @@ def moe_unpermute(
             )
         warnings.warn("probs kwarg is deprecated. Use merging_probs kwarg instead.")
         merging_probs = probs
+    if residual is not None:
+        if map_type != "mask":
+            raise ValueError("moe_unpermute supports a residual only with map_type 'mask'")
+        if restore_shape is None:
+            restore_shape = residual.shape
+        num_tokens, hidden_size = restore_shape
+        num_experts = (row_id_map.size(1) - 1) // 2 if row_id_map.dim() > 1 else 0
+        return torch.ops.te_moe.unpermute_mask_map_add_residual_fwd(
+            inp,
+            row_id_map,
+            merging_probs,
+            residual,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            pad_offsets,
+        )
     if map_type == "index":
         # Normalize probs
         if merging_probs is not None:

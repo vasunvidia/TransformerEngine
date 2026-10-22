@@ -404,6 +404,8 @@ def _unpermute_kernel(
     # These are unused in the unpermute kernel but maintain consistency with the permute kernel.
     output_buf_ptr,  # pylint: disable=unused-argument
     unpermuted_probs_buf_ptr,  # pylint: disable=unused-argument
+    # residual added to the unpermuted rows (read only with WITH_RESIDUAL)
+    residual_ptr,
     # strides
     stride_row_id_map_token,
     stride_row_id_map_expert,
@@ -416,6 +418,8 @@ def _unpermute_kernel(
     stride_permuted_probs_token,
     stride_unpermuted_probs_token,
     stride_unpermuted_probs_expert,
+    stride_residual_token,
+    stride_residual_hidden,
     # output pointers
     output_ptr,
     unpermuted_probs_ptr,
@@ -426,6 +430,7 @@ def _unpermute_kernel(
     WITH_MERGING_PROBS: tl.constexpr,
     PERMUTE_PROBS: tl.constexpr,
     FUSION_UNPAD: tl.constexpr,
+    WITH_RESIDUAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     data_type = input_ptr.dtype.element_ty
@@ -495,6 +500,14 @@ def _unpermute_kernel(
                 tl.store(unpermuted_probs_ptr + unpermuted_prob_off, prob)
     accumulator = accumulator.to(data_type)
     dst_row = pid_t.to(tl.int64)
+    if WITH_RESIDUAL:
+        # out = residual + unpermute(...), rounded like the unfused pair of ops: the row sum is
+        # rounded to the data type first (above), then added to the residual in fp32 and
+        # rounded again. The extra rounding is kept on purpose so that the result is bitwise
+        # equal to the separate unpermute and add.
+        residual_off = dst_row * stride_residual_token + current_offset * stride_residual_hidden
+        residual = tl.load(residual_ptr + residual_off, mask=mask)
+        accumulator = (accumulator.to(compute_type) + residual.to(compute_type)).to(data_type)
     output_off = dst_row * stride_output_token + current_offset * stride_output_hidden
     tl.store(output_ptr + output_off, accumulator, mask=mask)
 

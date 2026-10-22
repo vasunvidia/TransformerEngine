@@ -282,6 +282,7 @@ def unpermute_with_mask_map(
     num_tokens: int,
     num_experts: int,
     hidden_size: int,
+    residual: Optional[torch.Tensor] = None,
 ):
     """
     Unpermute the input tensor based on the row_id_map.
@@ -306,7 +307,24 @@ def unpermute_with_mask_map(
         Number of experts in the permuted tensor.
     hidden_size : int
         Hidden size of the permuted tensor.
+    residual : torch.Tensor, default = None
+        Tensor of shape `[num_tokens, hidden_size]` with the dtype of `inp`. If it is not None,
+        the output is `residual + unpermuted`, bitwise equal to adding the residual to the
+        unpermuted output in a separate operation: each unpermuted row is rounded to the data
+        type, then added to the residual in fp32 and rounded again.
     """
+    if residual is not None:
+        if residual.shape != (num_tokens, hidden_size):
+            raise ValueError(
+                f"residual has shape {tuple(residual.shape)}, expected"
+                f" {(num_tokens, hidden_size)} (the unpermuted output)"
+            )
+        if residual.dtype != inp.dtype:
+            raise ValueError(
+                f"residual has dtype {residual.dtype}, expected the input dtype {inp.dtype}"
+            )
+        if residual.device != inp.device:
+            raise ValueError(f"residual is on {residual.device}, expected {inp.device}")
     output = torch.empty((num_tokens, hidden_size), dtype=inp.dtype, device=te_device_type())
     if permuted_probs is not None:
         unpermuted_probs = torch.empty(
@@ -335,6 +353,7 @@ def unpermute_with_mask_map(
         # These are unused in unpermute but maintain consistent interface.
         output,  # output_buf_ptr (unused, passed for signature consistency)
         unpermuted_probs,  # unpermuted_probs_buf_ptr (unused, passed for signature consistency)
+        residual,
         row_id_map.stride(0),
         row_id_map.stride(1),
         inp.stride(0),
@@ -346,6 +365,8 @@ def unpermute_with_mask_map(
         permuted_probs.stride(0) if permuted_probs is not None else None,
         unpermuted_probs.stride(0) if unpermuted_probs is not None else None,
         unpermuted_probs.stride(1) if unpermuted_probs is not None else None,
+        residual.stride(0) if residual is not None else None,
+        residual.stride(1) if residual is not None else None,
         output,
         unpermuted_probs,
         num_experts,
@@ -354,6 +375,7 @@ def unpermute_with_mask_map(
         WITH_MERGING_PROBS=merging_probs is not None,
         PERMUTE_PROBS=permuted_probs is not None,
         FUSION_UNPAD=pad_offsets is not None,
+        WITH_RESIDUAL=residual is not None,
     )
     return output, unpermuted_probs
 
