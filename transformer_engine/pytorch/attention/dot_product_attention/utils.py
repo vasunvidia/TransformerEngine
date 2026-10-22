@@ -3517,6 +3517,108 @@ def mxfp8_transpose_swizzle(fp8_tensors, src_format):
         t._with_gemm_swizzled_scales = True
 
 
+# Per-device int32 buffer for the (unused) no-op flag of multi_tensor_compute_scale_and_scale_inv.
+_qkv_amax_noop_flags: Dict[int, torch.Tensor] = {}
+
+
+def _qkv_amax_noop_flag(device: torch.device) -> torch.Tensor:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    flag = _qkv_amax_noop_flags.get(index)
+    if flag is None:
+        flag = torch.zeros(1, dtype=torch.int32, device=device)
+        # A buffer allocated during CUDA graph capture belongs to the graph's private pool: use it
+        # for this call only and cache only buffers allocated outside capture.
+        if not torch.cuda.is_current_stream_capturing():
+            _qkv_amax_noop_flags[index] = flag
+    return flag
+
+
+def _qkv_amax_usable(qkv_quantizer, tensors) -> bool:
+    """Whether combine_and_quantize can quantize separate Q/K/V with a precomputed amax."""
+    return (
+        isinstance(qkv_quantizer, Float8CurrentScalingQuantizer)
+        and not qkv_quantizer.with_amax_reduction
+        and qkv_quantizer.rowwise_usage
+        and not qkv_quantizer.columnwise_usage
+        and all(isinstance(x, torch.Tensor) and x.is_contiguous() for x in tensors)
+    )
+
+
+def _check_qkv_amax(qkv_amax: torch.Tensor, q: torch.Tensor) -> None:
+    if (
+        not isinstance(qkv_amax, torch.Tensor)
+        or qkv_amax.dtype != torch.float32
+        or qkv_amax.numel() != 1
+        or qkv_amax.device != q.device
+    ):
+        raise ValueError(
+            "qkv_amax must be a one-element float32 tensor on the device of q, got"
+            f" {type(qkv_amax).__name__}"
+            + (
+                f" (dtype={qkv_amax.dtype}, shape={tuple(qkv_amax.shape)}, device={qkv_amax.device})"
+                if isinstance(qkv_amax, torch.Tensor)
+                else ""
+            )
+            + "."
+        )
+
+
+def quantize_with_qkv_amax(
+    tensors: List[torch.Tensor],
+    qkv_quantizer: Float8CurrentScalingQuantizer,
+    qkv_amax: torch.Tensor,
+) -> List[Float8Tensor]:
+    """FP8 current-scaling quantization of separate tensors with one precomputed amax.
+
+    Returns the same Float8Tensors as ``qkv_quantizer(torch.cat([x.view(-1) for x in tensors]))``
+    split back into the input shapes (Case 3 of :func:`combine_and_quantize`), provided that
+    ``qkv_amax`` holds the amax that quantizer computes over the concatenation, i.e. the maximum of
+    ``|x|`` over every element of every tensor, NaN elements ignored. The concatenation copy and the
+    amax pass are skipped:
+
+    - the scale comes from ``qkv_amax`` through the same ``compute_scale_from_amax`` routine as the
+      quantizer's own (``multi_tensor_compute_scale_and_scale_inv``, with the quantizer's
+      ``force_pow_2_scales`` and ``amax_epsilon``);
+    - each tensor is cast by the same per-tensor FP8 cast kernel with that scale, into its slice of
+      one uint8 buffer laid out as the concatenation;
+    - every output shares one ``scale_inv`` (the reciprocal of the scale), as the split outputs do.
+
+    So the FP8 bytes and the scale_inv are bitwise equal to the concatenated quantization.
+    """
+    src_nominal_dtype = tensors[0].dtype
+    device = tensors[0].device
+    numels = [x.numel() for x in tensors]
+    offsets = [sum(numels[:i]) for i in range(len(tensors) + 1)]
+    qkv_fp8 = qkv_quantizer.make_empty((offsets[-1],), dtype=src_nominal_dtype, device=device)
+    scale = torch.empty(1, dtype=torch.float32, device=device)
+    max_fp8 = 448.0 if qkv_quantizer.dtype == tex.DType.kFloat8E4M3 else 57344.0
+    tex.multi_tensor_compute_scale_and_scale_inv(
+        2048 * 32,
+        _qkv_amax_noop_flag(device),
+        [[qkv_amax.view(1)], [scale], [qkv_fp8._scale_inv.view(1)]],
+        max_fp8,
+        qkv_quantizer.force_pow_2_scales,
+        qkv_quantizer.amax_epsilon,
+    )
+    cast_quantizer = Float8Quantizer(
+        scale=scale,
+        amax=torch.Tensor(),  # no amax update in the cast
+        fp8_dtype=qkv_quantizer.dtype,
+        rowwise=True,
+        columnwise=False,
+    )
+    outputs = []
+    for i, x in enumerate(tensors):
+        out = Float8Tensor.make_like(
+            qkv_fp8,
+            data=qkv_fp8._data[offsets[i] : offsets[i + 1]].view(x.shape),
+            dtype=src_nominal_dtype,
+        )
+        tex.quantize(x, cast_quantizer, out, None)
+        outputs.append(out)
+    return outputs
+
+
 def combine_and_quantize(
     qkv_layout,
     q,
@@ -3528,6 +3630,7 @@ def combine_and_quantize(
     keep_same_data_and_scale_inv_format=False,
     combined_qkv: Optional[torch.Tensor] = None,
     combined_kv: Optional[torch.Tensor] = None,
+    qkv_amax: Optional[torch.Tensor] = None,
 ):
     """Combine Q, K, V tensors based on qkv_layout and quantize them together.
 
@@ -3537,7 +3640,18 @@ def combine_and_quantize(
     directly instead of re-deriving the packed buffer from the q/k/v views via
     ``combine_tensors`` (which rebuilds it with a raw ``set_`` under a silent
     adjacency/interleave assumption). Ignored for MXFP8 quantization.
+
+    ``qkv_amax`` (default None = off): the amax of Q, K and V computed by their producer, a
+    one-element float32 tensor holding the maximum of ``|x|`` over every element of q, k and v
+    (NaN elements ignored), i.e. exactly what the current-scaling quantizer would compute over
+    their concatenation. With a :class:`Float8CurrentScalingQuantizer` (no amax reduction, rowwise
+    usage only) and separate Q/K/V (``qkv_group=3``), q, k and v are then quantized separately
+    with the scale derived from it (:func:`quantize_with_qkv_amax`), which skips the
+    concatenation and the amax pass; the result is bitwise equal. It is ignored in every other
+    case.
     """
+    if qkv_amax is not None:
+        _check_qkv_amax(qkv_amax, q)
     if isinstance(qkv_quantizer, MXFP8Quantizer):
         qkv_format, q_format, kv_format = get_qkv_format(qkv_layout)
         assert qkv_format in ("bshd", "sbhd"), (
@@ -3670,6 +3784,9 @@ def combine_and_quantize(
             k_data, v_data = SplitAlongDim.apply(kv_data, dim, [1, 1], True)
         case 3:
             tensors = [q, k, v]
+            if qkv_amax is not None and _qkv_amax_usable(qkv_quantizer, tensors):
+                q_fp8, k_fp8, v_fp8 = quantize_with_qkv_amax(tensors, qkv_quantizer, qkv_amax)
+                return q_fp8, k_fp8, v_fp8, qkv_layout, None
             num_tensors = len(tensors)
             shapes = [x.shape for x in tensors]
             numels = [x.numel() for x in tensors]

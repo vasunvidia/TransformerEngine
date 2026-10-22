@@ -1607,6 +1607,8 @@ class FusedAttnFwdArgs:
     fp8_output: bool
     bf16_backward: bool
     layer_number: Optional[int]
+    # Precomputed amax of q, k and v for FP8 current scaling (see combine_and_quantize).
+    qkv_amax: Optional[torch.Tensor] = None
 
 
 @dataclass(slots=True)
@@ -1802,6 +1804,7 @@ def _fused_attn_forward_impl(
                 used_in_backward=is_training,
                 combined_qkv=args.packed_qkv,
                 combined_kv=args.packed_kv,
+                qkv_amax=args.qkv_amax,
             )
 
         # print quantizers
@@ -2722,6 +2725,7 @@ class FusedAttention(torch.nn.Module):
         packed_kv: Optional[torch.Tensor] = None,
         bf16_backward: bool = False,
         load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
+        qkv_amax: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """fused attention fprop"""
         assert (
@@ -2943,6 +2947,7 @@ class FusedAttention(torch.nn.Module):
                 fp8_output=fp8_output,
                 bf16_backward=bf16_backward,
                 layer_number=self.layer_number,
+                qkv_amax=qkv_amax if fp8 else None,
             )
             with self.attention_dropout_ctx():
                 if torch.compiler.is_compiling() and _fused_attn_op is not None:

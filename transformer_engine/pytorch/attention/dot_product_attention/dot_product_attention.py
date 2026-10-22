@@ -1984,6 +1984,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         qkv_interleave_dim: int = -3,
         thd_attention_policies: Optional[List[Dict[str, Any]]] = None,
         thd_attention_policy_dispatch: str = "auto",
+        qkv_amax: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""
         Dot Product Attention Layer.
@@ -2248,6 +2249,16 @@ class DotProductAttention(TransformerEngineBaseModule):
             backend capability check described above. ``"grouped"`` compacts each policy's
             logical tokens before attention, without changing backend eligibility for this or
             other attention calls.
+        qkv_amax: Optional[torch.Tensor], default = None
+            Amax of :attr:`query_layer`, :attr:`key_layer` and :attr:`value_layer` computed by
+            their producer (e.g. a fused normalization/RoPE kernel that writes them): a
+            one-element float32 tensor on their device holding the maximum of ``|x|`` over every
+            element of the three tensors as passed here (NaN elements ignored). Used only by
+            FP8 attention with the ``Float8CurrentScaling`` recipe on the FusedAttention backend
+            with separate (``*_*_*`` layout) contiguous Q, K and V and no context parallelism:
+            Q, K and V are then quantized separately with the scale derived from this amax,
+            instead of being concatenated so that one amax pass covers them. The FP8 data and
+            scales are bitwise unchanged. Ignored in every other case.
         """
         global _attention_backends
 
@@ -3059,6 +3070,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                         packed_qkv=qkv_layer,
                         packed_kv=kv_layer,
                         bf16_backward=bf16_backward,
+                        qkv_amax=qkv_amax,
                     )
                 return self.fused_attention(
                     query_layer,
@@ -3098,6 +3110,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     packed_qkv=qkv_layer,
                     packed_kv=kv_layer,
                     bf16_backward=bf16_backward,
+                    qkv_amax=qkv_amax,
                 )
 
             if use_unfused_attention:
