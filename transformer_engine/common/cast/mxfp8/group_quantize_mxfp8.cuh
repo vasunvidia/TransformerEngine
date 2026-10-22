@@ -934,20 +934,36 @@ __global__ void __launch_bounds__(CastTraits::THREADS_PER_CHUNK) group_quantize_
 
     int buff_in = 0;
     size_t chunk_rows = CHUNK_DIM_Y;
-    if constexpr (CHUNK_DIM_Y > TILE_DIM_Y) {
+    if constexpr (CHUNK_DIM_Y > TILE_DIM_Y || use_direct_same_both_mapper) {
+      // SAME_BOTH_DIMS only requires the stacked first dimension to be TILE_DIM_Y-aligned, so the
+      // last chunk of each tensor may be partial (e.g. 2880 = 22 * 128 + 64 rows). Clip it to the
+      // tensor: otherwise it re-quantizes the leading rows of the next tensor and, for the last
+      // tensor, stores scaling factors past the end of the scale buffers.
       chunk_rows = min(static_cast<size_t>(CHUNK_DIM_Y), rows - tensor_offset_Y);
     }
     const size_t chunk_cols = min(static_cast<size_t>(CHUNK_DIM_X), cols - block_offset_X);
     const int stages_Y = static_cast<int>(DIVUP(chunk_rows, static_cast<size_t>(BUFF_DIM_Y)));
     const int stages_X = static_cast<int>(DIVUP(chunk_cols, static_cast<size_t>(TILE_DIM_X)));
     const int stages = stages_X * stages_Y;
+    // Stage s covers rows [stage_Y * BUFF_DIM_Y, +BUFF_DIM_Y) of horizontal tile stage_X. With one
+    // horizontal tile per chunk (STAGES_X == 1, so stages_X == 1), stage_Y = s and stage_X = 0 need
+    // no division by the runtime stage count.
+    auto stage_coords = [stages_Y](const int s, size_t &stage_Y, size_t &stage_X) {
+      if constexpr (STAGES_X == 1) {
+        stage_Y = s;
+        stage_X = 0;
+      } else {
+        stage_Y = s % stages_Y;
+        stage_X = s / stages_Y;
+      }
+    };
 
     // Prime the pipeline with the first PREFETCH_STAGES slices of the current block.
 #pragma unroll
     for (int stage = 0; stage < PREFETCH_STAGES; ++stage) {
       const size_t buff = stage;
-      const size_t stage_Y = stage % stages_Y;
-      const size_t stage_X = stage / stages_Y;
+      size_t stage_Y, stage_X;
+      stage_coords(stage, stage_Y, stage_X);
       const size_t stage_offset_Y = stage_Y * BUFF_DIM_Y;
       const size_t stage_offset_X = stage_X * TILE_DIM_X;
       const size_t global_offset_Y = block_offset_Y + stage_offset_Y;
@@ -975,15 +991,15 @@ __global__ void __launch_bounds__(CastTraits::THREADS_PER_CHUNK) group_quantize_
     // traversed vertically in 32x128 stages before moving in the X dimension.
 #pragma unroll
     for (int stage = 0; stage < stages; ++stage) {
-      const size_t stage_Y = stage % stages_Y;
-      const size_t stage_X = stage / stages_Y;
+      size_t stage_Y, stage_X;
+      stage_coords(stage, stage_Y, stage_X);
       const size_t stage_offset_Y = stage_Y * BUFF_DIM_Y;
       const size_t stage_offset_X = stage_X * TILE_DIM_X;
       if (stage < stages - PREFETCH_STAGES) {
         const size_t next_prefetch_buff = (buff_in + PREFETCH_STAGES) % BUFFS_NUM;
         const size_t next_prefetch_stage = stage + PREFETCH_STAGES;
-        const size_t next_prefetch_stage_Y = next_prefetch_stage % stages_Y;
-        const size_t next_prefetch_stage_X = next_prefetch_stage / stages_Y;
+        size_t next_prefetch_stage_Y, next_prefetch_stage_X;
+        stage_coords(next_prefetch_stage, next_prefetch_stage_Y, next_prefetch_stage_X);
         const size_t next_prefetch_stage_offset_Y = next_prefetch_stage_Y * BUFF_DIM_Y;
         const size_t next_prefetch_stage_offset_X = next_prefetch_stage_X * TILE_DIM_X;
 
@@ -1190,6 +1206,32 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
     NVTE_CHECK(first_logical_dim % tile_dim_y == 0,
                "First logical dimension of a grouped tensor must be divisible by ", tile_dim_y,
                ".");
+  }
+
+  if (shape_rep == ShapeRepresentation::SAME_BOTH_DIMS) {
+    // Only the stacked first dimension has to be a multiple of 128, so each tensor may end in a
+    // partial 128-row chunk (e.g. 2880 = 22 * 128 + 64 rows), which the kernel clips to the
+    // tensor. A 32-row MXFP8 block must not straddle two tensors, though, and GEMM-swizzled
+    // scales are laid out in whole 128-row tiles per tensor.
+    NVTE_CHECK(first_logical_dim % num_tensors == 0,
+               "SAME_BOTH_DIMS requires an equal integral row count per tensor.");
+    const size_t rows_per_tensor = first_logical_dim / num_tensors;
+    constexpr size_t block_rows = CastTraits<ShapeRepresentation::SAME_BOTH_DIMS>::SCALE_DIM_Y;
+    NVTE_CHECK(rows_per_tensor % block_rows == 0,
+               "Grouped MXFP8 quantization of tensors with a uniform shape requires a row count "
+               "per tensor divisible by ",
+               block_rows, " (got ", rows_per_tensor, ").");
+    NVTE_CHECK(!with_gemm_swizzled_scales || rows_per_tensor % tile_dim_y == 0,
+               "Grouped MXFP8 quantization with GEMM-swizzled scales of tensors with a uniform "
+               "shape requires a row count per tensor divisible by ",
+               tile_dim_y, " (got ", rows_per_tensor,
+               "). Quantize with compact scales and swizzle them with "
+               "nvte_swizzle_grouped_scaling_factors instead.");
+    // The DBias workspace holds one partial sum per tile_dim_y rows of each tensor.
+    NVTE_CHECK(!IS_DBIAS || rows_per_tensor % tile_dim_y == 0,
+               "Grouped MXFP8 quantization with DBias of tensors with a uniform shape requires a "
+               "row count per tensor divisible by ",
+               tile_dim_y, " (got ", rows_per_tensor, ").");
   }
 
   const int64_t *const offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);

@@ -646,6 +646,185 @@ void performTest(const ProcessingMethod processing_method,
     }
 }
 
+/**
+ * SAME_BOTH_DIMS only requires the stacked first dimension to be a multiple of 128, so the row
+ * count M of each tensor may leave a partial last 128-row chunk (e.g. 32 stacked 2880-row expert
+ * weights, 2880 = 22 * 128 + 64). The scaling factors of such a group use the compact grouped
+ * layout that PyTorch's MXFP8Quantizer::create_grouped_tensor allocates and the grouped swizzle
+ * reads: tensor t starts at row t * M of the stacked rowwise scale matrix (row t * M / 32 of the
+ * columnwise one), and the buffers are padded only at the end of the group.
+ * Each output buffer is followed by canary bytes, which must be intact after the kernel.
+ */
+template <typename InputType, typename OutputType>
+void performTestSameBothDimsPartialChunk(const size_t num_tensors,
+                                         const size_t M,
+                                         const size_t K,
+                                         const bool rowwise,
+                                         const bool colwise) {
+    using namespace test;
+
+    constexpr size_t canary_bytes = 64 * 1024;
+    constexpr unsigned char canary_value = 0xA5;
+
+    DType itype = TypeInfo<InputType>::dtype;
+    DType otype = TypeInfo<OutputType>::dtype;
+
+    const size_t rows = num_tensors * M;
+    const size_t elts_num = rows * K;
+    const size_t scales_stride_rowwise = round_up_to_nearest_multiple(divide_round_up(K, 32), 4);
+    const size_t scales_stride_colwise = round_up_to_nearest_multiple(K, 128);
+    const size_t rowwise_sfs_num = round_up_to_nearest_multiple(rows, 128) * scales_stride_rowwise;
+    const size_t colwise_sfs_num =
+        round_up_to_nearest_multiple(divide_round_up(rows, 32), 4) * scales_stride_colwise;
+
+    std::mt19937 gen;
+    std::uniform_real_distribution<> dis(-2.0, 1.0);
+    std::vector<InputType> in_data(elts_num);
+    for (size_t i = 0; i < elts_num; ++i) {
+        in_data[i] = static_cast<InputType>(dis(gen));
+    }
+
+    // CPU reference, one tensor at a time, in the compact grouped scale layout
+    std::vector<OutputType> out_data_rowwise_ref(rowwise ? elts_num : 0);
+    std::vector<OutputType> out_data_colwise_ref(colwise ? elts_num : 0);
+    std::vector<fp8e8m0> out_scales_rowwise_ref(rowwise ? rowwise_sfs_num : 0, 0);
+    std::vector<fp8e8m0> out_scales_colwise_ref(colwise ? colwise_sfs_num : 0, 0);
+    std::vector<InputType> unused_dbias(K);
+    for (size_t t = 0; t < num_tensors; ++t) {
+        compute_ref<InputType, OutputType>(
+            ProcessingMethod::CAST_ONLY, &identity, false, rowwise, colwise,
+            in_data.data() + t * M * K, in_data.data() + t * M * K,
+            rowwise ? out_data_rowwise_ref.data() + t * M * K : nullptr,
+            colwise ? out_data_colwise_ref.data() + t * M * K : nullptr,
+            rowwise ? out_scales_rowwise_ref.data() + t * M * scales_stride_rowwise : nullptr,
+            colwise ? out_scales_colwise_ref.data() + (t * M / 32) * scales_stride_colwise : nullptr,
+            unused_dbias.data(), M, K, scales_stride_rowwise, scales_stride_colwise);
+    }
+
+    // Device buffers: zero-filled payload followed by canary bytes
+    auto alloc_with_canary = [&](const size_t bytes) {
+        unsigned char* ptr = nullptr;
+        NVTE_CHECK_CUDA(cudaMalloc(&ptr, bytes + canary_bytes));
+        NVTE_CHECK_CUDA(cudaMemset(ptr, 0, bytes));
+        NVTE_CHECK_CUDA(cudaMemset(ptr + bytes, canary_value, canary_bytes));
+        return ptr;
+    };
+    auto expect_canary_intact = [&](const std::string& name, const unsigned char* ptr,
+                                    const size_t bytes) {
+        std::vector<unsigned char> canary(canary_bytes);
+        NVTE_CHECK_CUDA(cudaMemcpy(canary.data(), ptr + bytes, canary_bytes,
+                                   cudaMemcpyDeviceToHost));
+        size_t clobbered = 0;
+        size_t last_clobbered = 0;
+        for (size_t i = 0; i < canary_bytes; ++i) {
+            if (canary[i] != canary_value) {
+                ++clobbered;
+                last_clobbered = i;
+            }
+        }
+        EXPECT_EQ(clobbered, 0) << name << ": " << clobbered << " byte(s) written past the end of "
+                                << "the " << bytes << "-byte buffer, the last at offset +"
+                                << last_clobbered;
+    };
+
+    const size_t in_data_size = elts_num * sizeof(InputType);
+    const size_t out_data_size = elts_num * sizeof(OutputType);
+    const size_t rowwise_scales_size = rowwise_sfs_num * sizeof(fp8e8m0);
+    const size_t colwise_scales_size = colwise_sfs_num * sizeof(fp8e8m0);
+
+    InputType* in_data_d = nullptr;
+    NVTE_CHECK_CUDA(cudaMalloc(&in_data_d, in_data_size));
+    NVTE_CHECK_CUDA(cudaMemcpy(in_data_d, in_data.data(), in_data_size, cudaMemcpyHostToDevice));
+    unsigned char* out_data_rowwise_d = rowwise ? alloc_with_canary(out_data_size) : nullptr;
+    unsigned char* out_scales_rowwise_d = rowwise ? alloc_with_canary(rowwise_scales_size) : nullptr;
+    unsigned char* out_data_colwise_d = colwise ? alloc_with_canary(out_data_size) : nullptr;
+    unsigned char* out_scales_colwise_d = colwise ? alloc_with_canary(colwise_scales_size) : nullptr;
+
+    // Uniform grouped tensors: no first/last dims or offsets, i.e. SAME_BOTH_DIMS
+    const std::vector<size_t> logical_shape_vec = {rows, K};
+    NVTEShape logical_shape_ = nvte_make_shape(logical_shape_vec.data(), logical_shape_vec.size());
+    NVTEGroupedTensor in_group_tensor =
+        nvte_create_grouped_tensor(NVTE_DELAYED_TENSOR_SCALING, num_tensors, logical_shape_);
+    NVTEGroupedTensor out_group_tensor =
+        nvte_create_grouped_tensor(NVTE_MXFP8_1D_SCALING, num_tensors, logical_shape_);
+    NVTEBasicTensor in_data_tensor = {in_data_d, static_cast<NVTEDType>(itype), logical_shape_};
+    nvte_set_grouped_tensor_param(in_group_tensor, NVTEGroupedTensorParam::kNVTEGroupedRowwiseData,
+                                  &in_data_tensor, sizeof(in_data_tensor));
+    if (rowwise) {
+        const std::vector<size_t> scales_shape_vec = {rowwise_sfs_num};
+        NVTEShape scales_shape = nvte_make_shape(scales_shape_vec.data(), scales_shape_vec.size());
+        NVTEBasicTensor data = {out_data_rowwise_d, static_cast<NVTEDType>(otype), logical_shape_};
+        NVTEBasicTensor scales = {out_scales_rowwise_d, NVTEDType::kNVTEFloat8E8M0, scales_shape};
+        nvte_set_grouped_tensor_param(out_group_tensor,
+                                      NVTEGroupedTensorParam::kNVTEGroupedRowwiseData,
+                                      &data, sizeof(data));
+        nvte_set_grouped_tensor_param(out_group_tensor,
+                                      NVTEGroupedTensorParam::kNVTEGroupedRowwiseScaleInv,
+                                      &scales, sizeof(scales));
+    }
+    if (colwise) {
+        const std::vector<size_t> scales_shape_vec = {colwise_sfs_num};
+        NVTEShape scales_shape = nvte_make_shape(scales_shape_vec.data(), scales_shape_vec.size());
+        NVTEBasicTensor data = {out_data_colwise_d, static_cast<NVTEDType>(otype), logical_shape_};
+        NVTEBasicTensor scales = {out_scales_colwise_d, NVTEDType::kNVTEFloat8E8M0, scales_shape};
+        nvte_set_grouped_tensor_param(out_group_tensor,
+                                      NVTEGroupedTensorParam::kNVTEGroupedColumnwiseData,
+                                      &data, sizeof(data));
+        nvte_set_grouped_tensor_param(out_group_tensor,
+                                      NVTEGroupedTensorParam::kNVTEGroupedColumnwiseScaleInv,
+                                      &scales, sizeof(scales));
+    }
+
+    QuantizationConfigWrapper quant_config;
+    nvte_group_quantize(in_group_tensor, out_group_tensor, quant_config, 0);
+    cudaDeviceSynchronize();
+    auto err = cudaGetLastError();
+    ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+
+    if (rowwise) {
+        expect_canary_intact("rowwise_scales", out_scales_rowwise_d, rowwise_scales_size);
+        expect_canary_intact("rowwise_output", out_data_rowwise_d, out_data_size);
+
+        std::vector<fp8e8m0> out_scales_h(rowwise_sfs_num);
+        std::vector<OutputType> out_data_h(elts_num);
+        cudaMemcpy(out_scales_h.data(), out_scales_rowwise_d, rowwise_scales_size,
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(out_data_h.data(), out_data_rowwise_d, out_data_size, cudaMemcpyDeviceToHost);
+        size_t mismatches_scales = 0;
+        compare_scaling_factors("rowwise_scales", out_scales_h.data(),
+                                out_scales_rowwise_ref.data(), 1, rowwise_sfs_num, rowwise_sfs_num,
+                                mismatches_scales, 0, 0.0, 0.0);
+        compare_scaled_elts<OutputType>("rowwise_output", out_data_rowwise_ref.data(),
+                                        out_data_h.data(), 1, elts_num, true,
+                                        32 * mismatches_scales);
+    }
+    if (colwise) {
+        expect_canary_intact("colwise_scales", out_scales_colwise_d, colwise_scales_size);
+        expect_canary_intact("colwise_output", out_data_colwise_d, out_data_size);
+
+        std::vector<fp8e8m0> out_scales_h(colwise_sfs_num);
+        std::vector<OutputType> out_data_h(elts_num);
+        cudaMemcpy(out_scales_h.data(), out_scales_colwise_d, colwise_scales_size,
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(out_data_h.data(), out_data_colwise_d, out_data_size, cudaMemcpyDeviceToHost);
+        size_t mismatches_scales = 0;
+        compare_scaling_factors("colwise_scales", out_scales_h.data(),
+                                out_scales_colwise_ref.data(), 1, colwise_sfs_num, colwise_sfs_num,
+                                mismatches_scales, 0, 0.0, 0.0);
+        compare_scaled_elts<OutputType>("colwise_output", out_data_colwise_ref.data(),
+                                        out_data_h.data(), 1, elts_num, false,
+                                        32 * mismatches_scales);
+    }
+
+    nvte_destroy_grouped_tensor(in_group_tensor);
+    nvte_destroy_grouped_tensor(out_group_tensor);
+    cudaFree(in_data_d);
+    cudaFree(out_data_rowwise_d);
+    cudaFree(out_scales_rowwise_d);
+    cudaFree(out_data_colwise_d);
+    cudaFree(out_scales_colwise_d);
+}
+
 std::vector<ProcessingMethod> processing_methods = {
     ProcessingMethod::CAST_ONLY,
     ProcessingMethod::CAST_DBIAS,
@@ -1030,3 +1209,142 @@ INSTANTIATE_TEST_SUITE_P(
         ::testing::Values(DType::kBFloat16),
         ::testing::Values(DType::kFloat8E4M3)),
     MakeGroupedFusedCastMXFP8TestName);
+
+namespace {
+
+// {num_tensors, rows per tensor (M), cols (K)}
+std::vector<std::vector<size_t>> same_both_dims_partial_chunk_config = {
+    {2, 192, 160},  // one full and one partial (64-row) chunk per tensor
+    {4, 96, 256},   // a single partial chunk per tensor
+    {32, 2880, 320},  // 32 experts x 2880 rows (22 * 128 + 64), partial chunk along K as well
+    {2, 256, 128},  // aligned control
+};
+
+// Stacked expert weights of gpt-oss fc2: 32 x [2880, 2880]
+std::vector<std::vector<size_t>> same_both_dims_partial_chunk_config_large = {
+    {32, 2880, 2880},
+};
+
+class GroupedCastMXFP8SameBothDimsPartialChunkTestSuite
+    : public ::testing::TestWithParam<std::tuple<ScalingDirection, std::vector<size_t>>> {};
+
+TEST_P(GroupedCastMXFP8SameBothDimsPartialChunkTestSuite, Test) {
+    if (getDeviceComputeCapability() < blackwellComputeCapability) {
+        GTEST_SKIP();
+    }
+    const ScalingDirection scaling_direction = std::get<0>(GetParam());
+    const std::vector<size_t> config = std::get<1>(GetParam());
+    const bool rowwise = scaling_direction != ScalingDirection::COLWISE;
+    const bool colwise = scaling_direction != ScalingDirection::ROWWISE;
+    performTestSameBothDimsPartialChunk<bf16, fp8e4m3>(config[0], config[1], config[2], rowwise,
+                                                       colwise);
+}
+
+// Uniform groups that the kernel cannot handle are rejected instead of corrupting memory:
+// 32-row MXFP8 blocks would straddle two tensors, and GEMM-swizzled scales and the DBias
+// workspace are laid out in whole 128-row tiles per tensor.
+TEST(OperatorTest_GroupedFusedCastMXFP8, SameBothDimsRejectsUnsupportedRowCounts) {
+    if (getDeviceComputeCapability() < blackwellComputeCapability) {
+        GTEST_SKIP();
+    }
+    enum class Case { BLOCK_STRADDLES_TENSORS, GEMM_SWIZZLED_SCALES, DBIAS };
+    // {case, num_tensors, rows per tensor}
+    const std::vector<std::tuple<Case, size_t, size_t>> cases = {
+        {Case::BLOCK_STRADDLES_TENSORS, 8, 48},
+        {Case::GEMM_SWIZZLED_SCALES, 32, 2880},
+        {Case::DBIAS, 2, 192},
+    };
+    constexpr size_t K = 128;
+    for (const auto& [kind, num_tensors, M] : cases) {
+        const size_t rows = num_tensors * M;
+        const size_t elts = rows * K;
+        const size_t scales = round_up_to_nearest_multiple(rows, 128) * (K / 32);
+        bf16* in_d = nullptr;
+        bf16* dbias_d = nullptr;
+        unsigned char* out_d = nullptr;
+        unsigned char* scales_d = nullptr;
+        NVTE_CHECK_CUDA(cudaMalloc(&in_d, elts * sizeof(bf16)));
+        NVTE_CHECK_CUDA(cudaMemset(in_d, 0, elts * sizeof(bf16)));
+        NVTE_CHECK_CUDA(cudaMalloc(&dbias_d, num_tensors * K * sizeof(bf16)));
+        NVTE_CHECK_CUDA(cudaMalloc(&out_d, elts));
+        NVTE_CHECK_CUDA(cudaMalloc(&scales_d, scales));
+
+        const std::vector<size_t> shape_vec = {rows, K};
+        const NVTEShape shape = nvte_make_shape(shape_vec.data(), shape_vec.size());
+        const std::vector<size_t> dbias_shape_vec = {num_tensors, K};
+        const NVTEShape dbias_shape = nvte_make_shape(dbias_shape_vec.data(), dbias_shape_vec.size());
+        const std::vector<size_t> scales_shape_vec = {scales};
+        const NVTEShape scales_shape = nvte_make_shape(scales_shape_vec.data(), scales_shape_vec.size());
+        NVTEGroupedTensor in_gt =
+            nvte_create_grouped_tensor(NVTE_DELAYED_TENSOR_SCALING, num_tensors, shape);
+        NVTEGroupedTensor out_gt = nvte_create_grouped_tensor(NVTE_MXFP8_1D_SCALING, num_tensors, shape);
+        NVTEGroupedTensor dbias_gt =
+            nvte_create_grouped_tensor(NVTE_DELAYED_TENSOR_SCALING, num_tensors, dbias_shape);
+        NVTEBasicTensor in_data = {in_d, kNVTEBFloat16, shape};
+        NVTEBasicTensor out_data = {out_d, kNVTEFloat8E4M3, shape};
+        NVTEBasicTensor out_scales = {scales_d, kNVTEFloat8E8M0, scales_shape};
+        NVTEBasicTensor dbias_data = {dbias_d, kNVTEBFloat16, dbias_shape};
+        nvte_set_grouped_tensor_param(in_gt, kNVTEGroupedRowwiseData, &in_data, sizeof(in_data));
+        nvte_set_grouped_tensor_param(out_gt, kNVTEGroupedRowwiseData, &out_data, sizeof(out_data));
+        nvte_set_grouped_tensor_param(out_gt, kNVTEGroupedRowwiseScaleInv, &out_scales,
+                                      sizeof(out_scales));
+        nvte_set_grouped_tensor_param(dbias_gt, kNVTEGroupedRowwiseData, &dbias_data,
+                                      sizeof(dbias_data));
+        const uint8_t swizzled = kind == Case::GEMM_SWIZZLED_SCALES;
+        nvte_set_grouped_tensor_param(out_gt, kNVTEGroupedWithGEMMSwizzledScales, &swizzled,
+                                      sizeof(swizzled));
+
+        if (kind == Case::DBIAS) {
+            Tensor workspace;
+            EXPECT_THROW(nvte_group_quantize_dbias(in_gt, out_gt, dbias_gt, workspace.data(), nullptr,
+                                                   0),
+                         std::runtime_error) << "rows per tensor " << M;
+        } else {
+            QuantizationConfigWrapper quant_config;
+            EXPECT_THROW(nvte_group_quantize(in_gt, out_gt, quant_config, 0), std::runtime_error)
+                << "rows per tensor " << M << ", GEMM-swizzled scales " << int(swizzled);
+        }
+        cudaDeviceSynchronize();
+
+        nvte_destroy_grouped_tensor(in_gt);
+        nvte_destroy_grouped_tensor(out_gt);
+        nvte_destroy_grouped_tensor(dbias_gt);
+        cudaFree(in_d);
+        cudaFree(dbias_d);
+        cudaFree(out_d);
+        cudaFree(scales_d);
+    }
+}
+
+std::string MakeSameBothDimsPartialChunkTestName(
+    const testing::TestParamInfo<GroupedCastMXFP8SameBothDimsPartialChunkTestSuite::ParamType>&
+        info) {
+    std::string name;
+    switch (std::get<0>(info.param)) {
+        case ScalingDirection::ROWWISE: name = "ROWWISE"; break;
+        case ScalingDirection::COLWISE: name = "COLWISE"; break;
+        case ScalingDirection::BOTH:    name = "BIDIMENSIONAL"; break;
+    }
+    const std::vector<size_t> config = std::get<1>(info.param);
+    name += "_N_" + std::to_string(config[0]) + "_SHAPE_" + std::to_string(config[1]) + "X" +
+            std::to_string(config[2]);
+    return name;
+}
+
+}  // namespace
+
+INSTANTIATE_TEST_SUITE_P(
+    OperatorTest_GroupedFusedCastMXFP8_SameBothDimsPartialChunk,
+    GroupedCastMXFP8SameBothDimsPartialChunkTestSuite,
+    ::testing::Combine(
+        ::testing::ValuesIn(scaling_directions),
+        ::testing::ValuesIn(same_both_dims_partial_chunk_config)),
+    MakeSameBothDimsPartialChunkTestName);
+
+INSTANTIATE_TEST_SUITE_P(
+    OperatorTest_GroupedFusedCastMXFP8_SameBothDimsPartialChunkLarge,
+    GroupedCastMXFP8SameBothDimsPartialChunkTestSuite,
+    ::testing::Combine(
+        ::testing::Values(ScalingDirection::BOTH),
+        ::testing::ValuesIn(same_both_dims_partial_chunk_config_large)),
+    MakeSameBothDimsPartialChunkTestName);

@@ -2440,6 +2440,15 @@ class GroupedLinear(TransformerEngineBaseModule):
                 optimize_for_gemm = self._enable_weight_preswizzle(
                     weight_quantizers[0], weight_tensors[0]
                 )
+                if (
+                    self.single_grouped_weight
+                    and isinstance(weight_quantizers[0], MXFP8Quantizer)
+                    and self.out_features % 128 != 0
+                ):
+                    # The grouped quantize writes GEMM-swizzled MXFP8 scales of a uniform group
+                    # only in whole 128-row tiles per weight. Keep compact scales otherwise; the
+                    # grouped GEMM swizzles them.
+                    optimize_for_gemm = False
                 for q in weight_quantizers:
                     q.optimize_for_gemm = optimize_for_gemm
 

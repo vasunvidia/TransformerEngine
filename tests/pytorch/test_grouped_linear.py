@@ -2213,6 +2213,144 @@ def test_single_grouped_weight_matches_discrete_grouped_tensor_path(fp8_recipe):
 
 
 @pytest.mark.skipif(not _mxfp8_available, reason=_reason_for_no_mxfp8)
+@pytest.mark.parametrize(
+    "num_groups,rows_per_group,cols",
+    [(32, 2880, 2880), (2, 192, 160), (4, 96, 256)],
+    ids=("32x2880x2880", "2x192x160", "4x96x256"),
+)
+def test_group_quantize_mxfp8_uniform_rows_not_multiple_of_128(num_groups, rows_per_group, cols):
+    """Uniform grouped MXFP8 quantize whose rows per group are not a multiple of 128.
+
+    A single grouped weight stacks the expert weights, e.g. 32 gpt-oss fc2 experts with
+    2880 = 22 * 128 + 64 rows each, and quantizes them in one ``group_quantize`` call. The
+    stores must stay inside the grouped buffers (each is followed by canary bytes here), and
+    every group must match a quantize of that group alone, bit for bit, in the compact grouped
+    scale layout (group g starts at scale row g * rows_per_group, or g * rows_per_group / 32
+    for the columnwise scales).
+    """
+    canary, canary_bytes = 0xA5, 1 << 16
+    rows = num_groups * rows_per_group
+    weight = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+
+    # Output buffers followed by canary bytes, passed through the output reuse path
+    rowwise_scale_shape = quantizer.get_scale_shape((rows, cols), False)
+    columnwise_scale_shape = quantizer.get_scale_shape((rows, cols), True)
+    sizes = {
+        "data": rows * cols,
+        "columnwise_data": rows * cols,
+        "scale_inv": rowwise_scale_shape[0] * rowwise_scale_shape[1],
+        "columnwise_scale_inv": columnwise_scale_shape[0] * columnwise_scale_shape[1],
+    }
+    buffers = {}
+    for name, size in sizes.items():
+        buffers[name] = torch.full((size + canary_bytes,), canary, dtype=torch.uint8, device="cuda")
+        buffers[name][:size].zero_()
+    output = GroupedTensor(
+        shape=(rows, cols),
+        dtype=weight.dtype,
+        num_tensors=num_groups,
+        quantizer=quantizer,
+        **{name: buffers[name][:size] for name, size in sizes.items()},
+    )
+    assert tex.group_quantize(weight, quantizer, num_groups, None, output=output) is output
+    for name, size in sizes.items():
+        clobbered = int((buffers[name][size:] != canary).sum())
+        assert clobbered == 0, f"{name}: {clobbered} byte(s) written past the end of the buffer"
+
+    # Compare the unpadded part of every group with a quantize of that group alone
+    rowwise_data = output.rowwise_data.view(rows, cols)
+    columnwise_data = output.columnwise_data.view(rows, cols)
+    rowwise_scales = output.scale_inv.view(rowwise_scale_shape)[:, : cols // 32]
+    columnwise_scales = output.columnwise_scale_inv.view(columnwise_scale_shape)[:, :cols]
+    for group in range(num_groups):
+        first, last = group * rows_per_group, (group + 1) * rows_per_group
+        expected = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)(
+            weight[first:last]
+        )
+        assert torch.equal(rowwise_data[first:last], expected._rowwise_data.view(torch.uint8))
+        assert torch.equal(columnwise_data[first:last], expected._columnwise_data.view(torch.uint8))
+        assert torch.equal(
+            rowwise_scales[first:last],
+            expected._rowwise_scale_inv[:rows_per_group, : cols // 32],
+        )
+        assert torch.equal(
+            columnwise_scales[first // 32 : last // 32],
+            expected._columnwise_scale_inv[: rows_per_group // 32, :cols],
+        )
+
+
+@pytest.mark.skipif(not _mxfp8_available, reason=_reason_for_no_mxfp8)
+@pytest.mark.parametrize("use_op_fuser", (False, True), ids=("module", "op"))
+def test_single_grouped_weight_mxfp8_rows_not_multiple_of_128(use_op_fuser):
+    """Single grouped MXFP8 weight with 2880 = 22 * 128 + 64 rows per group (gpt-oss fc2).
+
+    Matches the discrete-weight path, which quantizes each expert weight on its own.
+    """
+    mxfp8_recipe = recipe.MXFP8BlockScaling()
+    if not use_op_fuser and not is_module_grouped_tensor_path_supported(
+        mxfp8_recipe,
+        torch.bfloat16,
+    ):
+        pytest.skip("MXFP8 single-weight GroupedTensor path is unavailable on this system.")
+    FP8GlobalStateManager.reset()
+
+    num_gemms = 32
+    in_features = 256
+    out_features = 2880
+    m_splits = torch.full((num_gemms,), 128, dtype=torch.int64, device="cuda")
+    total_tokens = int(m_splits.sum())
+    weights = torch.randn(num_gemms, out_features, in_features, dtype=torch.bfloat16, device="cuda")
+
+    def make_grouped_linear(single_grouped_weight):
+        if use_op_fuser:
+            return te.ops.GroupedLinear(
+                num_gemms,
+                in_features,
+                out_features,
+                bias=False,
+                device="cuda",
+                dtype=torch.bfloat16,
+                single_grouped_weight=single_grouped_weight,
+            )
+        return GroupedLinear(
+            num_gemms,
+            in_features,
+            out_features,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device="cuda",
+            single_grouped_weight=single_grouped_weight,
+            use_grouped_tensor=True,
+        )
+
+    discrete = make_grouped_linear(False)
+    single = make_grouped_linear(True)
+    with torch.no_grad():
+        for idx in range(num_gemms):
+            getattr(discrete, f"weight{idx}").copy_(weights[idx])
+        single.weight.rowwise_data.view_as(weights).copy_(weights)
+
+    x = torch.randn(total_tokens, in_features, dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn(total_tokens, out_features, dtype=torch.bfloat16, device="cuda")
+    x_discrete = x.detach().clone().requires_grad_(True)
+    x_single = x.detach().clone().requires_grad_(True)
+    with autocast(enabled=True, recipe=mxfp8_recipe):
+        y_discrete = discrete(x_discrete, m_splits)
+        y_single = single(x_single, m_splits)
+    y_discrete.backward(dy)
+    y_single.backward(dy)
+
+    tolerances = dict(rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(y_single.float(), y_discrete.float(), **tolerances)
+    torch.testing.assert_close(x_single.grad.float(), x_discrete.grad.float(), **tolerances)
+    discrete_wgrad = torch.stack(
+        [getattr(discrete, f"weight{idx}").grad for idx in range(num_gemms)]
+    )
+    torch.testing.assert_close(single.weight.grad.float(), discrete_wgrad.float(), **tolerances)
+
+
+@pytest.mark.skipif(not _mxfp8_available, reason=_reason_for_no_mxfp8)
 def test_single_grouped_weight_mxfp8_workspace_cache():
     """BF16 primary weights update one persistent MXFP8 grouped workspace per iteration."""
     mxfp8_recipe = recipe.MXFP8BlockScaling()
