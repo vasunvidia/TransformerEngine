@@ -12,6 +12,7 @@ import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import DelayedScaling, MXFP8BlockScaling, Float8BlockScaling
 from transformer_engine.pytorch import MultiheadAttention, quantized_model_init, is_bf16_available
 from transformer_engine.pytorch import QuantizedTensor
+from transformer_engine.pytorch.optimizers import multi_tensor_adam_flat, multi_tensor_applier
 from transformer_engine.pytorch.optimizers.fused_adam import (
     _MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL,
 )
@@ -942,6 +943,169 @@ class TestFusedAdamFloat8Block(TestFusedOptimizer):
             assert state["exp_avg_sq"].dtype == torch.float32
             if "bias" not in name:
                 assert state["master_param"].dtype == torch.float32
+
+
+def _bits(tensor: torch.Tensor) -> torch.Tensor:
+    """Raw bits of a tensor, for bitwise comparisons."""
+    return tensor.view({4: torch.int32, 2: torch.int16}[tensor.element_size()])
+
+
+class TestMultiTensorAdamFlat:
+    """multi_tensor_adam_flat is bitwise equal to the multi-tensor path it replaces.
+
+    The reference is the update of a distributed-optimizer shard with per-parameter FP32 tensors:
+    cast each gradient segment to FP32, optionally scale the FP32 gradients with
+    multi_tensor_scale_tensor (gradient clipping), step FusedAdam on FP32 parameters (FP32
+    moments, no master weights, non-capturable), and copy the parameters back into the model
+    parameter buffer.
+    """
+
+    # (number of elements, padding before the parameter): segment boundaries cut vectors, and
+    # the padding must be neither read nor written.
+    layout = [(4096, 0), (1000, 7), (3, 1), (65536 + 5, 64), (1, 0), (2880, 3), (1536, 13)]
+    group_options = [
+        {"lr": 1e-3, "weight_decay": 0.1, "betas": (0.9, 0.95), "eps": 1e-5},
+        {"lr": 5e-4, "weight_decay": 0.0, "betas": (0.8, 0.99), "eps": 1e-8},
+    ]
+    max_norm = 1.0
+
+    @pytest.mark.parametrize("grad_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32, None])
+    @pytest.mark.parametrize("clip", [True, False])
+    @pytest.mark.parametrize("adam_w_mode", [True, False])
+    @pytest.mark.parametrize("misaligned", [False, True])
+    def test_matches_fused_adam(self, grad_dtype, param_dtype, clip, adam_w_mode, misaligned):
+        if torch.bfloat16 in (grad_dtype, param_dtype) and not is_bf16_available():
+            pytest.skip("BF16 is not supported")
+        torch.manual_seed(1234)
+        device = "cuda"
+
+        # Flat layout: segments (start, end, group) with padding in between.
+        segments = []
+        pos = 0
+        for i, (numel, padding) in enumerate(self.layout):
+            pos += padding
+            segments.append((pos, pos + numel, i % len(self.group_options)))
+            pos += numel
+        numel = pos + 5
+        # A one-element offset makes every buffer misaligned for vector access.
+        offset = 1 if misaligned else 0
+
+        def flat(dtype, fill=None):
+            buf = torch.empty(numel + offset, dtype=dtype, device=device)
+            if fill is None:
+                buf.normal_()
+            else:
+                buf.fill_(fill)
+            return buf[offset:]
+
+        grad = flat(grad_dtype)
+        master = flat(torch.float32)
+        exp_avg = flat(torch.float32, 0.0)
+        exp_avg_sq = flat(torch.float32, 0.0)
+        param = flat(param_dtype, -7.0) if param_dtype is not None else None
+        segments_t = torch.tensor(segments, dtype=torch.int64, device=device)
+
+        # Reference: per-parameter FP32 tensors and FusedAdam.
+        ref_params = [torch.nn.Parameter(master[s:e].clone()) for s, e, _ in segments]
+        ref_groups = [
+            {"params": [p for p, (_, _, g) in zip(ref_params, segments) if g == i], **options}
+            for i, options in enumerate(self.group_options)
+        ]
+        ref_optim = te.optimizers.FusedAdam(ref_groups, adam_w_mode=adam_w_mode)
+
+        is_gap = torch.ones(numel, dtype=torch.bool, device=device)
+        for s, e, _ in segments:
+            is_gap[s:e] = False
+
+        for step in range(1, 4):
+            # Large gradients, so that clipping changes them.
+            grad.copy_(torch.randn(numel, device=device) * 10)
+            # FP32 copies (as the default path makes), scaled in place by the reference.
+            ref_grads = [grad[s:e].to(torch.float32, copy=True) for s, e, _ in segments]
+            grad_scale = None
+            if clip:
+                overflow = torch.zeros(1, dtype=torch.int, device=device)
+                norm, _ = multi_tensor_applier(
+                    te.optimizers.multi_tensor_l2norm, overflow, [ref_grads], False
+                )
+                grad_scale = self.max_norm / (norm + 1.0e-6)
+                grad_scale.clamp_max_(1.0)
+                assert grad_scale.item() < 1.0
+                multi_tensor_applier(
+                    te.optimizers.multi_tensor_scale_tensor,
+                    overflow,
+                    [ref_grads, ref_grads],
+                    grad_scale,
+                )
+            for ref_param, ref_grad in zip(ref_params, ref_grads):
+                ref_param.grad = ref_grad
+            ref_optim.step()
+
+            before = {
+                "master": master.clone(),
+                "exp_avg": exp_avg.clone(),
+                "exp_avg_sq": exp_avg_sq.clone(),
+            }
+            if param is not None:
+                ref_param_buf = param.clone()
+                for ref_param, (s, e, _) in zip(ref_params, segments):
+                    ref_param_buf[s:e].copy_(ref_param.detach())
+                before["param"] = param.clone()
+
+            multi_tensor_adam_flat(
+                grad,
+                param,
+                master,
+                exp_avg,
+                exp_avg_sq,
+                segments_t,
+                grad_scale,
+                lr=[options["lr"] for options in self.group_options],
+                beta1=[options["betas"][0] for options in self.group_options],
+                beta2=[options["betas"][1] for options in self.group_options],
+                epsilon=[options["eps"] for options in self.group_options],
+                weight_decay=[options["weight_decay"] for options in self.group_options],
+                step=[step] * len(self.group_options),
+                bias_correction=[1] * len(self.group_options),
+                mode=1 if adam_w_mode else 0,
+            )
+
+            for ref_param, (s, e, _) in zip(ref_params, segments):
+                state = ref_optim.state[ref_param]
+                assert torch.equal(_bits(master[s:e]), _bits(ref_param.detach()))
+                assert torch.equal(_bits(exp_avg[s:e]), _bits(state["exp_avg"]))
+                assert torch.equal(_bits(exp_avg_sq[s:e]), _bits(state["exp_avg_sq"]))
+            if param is not None:
+                assert torch.equal(_bits(param), _bits(ref_param_buf))
+            # Padding is neither read nor written.
+            for name, buf in (("master", master), ("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+                assert torch.equal(_bits(buf[is_gap]), _bits(before[name][is_gap])), name
+            if param is not None:
+                assert torch.equal(_bits(param[is_gap]), _bits(before["param"][is_gap]))
+
+    def test_rejects_too_many_groups(self):
+        buf = torch.zeros(8, device="cuda")
+        segments = torch.tensor([[0, 8, 0]], dtype=torch.int64, device="cuda")
+        num_groups = 33
+        with pytest.raises(RuntimeError, match="parameter groups"):
+            multi_tensor_adam_flat(
+                buf,
+                None,
+                buf.clone(),
+                buf.clone(),
+                buf.clone(),
+                segments,
+                None,
+                lr=[1e-3] * num_groups,
+                beta1=[0.9] * num_groups,
+                beta2=[0.999] * num_groups,
+                epsilon=[1e-8] * num_groups,
+                weight_decay=[0.0] * num_groups,
+                step=[1] * num_groups,
+                bias_correction=[1] * num_groups,
+                mode=1,
+            )
 
 
 class TestFusedSGD(TestFusedOptimizer):

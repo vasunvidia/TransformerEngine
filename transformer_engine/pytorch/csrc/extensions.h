@@ -707,6 +707,15 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, at::Tensor noop_fl
                                               const int bias_correction, const float weight_decay,
                                               at::Tensor inv_scale);
 
+void multi_tensor_adam_flat_cuda(at::Tensor grad, std::optional<at::Tensor> param,
+                                 at::Tensor master_param, at::Tensor exp_avg, at::Tensor exp_avg_sq,
+                                 at::Tensor segments, std::optional<at::Tensor> grad_scale,
+                                 const std::vector<float> &lr, const std::vector<float> &beta1,
+                                 const std::vector<float> &beta2, const std::vector<float> &epsilon,
+                                 const std::vector<float> &weight_decay,
+                                 const std::vector<int> &step,
+                                 const std::vector<int> &bias_correction, const int mode);
+
 void multi_tensor_sgd_cuda(int chunk_size, at::Tensor noop_flag,
                            std::vector<std::vector<at::Tensor>> tensor_lists, float wd,
                            float momentum, float dampening, float lr, bool nesterov, bool first_run,

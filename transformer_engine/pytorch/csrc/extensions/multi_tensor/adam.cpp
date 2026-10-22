@@ -89,4 +89,42 @@ void multi_tensor_adam_capturable_master_cuda(int chunk_size, at::Tensor noop_fl
       inv_scale_cu.data(), at::cuda::getCurrentCUDAStream());
 }
 
+void multi_tensor_adam_flat_cuda(at::Tensor grad, std::optional<at::Tensor> param,
+                                 at::Tensor master_param, at::Tensor exp_avg, at::Tensor exp_avg_sq,
+                                 at::Tensor segments, std::optional<at::Tensor> grad_scale,
+                                 const std::vector<float> &lr, const std::vector<float> &beta1,
+                                 const std::vector<float> &beta2, const std::vector<float> &epsilon,
+                                 const std::vector<float> &weight_decay,
+                                 const std::vector<int> &step,
+                                 const std::vector<int> &bias_correction, const int mode) {
+  const size_t num_groups = lr.size();
+  NVTE_CHECK(beta1.size() == num_groups && beta2.size() == num_groups &&
+                 epsilon.size() == num_groups && weight_decay.size() == num_groups &&
+                 step.size() == num_groups && bias_correction.size() == num_groups,
+             "Every per-group hyperparameter list must have one value per parameter group");
+  for (const auto &t : {grad, master_param, exp_avg, exp_avg_sq, segments}) {
+    NVTE_CHECK(t.is_contiguous(), "multi_tensor_adam_flat expects contiguous tensors");
+  }
+  auto grad_cu = makeTransformerEngineTensor(grad);
+  auto master_param_cu = makeTransformerEngineTensor(master_param);
+  auto exp_avg_cu = makeTransformerEngineTensor(exp_avg);
+  auto exp_avg_sq_cu = makeTransformerEngineTensor(exp_avg_sq);
+  auto segments_cu = makeTransformerEngineTensor(segments);
+  auto param_cu = TensorWrapper();  // empty: do not write model parameters
+  if (param.has_value()) {
+    NVTE_CHECK(param->is_contiguous(), "multi_tensor_adam_flat expects contiguous tensors");
+    param_cu = makeTransformerEngineTensor(*param);
+  }
+  auto grad_scale_cu = TensorWrapper();  // empty: do not scale gradients
+  if (grad_scale.has_value()) {
+    grad_scale_cu = makeTransformerEngineTensor(*grad_scale);
+  }
+
+  nvte_multi_tensor_adam_flat_cuda(
+      grad_cu.data(), param_cu.data(), master_param_cu.data(), exp_avg_cu.data(),
+      exp_avg_sq_cu.data(), segments_cu.data(), grad_scale_cu.data(), lr.data(), beta1.data(),
+      beta2.data(), epsilon.data(), weight_decay.data(), step.data(), bias_correction.data(),
+      num_groups, mode, at::cuda::getCurrentCUDAStream());
+}
+
 }  // namespace transformer_engine::pytorch

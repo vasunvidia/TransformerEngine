@@ -203,6 +203,60 @@ void nvte_multi_tensor_adam_capturable_master_cuda(
     const float epsilon, NVTETensor step, const int mode, const int bias_correction,
     const float weight_decay, NVTETensor inv_scale, cudaStream_t stream);
 
+/*! \brief Maximum number of parameter groups of nvte_multi_tensor_adam_flat_cuda. */
+#define NVTE_MULTI_TENSOR_ADAM_FLAT_MAX_GROUPS 32
+
+/*!  \brief Compute and apply the Adam update of flat buffers partitioned into
+ *          parameter-group segments.
+ *
+ * Element i of every buffer belongs to the same parameter element, as in the shard of a
+ * distributed-optimizer bucket. The elements are partitioned into segments, each with a
+ * parameter group whose hyperparameters are used for its elements. Elements not covered by a
+ * segment are neither read nor written.
+ *
+ * The gradient is read in its own precision and, if grad_scale is given, multiplied by it (e.g.
+ * a gradient-clipping coefficient). The FP32 parameters and moments are updated in place, and the
+ * updated parameters are optionally written, cast to the dtype of param, to the model-parameter
+ * buffer. The update is bitwise identical to casting the gradients to FP32, scaling them with
+ * nvte_multi_tensor_scale_tensor_cuda, calling nvte_multi_tensor_adam_cuda on the FP32
+ * parameters and moments, and casting the parameters to the model dtype. The bias corrections
+ * are computed on the host, so the operation cannot be captured in a CUDA graph across steps.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]      grad              Gradients (1-D; FP32, FP16 or BF16).
+ *  \param[out]     param             Model parameters (FP32, FP16 or BF16, same number of elements
+ *                                    as grad). If empty, the model parameters are not written.
+ *  \param[in,out]  master_param      FP32 parameters (same number of elements as grad).
+ *  \param[in,out]  exp_avg           FP32 first moments (same number of elements as grad).
+ *  \param[in,out]  exp_avg_sq        FP32 second moments (same number of elements as grad).
+ *  \param[in]      segments          Int64 tensor of shape [num_segments, 3] with rows
+ *                                    (start, end, group): element range [start, end) belongs to
+ *                                    parameter group `group`. Rows must be sorted by start and
+ *                                    must not overlap, with 0 <= start < end <= numel(grad).
+ *  \param[in]      grad_scale        FP32 tensor with one element that multiplies the gradients,
+ *                                    or an empty tensor.
+ *  \param[in]      lr                Learning rate of each group (num_groups values).
+ *  \param[in]      beta1             Coefficient for the first moment of each group.
+ *  \param[in]      beta2             Coefficient for the second moment of each group.
+ *  \param[in]      epsilon           Term added to the denominator, for each group.
+ *  \param[in]      weight_decay      Weight decay of each group.
+ *  \param[in]      step              Iteration counter of each group (for the bias correction).
+ *  \param[in]      bias_correction   Whether to apply the bias correction, for each group.
+ *  \param[in]      num_groups        Number of parameter groups (at most
+ *                                    NVTE_MULTI_TENSOR_ADAM_FLAT_MAX_GROUPS).
+ *  \param[in]      mode              0 for L2 regularization, 1 for decoupled weight decay (AdamW).
+ *  \param[in]      stream            CUDA stream used for this operation.
+ */
+void nvte_multi_tensor_adam_flat_cuda(const NVTETensor grad, NVTETensor param,
+                                      NVTETensor master_param, NVTETensor exp_avg,
+                                      NVTETensor exp_avg_sq, const NVTETensor segments,
+                                      const NVTETensor grad_scale, const float *lr,
+                                      const float *beta1, const float *beta2, const float *epsilon,
+                                      const float *weight_decay, const int *step,
+                                      const int *bias_correction, const size_t num_groups,
+                                      const int mode, cudaStream_t stream);
+
 /*!  \brief Compute and apply gradient update to parameters for SGD optimizer.
  *
  * \warning   This API is **experimental** and subject to change.
