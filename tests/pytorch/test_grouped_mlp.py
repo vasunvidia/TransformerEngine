@@ -4098,7 +4098,6 @@ class TestGroupedMLPDeterminism:
             )
 
 
-
 class TestGroupedMLPFastQuantEpilogue:
     """``NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE=1`` passes ``fast_quant_epilogue=True`` to the cuDNN
     dGLU kernel (FC2 dgrad + activation backward + MXFP8 quantization). Its epilogue only
