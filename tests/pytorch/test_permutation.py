@@ -1991,6 +1991,105 @@ def test_permutation_mask_map_fp8(
     )
 
 
+def _padded_permutation_row_index(routing_map, align_size, num_rows):
+    """Source token of every row of the expert-major, per-expert padded permutation that
+    moe_permute_and_pad_with_probs produces (-1 on padding rows and on the unused tail)."""
+    num_tokens, num_expert = routing_map.shape
+    routed = routing_map.to(torch.int64)
+    counts = routed.sum(dim=0)
+    padded_counts = (counts + align_size - 1) // align_size * align_size
+    starts = torch.cumsum(padded_counts, dim=0) - padded_counts
+    dest = starts.unsqueeze(0) + torch.cumsum(routed, dim=0) - routed
+    tokens = torch.arange(num_tokens, device=routing_map.device).unsqueeze(1).expand_as(dest)
+    row_index = torch.full((num_rows,), -1, dtype=torch.int32, device=routing_map.device)
+    row_index[dest[routing_map]] = tokens[routing_map].to(torch.int32)
+    return row_index, padded_counts
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "num_tokens, num_expert, hidden_size, topK, align_size, tail_rows",
+    [
+        (4096, 32, 2880, 4, 128, 0),  # gpt-oss shape: hidden size not a multiple of 128
+        (4096, 32, 2880, 4, 256, 512),  # unused capacity tail past the last expert
+        (1024, 7, 1024, 2, 128, 128),
+        (96, 16, 512, 1, 128, 0),  # some experts receive no token
+    ],
+)
+@pytest.mark.parametrize("columnwise", [False, True])
+@pytest.mark.parametrize("optimize_for_gemm", [False, True])
+def test_group_quantize_row_gather_mxfp8(
+    dtype, num_tokens, num_expert, hidden_size, topK, align_size, tail_rows, columnwise,
+    optimize_for_gemm,
+):
+    """group_quantize(x, row_index=...) is bitwise permute-and-pad + group_quantize."""
+    import transformer_engine_torch as tex
+
+    torch.manual_seed(seed)
+    scores = torch.rand(num_tokens, num_expert, device="cuda")
+    routing_map = torch.zeros(num_tokens, num_expert, dtype=torch.bool, device="cuda")
+    routing_map.scatter_(1, torch.topk(scores, topK, dim=1).indices, True)
+    if num_tokens < num_expert * 8:
+        routing_map[:, : num_expert // 2] = False  # leave some experts without tokens
+    probs = scores * routing_map
+    inp = torch.randn(num_tokens, hidden_size, dtype=dtype, device="cuda")
+    inp[:, ::97] *= 1000.0  # make the per-block scales differ
+
+    tokens_per_expert = routing_map.sum(dim=0)
+    permuted, _, _, _, padded_counts = te_permute_and_pad_with_probs(
+        inp, probs, routing_map, tokens_per_expert, align_size
+    )
+    num_used = int(padded_counts.sum().item())
+    num_rows = num_used + tail_rows
+    row_index, padded_counts_ref = _padded_permutation_row_index(
+        routing_map, align_size, num_rows
+    )
+    assert torch.equal(padded_counts.to(padded_counts_ref.device), padded_counts_ref)
+
+    # The permuted operand as a dispatcher hands it to the grouped GEMM: the rows past the
+    # last expert are left unwritten (garbage).
+    ref_rows = torch.randn(num_rows, hidden_size, dtype=dtype, device="cuda") * 1e4
+    ref_rows[:num_used] = permuted[:num_used]
+    gathered = inp[row_index.clamp(min=0).long()] * (row_index >= 0).unsqueeze(1).to(dtype)
+    torch.testing.assert_close(gathered[:num_used], ref_rows[:num_used], rtol=0, atol=0)
+
+    first_dims = padded_counts_ref.to(torch.int64)
+    tensor_offsets = torch.cat(
+        [torch.zeros(1, dtype=torch.int64, device="cuda"), torch.cumsum(first_dims, 0)]
+    ) * hidden_size
+
+    def quantize(x, rows):
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=columnwise)
+        quantizer.optimize_for_gemm = optimize_for_gemm
+        quantizer.internal = True
+        return tex.group_quantize(
+            x, quantizer, num_expert, first_dims, tensor_offsets=tensor_offsets, row_index=rows
+        )
+
+    ref = quantize(ref_rows, None)
+    out = quantize(inp, row_index)
+    assert tuple(out.logical_shape) == (num_rows, hidden_size)
+
+    # Rows past the last expert are not quantized by either path, so only the used prefix of
+    # the data and scale buffers is defined. It is a prefix in both scale layouts.
+    rowwise_scale_cols = (hidden_size // 32 + 3) // 4 * 4
+    columnwise_scale_cols = (hidden_size + 127) // 128 * 128
+    checks = [
+        ("rowwise_data", num_used * hidden_size),
+        ("scale_inv", num_used * rowwise_scale_cols),
+    ]
+    if columnwise:
+        checks += [
+            ("columnwise_data", num_used * hidden_size),
+            ("columnwise_scale_inv", num_used // 32 * columnwise_scale_cols),
+        ]
+    for name, numel in checks:
+        a = getattr(ref, name).reshape(-1).view(torch.uint8)[:numel]
+        b = getattr(out, name).reshape(-1).view(torch.uint8)[:numel]
+        assert torch.equal(a, b), f"{name}: {int((a != b).sum())} of {numel} bytes differ"
+
+
 @pytest.mark.parametrize("te_dtype", _te_dtypes)
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_expert", [7, 16])

@@ -588,6 +588,34 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
   }
 }
 
+// Row-gather grouped quantization: output rows are input[row_index[p]] (zeros for p < 0).
+inline void group_quantize_gather_fwd_helper(const NVTETensor input, const NVTETensor row_index,
+                                             NVTEGroupedTensor output,
+                                             const NVTEQuantizationConfig quant_config,
+                                             cudaStream_t stream) {
+  const NVTEScalingMode scaling_mode = nvte_grouped_tensor_scaling_mode(output);
+  NVTE_CHECK(scaling_mode == NVTE_MXFP8_1D_SCALING,
+             "Row-gather group quantization is only implemented for MXFP8, got scaling mode " +
+                 to_string(scaling_mode) + ".");
+
+  const Tensor *input_tensor = convertNVTETensorCheck(input);
+  const Tensor *row_index_tensor = convertNVTETensorCheck(row_index);
+  GroupedTensor *output_tensor = convertNVTEGroupedTensorCheck(output);
+
+  QuantizationConfig quant_config_cpp;
+  if (quant_config != nullptr) {
+    quant_config_cpp = *reinterpret_cast<QuantizationConfig *>(quant_config);
+  }
+  Tensor dummy_tensor;
+  Tensor *noop_tensor = &dummy_tensor;
+  if (quant_config_cpp.noop_tensor != nullptr) {
+    noop_tensor = convertNVTETensorCheck(quant_config_cpp.noop_tensor);
+  }
+
+  mxfp8::group_quantize_gather(input_tensor, row_index_tensor, noop_tensor, output_tensor,
+                               &quant_config_cpp, stream);
+}
+
 // Grouped scaled SwiGLU recompute: input [N, 2H] ([act|gate]) + prob [N]
 // -> columnwise MXFP8 of (silu(act) * gate) * prob.
 template <typename ParamOP, float (*OP)(float, const ParamOP &)>

@@ -103,6 +103,24 @@ void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t strea
 void nvte_group_quantize(const NVTEGroupedTensor input, NVTEGroupedTensor output,
                          const NVTEQuantizationConfig quant_config, cudaStream_t stream);
 
+/*! \brief Gathers rows of a 2D input tensor and casts them into a grouped MXFP8 tensor.
+ *
+ *  Row p of the logical [M, K] input of the cast is row row_index[p] of `input`, or zeros if
+ *  row_index[p] is negative. The result is bitwise equal to materializing that [M, K] tensor
+ *  (e.g. with a MoE permutation) and casting it with nvte_group_quantize, without writing the
+ *  gathered tensor to memory. Only the MXFP8 scaling mode and grouped outputs with a common last
+ *  dimension are supported. K * sizeof(input dtype) must be a multiple of 16 bytes.
+ *
+ *  \param[in]     input            Dense 2D input tensor [num_rows, K].
+ *  \param[in]     row_index        int32 tensor of M source row indices (negative: zero row).
+ *  \param[in,out] output           Output grouped MXFP8 tensor with logical shape [M, K].
+ *  \param[in]     quant_config     Quantization configuration.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_group_quantize_gather(const NVTETensor input, const NVTETensor row_index,
+                                NVTEGroupedTensor output, const NVTEQuantizationConfig quant_config,
+                                cudaStream_t stream);
+
 /*! \brief Casts input tensor to FP8/MXFP8/BlockwiseFP8, providing the option to immediately exit the kernel
  *         based on the value of the 'noop' tensor.
  *         The type of quantized tensor in the output depends on the scaling mode of the output

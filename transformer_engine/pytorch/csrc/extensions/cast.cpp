@@ -308,7 +308,8 @@ void compute_grouped_fp8_current_scaling_amax_and_scale(
 py::object group_quantize(const at::Tensor &input, py::handle quantizer, const size_t num_tensors,
                           std::optional<at::Tensor> first_dims, std::optional<at::Tensor> last_dims,
                           std::optional<at::Tensor> tensor_offsets,
-                          std::optional<at::Tensor> noop_flag, const py::object &output) {
+                          std::optional<at::Tensor> noop_flag, const py::object &output,
+                          std::optional<at::Tensor> row_index) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -324,6 +325,21 @@ py::object group_quantize(const at::Tensor &input, py::handle quantizer, const s
   std::vector<size_t> logical_shape;
   for (const auto &d : tensor.sizes()) {
     logical_shape.push_back(d);
+  }
+  const std::vector<size_t> input_shape = logical_shape;
+  // Row gather: the logical input is [row_index.numel(), K] with row p = tensor[row_index[p]]
+  // (zeros where row_index[p] < 0). It is gathered inside the quantization kernel.
+  if (row_index.has_value()) {
+    NVTE_CHECK(row_index->is_cuda() && row_index->scalar_type() == at::kInt &&
+                   row_index->dim() == 1 && row_index->is_contiguous(),
+               "group_quantize: row_index must be a contiguous 1D int32 CUDA tensor.");
+    NVTE_CHECK(tensor.is_contiguous(), "group_quantize: row gather requires a contiguous input.");
+    NVTE_CHECK(output.is_none(), "group_quantize: row gather does not support output reuse.");
+    NVTE_CHECK(!last_dims.has_value(),
+               "group_quantize: row gather does not support a varying last dim.");
+    NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer.ptr()),
+               "group_quantize: row gather is only supported with MXFP8 quantizers.");
+    logical_shape[0] = static_cast<size_t>(row_index->numel());
   }
   const auto logical_first_dim = logical_shape[0];
   const auto logical_last_dim = logical_shape[1];
@@ -352,8 +368,8 @@ py::object group_quantize(const at::Tensor &input, py::handle quantizer, const s
     }
   }
 
-  // Create input GroupedTensor.
-  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
+  // Create input GroupedTensor (unused by the row-gather path, which reads `tensor` directly).
+  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, input_shape);
   grouped_input_tensor.set_rowwise_data(tensor.data_ptr(),
                                         GetTransformerEngineDType(tensor.scalar_type()),
                                         std::vector<size_t>{static_cast<size_t>(tensor.numel())});
@@ -453,6 +469,16 @@ py::object group_quantize(const at::Tensor &input, py::handle quantizer, const s
         quant_config_cpp.set_noop_tensor(noop_flag_cpp->data());
       }
       quant_config_cpp.set_mxfp8_2d_quantization(mxfp8_quantizer_cpp->with_2d_quantization);
+      if (row_index.has_value()) {
+        auto input_cpp = makeTransformerEngineTensor(tensor);
+        auto row_index_cpp = makeTransformerEngineTensor(*row_index);
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_group_quantize_gather(input_cpp.data(), row_index_cpp.data(),
+                                     grouped_output_tensor_cpp.data(), quant_config_cpp,
+                                     at::cuda::getCurrentCUDAStream());
+        });
+        break;
+      }
       NVTE_SCOPED_GIL_RELEASE({
         nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
                             quant_config_cpp, at::cuda::getCurrentCUDAStream());
