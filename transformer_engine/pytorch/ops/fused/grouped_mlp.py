@@ -258,6 +258,12 @@ _DETERMINISM_REQUESTED = (
 )
 
 
+def _dglu_fast_quant_epilogue_requested() -> bool:
+    """``NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE=1``: ask the cuDNN dGLU kernel for its cheaper
+    MXFP8 quantization epilogue (bitwise equal outputs). Default off. Uncached."""
+    return bool(int(os.getenv("NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE", "0")))
+
+
 def _wrap_single_quantized_as_grouped(
     tensor: torch.Tensor,
     quantized: MXFP8Tensor | NVFP4Tensor | NVFP4TensorStorage,
@@ -1215,6 +1221,19 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             return False
         try:
             return "deterministic" in inspect.signature(kernel).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
+    def grouped_gemm_dactivation_has_fast_quant_epilogue(cls) -> bool:
+        """Whether the dactivation wrapper accepts ``fast_quant_epilogue`` (feature-detected)."""
+        try:
+            kernel = cls.grouped_gemm_dactivation_kernel()
+        except (ImportError, NotImplementedError):
+            return False
+        try:
+            return "fast_quant_epilogue" in inspect.signature(kernel).parameters
         except (TypeError, ValueError):
             return False
 
@@ -2676,6 +2695,13 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         if self._cudnn_dact_func is not None:
             fc2_dactivation_kwargs["beta_tensor"] = fc2_beta_tensor
             fc2_dactivation_kwargs["act_func"] = self._cudnn_dact_func
+            if not use_nvfp4 and _dglu_fast_quant_epilogue_requested():
+                if not self.grouped_gemm_dactivation_has_fast_quant_epilogue():
+                    raise RuntimeError(
+                        "NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE=1 requires a cuDNN front-end whose"
+                        " dGLU wrapper accepts `fast_quant_epilogue`."
+                    )
+                fc2_dactivation_kwargs["fast_quant_epilogue"] = True
         else:
             fc2_dactivation_kwargs["use_dsrelu_reuse"] = recompute_fc2_x_from_dsrelu
         if self._pass_geglu_runtime_params:
