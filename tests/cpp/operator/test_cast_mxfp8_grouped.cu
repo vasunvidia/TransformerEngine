@@ -1216,6 +1216,8 @@ namespace {
 std::vector<std::vector<size_t>> same_both_dims_partial_chunk_config = {
     {2, 192, 160},  // one full and one partial (64-row) chunk per tensor
     {4, 96, 256},   // a single partial chunk per tensor
+    {4, 160, 128},  // a last chunk of a single 32-row stage
+    {4, 32, 256},   // one 32-row stage per tensor
     {32, 2880, 320},  // 32 experts x 2880 rows (22 * 128 + 64), partial chunk along K as well
     {2, 256, 128},  // aligned control
 };

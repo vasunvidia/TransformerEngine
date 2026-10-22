@@ -2215,8 +2215,8 @@ def test_single_grouped_weight_matches_discrete_grouped_tensor_path(fp8_recipe):
 @pytest.mark.skipif(not _mxfp8_available, reason=_reason_for_no_mxfp8)
 @pytest.mark.parametrize(
     "num_groups,rows_per_group,cols",
-    [(32, 2880, 2880), (2, 192, 160), (4, 96, 256)],
-    ids=("32x2880x2880", "2x192x160", "4x96x256"),
+    [(32, 2880, 2880), (2, 192, 160), (4, 96, 256), (4, 160, 128), (4, 32, 256)],
+    ids=("32x2880x2880", "2x192x160", "4x96x256", "4x160x128", "4x32x256"),
 )
 def test_group_quantize_mxfp8_uniform_rows_not_multiple_of_128(num_groups, rows_per_group, cols):
     """Uniform grouped MXFP8 quantize whose rows per group are not a multiple of 128.
