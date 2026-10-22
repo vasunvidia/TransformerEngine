@@ -7,6 +7,7 @@ from transformer_engine_torch import (
     multi_tensor_scale,
     multi_tensor_scale_tensor,
     multi_tensor_l2norm,
+    multi_tensor_l2norm_single_launch,
     multi_tensor_unscale_l2norm,
     multi_tensor_adam,
     multi_tensor_adam_fp8,

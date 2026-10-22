@@ -40,6 +40,56 @@ void nvte_multi_tensor_l2norm_cuda(int chunk_size, NVTETensor noop_flag, NVTETen
                                    NVTETensor ret_per_tensor, int per_tensor,
                                    int max_chunks_per_tensor, cudaStream_t stream);
 
+/*!  \brief Size of the scratch space of nvte_multi_tensor_l2norm_single_launch_cuda.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]     chunk_size              Number of tensor elements processed by a CUDA block.
+ *  \param[in]     tensor_lists            2D array of input tensors (one list).
+ *  \param[in]     num_tensor_lists        Size (dim0) of tensor_lists (must be 1).
+ *  \param[in]     num_tensors_per_list    Size (dim1) of tensor_lists.
+ *  \return Number of FP32 elements of `output`: 320 per kernel launch that
+ *          nvte_multi_tensor_l2norm_cuda would make for these tensors.
+ */
+size_t nvte_multi_tensor_l2norm_single_launch_output_size(int chunk_size, NVTETensor **tensor_lists,
+                                                          const size_t num_tensor_lists,
+                                                          const size_t num_tensors_per_list);
+
+/*!  \brief Computes L2 norm for a list of tensors, with one main kernel launch.
+ *
+ * Bitwise equal to nvte_multi_tensor_l2norm_cuda with the same arguments (`ret`,
+ * `ret_per_tensor` and `noop_flag`): every block does the same arithmetic, and the block sums are
+ * added in the same order. nvte_multi_tensor_l2norm_cuda runs up to 320 blocks per kernel launch;
+ * this function runs all blocks of up to 128 tensors in one launch, which is much faster for long
+ * tensor lists. The scratch space is larger (see
+ * nvte_multi_tensor_l2norm_single_launch_output_size). All tensors must have the same dtype. Does
+ * not synchronize with the host and can be captured in a CUDA graph.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]     chunk_size              Number of tensor elements processed by a CUDA block.
+ *  \param[in,out] noop_flag               Set to 1 if a block sum is not finite.
+ *  \param[in]     tensor_lists            2D array of input tensors (one list).
+ *  \param[in]     num_tensor_lists        Size (dim0) of tensor_lists (must be 1).
+ *  \param[in]     num_tensors_per_list    Size (dim1) of tensor_lists.
+ *  \param[in]     output                  Zero-initialized FP32 scratch space of at least
+ *                                         nvte_multi_tensor_l2norm_single_launch_output_size
+ *                                         elements.
+ *  \param[in]     output_per_tensor       Zero-initialized FP32 scratch space of
+ *                                         num_tensors_per_list * max_chunks_per_tensor elements
+ *                                         (per_tensor only).
+ *  \param[out]    ret                     L2 norm of all inputs.
+ *  \param[out]    ret_per_tensor          L2 norm for each tensor.
+ *  \param[in]     per_tensor              Whether to calculate per tensor or cumulative norm.
+ *  \param[in]     max_chunks_per_tensor   Maximum number of chunks in any input tensor.
+ *  \param[in]     stream                  CUDA stream used for this operation.
+ */
+void nvte_multi_tensor_l2norm_single_launch_cuda(
+    int chunk_size, NVTETensor noop_flag, NVTETensor **tensor_lists, const size_t num_tensor_lists,
+    const size_t num_tensors_per_list, NVTETensor output, NVTETensor output_per_tensor,
+    NVTETensor ret, NVTETensor ret_per_tensor, int per_tensor, int max_chunks_per_tensor,
+    cudaStream_t stream);
+
 /*!  \brief Computes L2 norm for a list of tensors after unscaling.
  *
  * Unscaling is only done for computing the L2 norm. The tensors themselves are not updated.

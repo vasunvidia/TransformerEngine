@@ -716,6 +716,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("multi_tensor_l2norm", &transformer_engine::pytorch::multi_tensor_l2norm_cuda,
         "Computes L2 norm for a list of contiguous tensors",
         py::call_guard<py::gil_scoped_release>());
+  m.def("multi_tensor_l2norm_single_launch",
+        &transformer_engine::pytorch::multi_tensor_l2norm_single_launch_cuda,
+        "Computes L2 norm for a list of contiguous tensors with one main kernel launch (bitwise "
+        "equal to multi_tensor_l2norm)",
+        py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_unscale_l2norm",
         &transformer_engine::pytorch::multi_tensor_unscale_l2norm_cuda,
         "Computes L2 norm for a list of contiguous tensors after unscaling (unscaling is only "
