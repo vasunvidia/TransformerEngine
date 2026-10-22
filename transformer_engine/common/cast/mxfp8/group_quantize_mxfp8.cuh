@@ -1212,6 +1212,37 @@ __global__ void __launch_bounds__(CastTraits::THREADS_PER_CHUNK) group_quantize_
 }
 }  // namespace group_quantize_kernel
 
+// Row-count requirements of a grouped MXFP8 quantization whose tensors all have the same shape
+// (SAME_BOTH_DIMS), shared by group_quantize and group_quantize_gather. Only the stacked first
+// dimension has to be a multiple of tile_dim_y, so each tensor may end in a partial 128-row chunk
+// (e.g. 2880 = 22 * 128 + 64 rows), which the kernel clips to the tensor. A 32-row MXFP8 block
+// must not straddle two tensors, though, GEMM-swizzled scales are laid out in whole 128-row tiles
+// per tensor, and the DBias workspace holds one partial sum per tile_dim_y rows of each tensor.
+inline void check_same_both_dims_row_count(const size_t first_logical_dim, const size_t num_tensors,
+                                           const size_t tile_dim_y,
+                                           const bool with_gemm_swizzled_scales,
+                                           const bool with_dbias) {
+  NVTE_CHECK(first_logical_dim % num_tensors == 0,
+             "SAME_BOTH_DIMS requires an equal integral row count per tensor.");
+  const size_t rows_per_tensor = first_logical_dim / num_tensors;
+  constexpr size_t block_rows =
+      group_quantize_kernel::CastTraits<ShapeRepresentation::SAME_BOTH_DIMS>::SCALE_DIM_Y;
+  NVTE_CHECK(rows_per_tensor % block_rows == 0,
+             "Grouped MXFP8 quantization of tensors with a uniform shape requires a row count "
+             "per tensor divisible by ",
+             block_rows, " (got ", rows_per_tensor, ").");
+  NVTE_CHECK(!with_gemm_swizzled_scales || rows_per_tensor % tile_dim_y == 0,
+             "Grouped MXFP8 quantization with GEMM-swizzled scales of tensors with a uniform "
+             "shape requires a row count per tensor divisible by ",
+             tile_dim_y, " (got ", rows_per_tensor,
+             "). Quantize with compact scales and swizzle them with "
+             "nvte_swizzle_grouped_scaling_factors instead.");
+  NVTE_CHECK(!with_dbias || rows_per_tensor % tile_dim_y == 0,
+             "Grouped MXFP8 quantization with DBias of tensors with a uniform shape requires a "
+             "row count per tensor divisible by ",
+             tile_dim_y, " (got ", rows_per_tensor, ").");
+}
+
 template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &)>
 void group_quantize(const GroupedTensor *input, const GroupedTensor *activations,
@@ -1283,29 +1314,8 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   }
 
   if (shape_rep == ShapeRepresentation::SAME_BOTH_DIMS) {
-    // Only the stacked first dimension has to be a multiple of 128, so each tensor may end in a
-    // partial 128-row chunk (e.g. 2880 = 22 * 128 + 64 rows), which the kernel clips to the
-    // tensor. A 32-row MXFP8 block must not straddle two tensors, though, and GEMM-swizzled
-    // scales are laid out in whole 128-row tiles per tensor.
-    NVTE_CHECK(first_logical_dim % num_tensors == 0,
-               "SAME_BOTH_DIMS requires an equal integral row count per tensor.");
-    const size_t rows_per_tensor = first_logical_dim / num_tensors;
-    constexpr size_t block_rows = CastTraits<ShapeRepresentation::SAME_BOTH_DIMS>::SCALE_DIM_Y;
-    NVTE_CHECK(rows_per_tensor % block_rows == 0,
-               "Grouped MXFP8 quantization of tensors with a uniform shape requires a row count "
-               "per tensor divisible by ",
-               block_rows, " (got ", rows_per_tensor, ").");
-    NVTE_CHECK(!with_gemm_swizzled_scales || rows_per_tensor % tile_dim_y == 0,
-               "Grouped MXFP8 quantization with GEMM-swizzled scales of tensors with a uniform "
-               "shape requires a row count per tensor divisible by ",
-               tile_dim_y, " (got ", rows_per_tensor,
-               "). Quantize with compact scales and swizzle them with "
-               "nvte_swizzle_grouped_scaling_factors instead.");
-    // The DBias workspace holds one partial sum per tile_dim_y rows of each tensor.
-    NVTE_CHECK(!IS_DBIAS || rows_per_tensor % tile_dim_y == 0,
-               "Grouped MXFP8 quantization with DBias of tensors with a uniform shape requires a "
-               "row count per tensor divisible by ",
-               tile_dim_y, " (got ", rows_per_tensor, ").");
+    check_same_both_dims_row_count(first_logical_dim, num_tensors, tile_dim_y,
+                                   with_gemm_swizzled_scales, IS_DBIAS);
   }
 
   const int64_t *const offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
@@ -1546,6 +1556,10 @@ inline void group_quantize_gather(const Tensor *input, const Tensor *row_index, 
   const size_t tile_dim_y = get_tile_dim_y(shape_rep);
   NVTE_CHECK(first_logical_dim % tile_dim_y == 0,
              "First logical dimension of a grouped tensor must be divisible by ", tile_dim_y, ".");
+  if (shape_rep == ShapeRepresentation::SAME_BOTH_DIMS) {
+    check_same_both_dims_row_count(first_logical_dim, num_tensors, tile_dim_y,
+                                   with_gemm_swizzled_scales, /*with_dbias=*/false);
+  }
 
   const int64_t *const offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
   const int64_t *const first_dims_ptr = reinterpret_cast<const int64_t *>(output->first_dims.dptr);

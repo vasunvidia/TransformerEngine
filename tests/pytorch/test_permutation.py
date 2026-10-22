@@ -2090,6 +2090,75 @@ def test_group_quantize_row_gather_mxfp8(
         assert torch.equal(a, b), f"{name}: {int((a != b).sum())} of {numel} bytes differ"
 
 
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize(
+    "num_groups, rows_per_group, cols",
+    [(4, 160, 128), (32, 2880, 256)],
+    ids=("4x160x128", "32x2880x256"),
+)
+def test_group_quantize_row_gather_mxfp8_uniform_partial_chunks(num_groups, rows_per_group, cols):
+    """Row-gather quantize into a uniform grouped tensor (no first_dims) whose rows per group are
+    not a multiple of 128: bitwise equal to group_quantize of the gathered rows (both clip the
+    partial last chunk of every group)."""
+    import transformer_engine_torch as tex
+
+    torch.manual_seed(seed)
+    rows = num_groups * rows_per_group
+    num_src = rows // 2 + 7
+    inp = torch.randn(num_src, cols, dtype=torch.bfloat16, device="cuda")
+    inp[:, ::5] *= 1000.0  # make the per-block scales differ
+    row_index = torch.randint(-1, num_src, (rows,), dtype=torch.int32, device="cuda")
+    # Rows with a negative index are +0 (a multiply by 0 would give -0 for negative inputs).
+    gathered = torch.where(
+        (row_index >= 0).unsqueeze(1), inp[row_index.clamp(min=0).long()], torch.zeros_like(inp[:1])
+    )
+
+    def quantize(x, rows_idx):
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        quantizer.internal = True
+        return tex.group_quantize(x, quantizer, num_groups, None, row_index=rows_idx)
+
+    ref = quantize(gathered, None)
+    out = quantize(inp, row_index)
+    assert tuple(out.logical_shape) == (rows, cols)
+    rowwise_scale_cols = (cols // 32 + 3) // 4 * 4
+    columnwise_scale_cols = (cols + 127) // 128 * 128
+    for name, numel in (
+        ("rowwise_data", rows * cols),
+        ("columnwise_data", rows * cols),
+        ("scale_inv", rows * rowwise_scale_cols),
+        ("columnwise_scale_inv", rows // 32 * columnwise_scale_cols),
+    ):
+        a = getattr(ref, name).reshape(-1).view(torch.uint8)[:numel]
+        b = getattr(out, name).reshape(-1).view(torch.uint8)[:numel]
+        assert torch.equal(a, b), f"{name}: {int((a != b).sum())} of {numel} bytes differ"
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize(
+    "num_groups, rows_per_group, optimize_for_gemm, match",
+    [
+        (8, 48, False, "divisible by 32"),  # a 32-row MXFP8 block would straddle two groups
+        (4, 160, True, "GEMM-swizzled"),  # swizzled scales need whole 128-row tiles per group
+    ],
+    ids=("rows_not_multiple_of_32", "swizzled_rows_not_multiple_of_128"),
+)
+def test_group_quantize_row_gather_mxfp8_rejects_unsupported_uniform_rows(
+    num_groups, rows_per_group, optimize_for_gemm, match
+):
+    """The row-gather entry applies the same uniform-shape row-count checks as group_quantize."""
+    import transformer_engine_torch as tex
+
+    rows = num_groups * rows_per_group
+    inp = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    row_index = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+    quantizer.optimize_for_gemm = optimize_for_gemm
+    quantizer.internal = True
+    with pytest.raises(RuntimeError, match=match):
+        tex.group_quantize(inp, quantizer, num_groups, None, row_index=row_index)
+
+
 @pytest.mark.parametrize("te_dtype", _te_dtypes)
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_expert", [7, 16])
