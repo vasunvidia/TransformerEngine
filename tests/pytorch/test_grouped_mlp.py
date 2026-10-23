@@ -4249,6 +4249,161 @@ class TestGroupedMLPFastQuantEpilogue:
         assert grouped_mlp_module._dglu_fast_quant_epilogue_requested()
 
 
+class TestGroupedMLPFastGluEpilogue:
+    """``NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE=1`` passes ``fast_quant_epilogue=True`` to the cuDNN
+    GLU forward kernel (FC1 + activation + MXFP8 quantization). Its epilogue only reorganizes the
+    quantization work, so the output and every gradient must keep every bit."""
+
+    @staticmethod
+    def _trace_glu_wrapper(monkeypatch) -> list:
+        try:
+            import cudnn
+        except ImportError:
+            pytest.skip("cuDNN frontend is not installed")
+        original = cudnn.grouped_gemm_glu_wrapper_sm100
+        calls = []
+
+        @functools.wraps(original)
+        def traced(*args, **kwargs):
+            calls.append(kwargs.get("fast_quant_epilogue"))
+            return original(*args, **kwargs)
+
+        _clear_grouped_glu_kernel_caches()
+        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        fused_cls.grouped_gemm_activation_has_fast_quant_epilogue.cache_clear()
+        monkeypatch.setattr(cudnn, "grouped_gemm_glu_wrapper_sm100", traced)
+        return calls
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_outputs_and_gradients_bitwise_equal_to_default_epilogue(self, monkeypatch) -> None:
+        """Same module, inputs and deterministic mode; the flag off, on, and off again."""
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+        calls = self._trace_glu_wrapper(monkeypatch)
+        try:
+            if not fused_cls.grouped_gemm_activation_has_fast_quant_epilogue():
+                pytest.skip("the installed cuDNN frontend has no GLU fast_quant_epilogue")
+            # Deterministic dprob, so probs.grad can be compared bit for bit as well.
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            monkeypatch.delenv("NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE", raising=False)
+
+            device = torch.device("cuda")
+            dtype = torch.bfloat16
+            group_size, hidden_size, tokens_per_group = 4, 512, 512
+            split_sizes = torch.tensor(
+                [tokens_per_group] * group_size, dtype=torch.int, device=device
+            )
+            num_tokens = tokens_per_group * group_size
+            recipe = make_recipe("mxfp8")
+            generator = torch.Generator(device=device).manual_seed(4321)
+
+            def _rand(*shape, scale=1.0, requires_grad=True) -> torch.Tensor:
+                out = torch.rand(shape, generator=generator, device=device) * 2 - 1
+                out = (out * scale).to(dtype)
+                return out.requires_grad_() if requires_grad else out
+
+            # Input rows and router probabilities spanning many binades, so the MXFP8 block
+            # scales of the GLU output (row and column blocks) take many different values.
+            x = _rand(num_tokens, hidden_size, requires_grad=False)
+            x *= torch.exp2(torch.arange(num_tokens, device=device) % 16 - 8).to(dtype)[:, None]
+            x.requires_grad_()
+            probs = _rand(num_tokens, requires_grad=False)
+            probs *= torch.exp2((torch.arange(num_tokens, device=device) // 32) % 12 - 6).to(dtype)
+            probs.requires_grad_()
+            dy = _rand(num_tokens, hidden_size, requires_grad=False)
+
+            with te.quantized_model_init(enabled=True, recipe=recipe):
+                module = te.ops.Sequential(
+                    te.ops.GroupedLinear(
+                        group_size,
+                        hidden_size,
+                        2 * hidden_size,
+                        bias=False,
+                        single_grouped_weight=True,
+                        device=device,
+                        dtype=dtype,
+                        split_alignment=256,
+                    ),
+                    _make_scaled_activation("scaled_swiglu", glu_interleave_size=32),
+                    te.ops.GroupedLinear(
+                        group_size,
+                        hidden_size,
+                        hidden_size,
+                        bias=False,
+                        single_grouped_weight=True,
+                        device=device,
+                        dtype=dtype,
+                        split_alignment=256,
+                    ),
+                )
+
+            def _run(fast: bool) -> list[torch.Tensor]:
+                monkeypatch.setenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", "1" if fast else "0")
+                x.grad = None
+                probs.grad = None
+                for param in module.parameters():
+                    param.grad = None
+                with te.autocast(enabled=True, recipe=recipe):
+                    y = module(x, split_sizes, probs, split_sizes)
+                y.backward(dy)
+                outs = [y, x.grad, probs.grad] + [param.grad for param in module.parameters()]
+                return [t.detach().clone() for t in outs]
+
+            ref = _run(False)
+            forward_ops = module._module_groups[0]._forward_ops
+            assert len(forward_ops) == 1 and isinstance(forward_ops[0][0], fused_cls)
+            fast = _run(True)
+            ref_again = _run(False)
+            torch.cuda.synchronize()
+
+            # The flag reaches the cuDNN GLU wrapper only when set.
+            assert calls == [None, True, None]
+            names = ["y", "x.grad", "probs.grad"] + [name for name, _ in module.named_parameters()]
+            for name, a, b, c in zip(names, ref, fast, ref_again):
+                assert torch.isfinite(a.float()).all(), name
+                # The reference is reproducible run to run, so a fast-path difference is real.
+                a, b, c = (t.contiguous().view(torch.uint8) for t in (a, b, c))
+                assert torch.equal(a, c), f"{name}: not reproducible"
+                assert torch.equal(a, b), (
+                    f"{name} differs with the fast GLU epilogue: {int((a != b).sum())} of"
+                    f" {a.numel()} bytes"
+                )
+        finally:
+            _clear_grouped_glu_kernel_caches()
+            fused_cls.grouped_gemm_activation_has_fast_quant_epilogue.cache_clear()
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_refuses_without_frontend_support(self, monkeypatch) -> None:
+        """A front-end that lacks the knob must not silently run the default epilogue."""
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+        monkeypatch.setattr(
+            fused_cls,
+            "grouped_gemm_activation_has_fast_quant_epilogue",
+            classmethod(lambda cls: False),
+        )
+        monkeypatch.setenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", "1")
+        with pytest.raises(RuntimeError, match="fast_quant_epilogue"):
+            TestGroupedMLPFusedOp().test_grouped_mlp(
+                enable_fusion=True,
+                bias=False,
+                hidden_size=128,
+                quantization="mxfp8",
+                single_grouped_weight=True,
+                activation="scaled_swiglu",
+            )
+
+    def test_flag_parsing(self, monkeypatch) -> None:
+        monkeypatch.delenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", raising=False)
+        assert not grouped_mlp_module._glu_fast_quant_epilogue_requested()
+        monkeypatch.setenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", "0")
+        assert not grouped_mlp_module._glu_fast_quant_epilogue_requested()
+        monkeypatch.setenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", "1")
+        assert grouped_mlp_module._glu_fast_quant_epilogue_requested()
+
+
 def test_grouped_gemm_quant_cute_matches_mxfp8_quantized() -> None:
     if not mxfp8_available:
         pytest.skip(reason_for_no_mxfp8)

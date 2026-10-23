@@ -187,6 +187,17 @@ General
                  the default epilogue's. Requires a cuDNN front-end whose dGLU wrapper accepts
                  ``fast_quant_epilogue``; otherwise the backward raises.
 
+.. envvar:: NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: In the fused grouped MLP with a GLU activation and MXFP8, pass
+                 ``fast_quant_epilogue=True`` to the cuDNN front-end GLU forward kernel (FC1 +
+                 activation + MXFP8 quantization of the result), which then uses a cheaper
+                 row/column quantization epilogue. The outputs are bitwise identical to the default
+                 epilogue's. Requires a cuDNN front-end whose GLU wrapper accepts
+                 ``fast_quant_epilogue``; otherwise the forward raises.
+
 Attention Backend Selection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

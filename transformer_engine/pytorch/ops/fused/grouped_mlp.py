@@ -264,6 +264,12 @@ def _dglu_fast_quant_epilogue_requested() -> bool:
     return bool(int(os.getenv("NVTE_GROUPED_MLP_FAST_QUANT_EPILOGUE", "0")))
 
 
+def _glu_fast_quant_epilogue_requested() -> bool:
+    """``NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE=1``: ask the cuDNN GLU forward kernel for its cheaper
+    MXFP8 quantization epilogue (bitwise equal outputs). Default off. Uncached."""
+    return bool(int(os.getenv("NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE", "0")))
+
+
 def _wrap_single_quantized_as_grouped(
     tensor: torch.Tensor,
     quantized: MXFP8Tensor | NVFP4Tensor | NVFP4TensorStorage,
@@ -1239,6 +1245,19 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
 
     @classmethod
     @functools.lru_cache(maxsize=None)
+    def grouped_gemm_activation_has_fast_quant_epilogue(cls) -> bool:
+        """Whether the activation wrapper accepts ``fast_quant_epilogue`` (feature-detected)."""
+        try:
+            kernel = cls.grouped_gemm_activation_kernel()
+        except (ImportError, NotImplementedError):
+            return False
+        try:
+            return "fast_quant_epilogue" in inspect.signature(kernel).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    @functools.lru_cache(maxsize=None)
     def grouped_gemm_quant_kernel(cls) -> Callable:
         """Grouped GEMM quant kernel for block-scaled inputs."""
         from cudnn import grouped_gemm_quant_wrapper_sm100  # pylint: disable=no-name-in-module
@@ -1801,6 +1820,17 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
             fc1_activation_kwargs["discrete_col_sfd"] = not use_nvfp4
             if supports_single_group_runtime_offsets:
                 fc1_activation_kwargs["use_single_group_runtime_offsets"] = use_dense_single_group
+            if (
+                not use_nvfp4
+                and self._cudnn_act_func is not None
+                and _glu_fast_quant_epilogue_requested()
+            ):
+                if not self.grouped_gemm_activation_has_fast_quant_epilogue():
+                    raise RuntimeError(
+                        "NVTE_GROUPED_MLP_FAST_GLU_EPILOGUE=1 requires a cuDNN front-end whose"
+                        " GLU wrapper accepts `fast_quant_epilogue`."
+                    )
+                fc1_activation_kwargs["fast_quant_epilogue"] = True
         elif kernel_impl == "gemm_act_rht_amax":
             fc1_activation_kwargs["d_dtype"] = torch.bfloat16
             fc1_activation_kwargs["use_tmem_post_rht_amax"] = _use_tmem_post_rht_amax()
