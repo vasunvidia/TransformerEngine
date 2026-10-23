@@ -6,6 +6,7 @@ import random
 import pytest
 import torch
 from transformer_engine.pytorch import parallel_cross_entropy
+import transformer_engine.pytorch.triton.cross_entropy as triton_cross_entropy
 
 from utils import dtype_tols
 
@@ -523,3 +524,193 @@ def test_parallel_cross_entropy_return_argmax_nan():
             target = torch.zeros(logits.shape[:-1], dtype=torch.long, device="cuda")
             _, argmax = parallel_cross_entropy(logits, target, return_argmax=True)
             torch.testing.assert_close(argmax, torch.argmax(logits, dim=-1), rtol=0, atol=0)
+
+
+class _CountLaunches:
+    """Stand-in for a Triton kernel that counts its launches."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.launches = 0
+
+    def __getitem__(self, grid):
+        self.launches += 1
+        return self.kernel[grid]
+
+
+def _spy_backward_kernels(monkeypatch):
+    """Count launches of the row and the chunked backward kernel."""
+
+    row = _CountLaunches(triton_cross_entropy.cross_entropy_backward_kernel)
+    chunked = _CountLaunches(triton_cross_entropy.cross_entropy_backward_chunked_kernel)
+    monkeypatch.setattr(triton_cross_entropy, "cross_entropy_backward_kernel", row)
+    monkeypatch.setattr(triton_cross_entropy, "cross_entropy_backward_chunked_kernel", chunked)
+    return row, chunked
+
+
+def _bits(tensor):
+    """The raw bits of a BF16 or FP32 tensor, for exact comparisons (NaN included)."""
+
+    return tensor.view(torch.int16 if tensor.element_size() == 2 else torch.int32)
+
+
+def _chunked_bwd_logits(shape, dtype):
+    """Logits whose rows exercise the per-element edge cases of the backward."""
+
+    torch.manual_seed(2024)
+    values = torch.randn(shape, device="cuda") * 3
+    vocab = shape[-1]
+    values[0, 0] = -110.0  # exp(x - m) underflows to subnormals and zero ...
+    values[0, 0, 5] = 0.0  # ... next to the maximum
+    values[0, 1] = torch.linspace(-150.0, 0.0, vocab, device="cuda")
+    values[0, 2] = 0.0  # a constant row
+    values[1, 0, vocab // 2] = float("nan")  # a NaN row
+    values[1, 1, vocab - 1] = float("inf")  # an infinite maximum
+    return values.to(dtype)
+
+
+def _chunked_bwd_targets(shape, ignore_idx=-100):
+    """Targets on chunk edges, at both ends of the vocabulary and ignored rows."""
+
+    vocab = shape[-1]
+    target = torch.randint(0, vocab, shape[:-1], device="cuda")
+    flat = target.view(-1)
+    edges = [0, vocab - 1, 2047, 2048, 4095, 4096, 4097, 8191, 8192]
+    edges = [c for c in edges if c < vocab]
+    flat[3 : 3 + len(edges)] = torch.tensor(edges, device="cuda")
+    flat[-1] = ignore_idx
+    flat[-4] = ignore_idx
+    return target
+
+
+def _ce_loss_and_grad(values, target, label_smoothing, reduce_loss, overwrite_input):
+    logits = values.clone().requires_grad_()
+    loss = parallel_cross_entropy(
+        logits, target, label_smoothing, reduce_loss, overwrite_input=overwrite_input
+    )
+    torch.manual_seed(5)
+    external_grad = torch.rand_like(loss) + 0.5
+    loss.backward(external_grad)
+    return loss.detach(), logits.grad
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("vocab", [128256, 50257, 8192, 4097, 1000])
+@pytest.mark.parametrize("reduce_loss", [False, True], ids=["none", "mean"])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1], ids=["plain", "smoothed"])
+@pytest.mark.parametrize("overwrite_input", [False, True], ids=["safe", "destructive"])
+def test_chunked_backward_is_bitwise_identical(
+    monkeypatch, dtype, vocab, reduce_loss, label_smoothing, overwrite_input
+):
+    """NVTE_CROSS_ENTROPY_CHUNKED_BWD=1 launches the chunked backward kernel and gives the bits of
+    the row kernel's gradient, with ignored rows, targets on chunk edges, subnormal, NaN and
+    infinite values, label smoothing and a reduced loss."""
+
+    shape = (3, 7, vocab)
+    values = _chunked_bwd_logits(shape, dtype)
+    target = _chunked_bwd_targets(shape)
+
+    row, chunked = _spy_backward_kernels(monkeypatch)
+    monkeypatch.delenv("NVTE_CROSS_ENTROPY_CHUNKED_BWD", raising=False)
+    ref_loss, ref_grad = _ce_loss_and_grad(
+        values, target, label_smoothing, reduce_loss, overwrite_input
+    )
+    assert (row.launches, chunked.launches) == (1, 0)
+
+    monkeypatch.setenv("NVTE_CROSS_ENTROPY_CHUNKED_BWD", "1")
+    loss, grad = _ce_loss_and_grad(values, target, label_smoothing, reduce_loss, overwrite_input)
+    assert (row.launches, chunked.launches) == (1, 1)
+
+    assert torch.equal(_bits(loss), _bits(ref_loss))
+    assert torch.equal(_bits(grad), _bits(ref_grad))
+    # The special rows really occur.
+    assert torch.isnan(grad[1, 0]).any()
+    assert (grad[2, 6] == 0).all() and (grad[2, 3] == 0).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1], ids=["plain", "smoothed"])
+def test_chunked_backward_vocab_shard(monkeypatch, dtype, rank, label_smoothing):
+    """With a vocabulary shard (tensor parallelism), the chunked kernel subtracts the target term
+    only on the rank that holds the target column, as the row kernel does."""
+
+    world_size, vocab = 3, 9000
+    shape = (2, 9, vocab)
+    values = _chunked_bwd_logits(shape, dtype)
+    target = torch.randint(0, world_size * vocab, shape[:-1], device="cuda")
+    target.view(-1)[:6] = torch.tensor(
+        [rank * vocab, rank * vocab + vocab - 1, rank * vocab + 4096, 0, 2 * vocab, -100],
+        device="cuda",
+    )
+    _, saved, stats, target, n_non_ignore, _, _, _ = triton_cross_entropy.cross_entropy_forward(
+        values.clone(), target, label_smoothing, False, None, -100, True
+    )
+    grad_output = torch.rand(shape[:-1], device="cuda")
+
+    row, chunked = _spy_backward_kernels(monkeypatch)
+    grads = {}
+    for mode in ("0", "1"):
+        monkeypatch.setenv("NVTE_CROSS_ENTROPY_CHUNKED_BWD", mode)
+        grads[mode] = triton_cross_entropy.cross_entropy_backward(
+            saved.clone(),
+            stats,
+            target,
+            n_non_ignore,
+            grad_output,
+            label_smoothing,
+            False,
+            rank,
+            world_size,
+            -100,
+        )
+    assert (row.launches, chunked.launches) == (1, 1)
+    assert torch.equal(_bits(grads["1"]), _bits(grads["0"]))
+
+
+def test_chunked_backward_cuda_graph(monkeypatch):
+    """The chunked backward can be captured and replayed in a CUDA graph."""
+
+    monkeypatch.setenv("NVTE_CROSS_ENTROPY_CHUNKED_BWD", "1")
+    shape = (4, 3, 20000)
+    values = _chunked_bwd_logits(shape, torch.bfloat16)
+    target = _chunked_bwd_targets(shape)
+    external_grad = torch.rand(shape[:-1], device="cuda") + 0.5
+
+    def step(logits):
+        loss = parallel_cross_entropy(logits, target, overwrite_input=True)
+        loss.backward(external_grad)
+
+    row, chunked = _spy_backward_kernels(monkeypatch)
+    eager_logits = values.clone().requires_grad_()
+    step(eager_logits)
+
+    static_logits = values.clone().requires_grad_()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step(static_logits)
+    torch.cuda.current_stream().wait_stream(stream)
+    static_logits.grad = None
+    with torch.no_grad():
+        static_logits.copy_(values)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step(static_logits)
+    with torch.no_grad():
+        static_logits.copy_(values)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert (row.launches, chunked.launches) == (0, 3)  # eager, warm-up, capture
+    assert torch.equal(_bits(static_logits.grad), _bits(eager_logits.grad))
+
+
+def test_chunked_backward_rejects_unknown_mode(monkeypatch):
+    """NVTE_CROSS_ENTROPY_CHUNKED_BWD accepts 0 and 1 only."""
+
+    monkeypatch.setenv("NVTE_CROSS_ENTROPY_CHUNKED_BWD", "2")
+    logits = torch.randn(2, 3, 50, device="cuda", requires_grad=True)
+    target = torch.zeros((2, 3), dtype=torch.int64, device="cuda")
+    loss = parallel_cross_entropy(logits, target)
+    with pytest.raises(ValueError, match="NVTE_CROSS_ENTROPY_CHUNKED_BWD"):
+        loss.sum().backward()

@@ -4,6 +4,7 @@
 
 """PyTorch wrapper functions for Cross Entropy Triton kernels."""
 
+import os
 from typing import Optional, Union
 import torch
 import torch.distributed as dist
@@ -15,10 +16,33 @@ from transformer_engine.common.triton.cross_entropy import (
     cross_entropy_tp_pre_kernel,
     cross_entropy_tp_post_kernel,
     cross_entropy_backward_kernel,
+    cross_entropy_backward_chunked_kernel,
 )
 
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
 MAX_FUSED_SIZE = 65536 // 2
+
+_CHUNKED_BWD_ENV = "NVTE_CROSS_ENTROPY_CHUNKED_BWD"
+# Columns per program and warps of the chunked backward, by element size of the logits: 64
+# elements (128 or 256 bytes) per thread. On GB300 with BF16 logits of shape (8192, 3, 128256),
+# 4096 columns x 2 warps ran in 1.90 ms against 2.55 ms for the row kernel and 1.77 ms for a
+# copy of the same bytes; (8192, 4) ran in 1.93 ms, other sizes and warp counts in 2.0-2.6 ms.
+_CHUNKED_BWD_CONFIG = {2: (4096, 2), 4: (2048, 2)}
+
+
+def _use_chunked_backward() -> bool:
+    """Whether ``NVTE_CROSS_ENTROPY_CHUNKED_BWD`` selects the chunked backward kernel.
+
+    Unset, empty or ``0`` (default): one program per row (``cross_entropy_backward_kernel``).
+    ``1``: one program per chunk of a row (``cross_entropy_backward_chunked_kernel``). Both
+    give bitwise identical gradients.
+    """
+    mode = os.getenv(_CHUNKED_BWD_ENV, "").strip()
+    if mode in ("", "0"):
+        return False
+    if mode == "1":
+        return True
+    raise ValueError(f"{_CHUNKED_BWD_ENV}={mode!r}: expected 0 (default) or 1")
 
 
 def cross_entropy_forward(
@@ -149,13 +173,41 @@ def cross_entropy_backward(
     world_size: int,
     ignore_idx: int,
 ):
-    """Reconstruct the derivative in FP32 and overwrite the saved input buffer."""
+    """Reconstruct the derivative in FP32 and overwrite the saved input buffer.
+
+    ``NVTE_CROSS_ENTROPY_CHUNKED_BWD=1`` runs ``cross_entropy_backward_chunked_kernel`` (one
+    program per chunk of a row) instead of ``cross_entropy_backward_kernel`` (one program per
+    row); the gradients are bitwise identical.
+    """
 
     B, SQ, V = saved_input.shape
     n_rows = B * SQ
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     grad_output = grad_output.contiguous()
 
+    if _use_chunked_backward():
+        block_size, num_warps = _CHUNKED_BWD_CONFIG[saved_input.element_size()]
+        block_size = min(block_size, triton.next_power_of_2(V))
+        n_chunks = triton.cdiv(V, block_size)
+        cross_entropy_backward_chunked_kernel[(n_rows * n_chunks,)](
+            saved_input_ptr=saved_input,
+            Y_ptr=target,
+            stats_ptr=stats,
+            n_non_ignore_ptr=n_non_ignore if n_non_ignore is not None else stats,
+            grad_output_ptr=grad_output,
+            grad_output_stride=0 if reduce_loss else 1,
+            rank=rank,
+            world_size=world_size,
+            n_cols=V,
+            n_chunks=n_chunks,
+            ignore_idx=ignore_idx,
+            reduce_loss=reduce_loss,
+            label_smoothing=label_smoothing,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+        return saved_input
+
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     cross_entropy_backward_kernel[(n_rows,)](
         saved_input_ptr=saved_input,
         Y_ptr=target,

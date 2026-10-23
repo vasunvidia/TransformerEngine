@@ -421,6 +421,12 @@ Kernel Configuration
    :Default: ``autotune``
    :Description: Tile (``BLOCK_SIZE``, elements of the hidden dimension per program) of the MoE permutation Triton kernels of the PyTorch mask-map ``moe_permute`` / ``moe_unpermute`` / ``moe_sort_chunks_by_index`` paths. ``autotune`` (default, also when unset) lets Triton benchmark every tile at the first call of each process, so concurrent processes, such as the ranks of a data-parallel job, may select different tiles and run at different speeds. ``heuristic`` selects the tile from the kernel and the hidden size with a fixed rule (``permutation_block_size`` in ``transformer_engine/common/triton/permutation.py``), the same in every process and run; a number selects that tile for every permutation kernel. A fixed tile skips autotuning entirely. Outputs are bitwise identical for every tile, except the merging-probability gradient of ``moe_unpermute`` (its reduction over the hidden dimension follows the tile).
 
+.. envvar:: NVTE_CROSS_ENTROPY_CHUNKED_BWD
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Kernel of the backward pass of ``parallel_cross_entropy`` (PyTorch). ``0`` (default, also when unset) runs one Triton program per row of the logits. ``1`` runs one program per chunk of a row, which keeps more memory accesses in flight and skips the target-column test outside the chunk that holds the target. The input gradient is bitwise identical in both modes.
+
 Torch Compilation and Fusion
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

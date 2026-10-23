@@ -318,3 +318,79 @@ def cross_entropy_backward_kernel(
         is_target = target_is_local & (offsets == target_col)
         grad -= tl.where(is_target, 1 - label_smoothing, 0.0)
         tl.store(saved_input_ptr + offsets, grad * grad_output, mask=mask)
+
+
+@triton.jit
+def cross_entropy_backward_chunked_kernel(
+    saved_input_ptr,
+    Y_ptr,
+    stats_ptr,
+    n_non_ignore_ptr,
+    grad_output_ptr,
+    grad_output_stride,
+    rank,
+    world_size,
+    n_cols,
+    n_chunks,
+    ignore_idx,
+    reduce_loss: tl.constexpr,
+    label_smoothing: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """cross_entropy_backward_kernel with one program per chunk of BLOCK_SIZE columns of a row.
+
+    The result is bitwise that of cross_entropy_backward_kernel. Every element goes through the
+    same operations in the same order: grad = exp(x - m) / d - eps, minus (1 - label_smoothing)
+    at the target column, times grad_output, stored in the input's dtype. The backward has no
+    reduction, so how the row is split into programs does not change any value.
+
+    A chunk that covers BLOCK_SIZE columns of the row and does not hold the target column skips
+    the column mask and the subtraction of the target term, which is +0.0 for all its elements;
+    with label_smoothing == 0 it also skips the subtraction of eps, which is +0.0 then.
+    x - (+0.0) == x for every float in round-to-nearest without flush-to-zero (the kernels use
+    sub.rn without .ftz), and a NaN stays a NaN that the multiplication by grad_output turns into
+    the same canonical NaN. Other chunks run the per-element code of
+    cross_entropy_backward_kernel unchanged.
+
+    Many small programs keep more loads in flight per SM than one 1024-thread program per row,
+    and the full chunks drop the 64-bit target comparison and the select of every element.
+    """
+
+    pid = tl.program_id(0).to(tl.int64)
+    row = pid // n_chunks
+    i = (pid - row * n_chunks).to(tl.int32) * BLOCK_SIZE
+    saved_input_ptr += row * n_cols
+    offsets = i + tl.arange(0, BLOCK_SIZE)
+    y = tl.load(Y_ptr + row)
+
+    if y == ignore_idx:
+        tl.store(saved_input_ptr + offsets, 0.0, mask=offsets < n_cols)
+        return
+
+    m = tl.load(stats_ptr + row * 2)
+    d = tl.load(stats_ptr + row * 2 + 1)
+    grad_output = tl.load(grad_output_ptr + row * grad_output_stride).to(tl.float32)
+    if reduce_loss:
+        grad_output /= tl.load(n_non_ignore_ptr)
+
+    eps = label_smoothing / (n_cols * world_size)
+    vocab_start = rank * n_cols
+    target_col = y - vocab_start
+    target_is_local = (y >= vocab_start) & (y < vocab_start + n_cols)
+    chunk_has_target = target_is_local & (target_col >= i) & (target_col < i + BLOCK_SIZE)
+
+    if chunk_has_target | (i + BLOCK_SIZE > n_cols):
+        # Per-element code of cross_entropy_backward_kernel.
+        mask = offsets < n_cols
+        x = tl.load(saved_input_ptr + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        grad = tl.exp(x - m) / d - eps
+        is_target = target_is_local & (offsets == target_col)
+        grad -= tl.where(is_target, 1 - label_smoothing, 0.0)
+        tl.store(saved_input_ptr + offsets, grad * grad_output, mask=mask)
+    else:
+        # Full chunk without the target: the subtracted target term is +0.0 for every element.
+        x = tl.load(saved_input_ptr + offsets).to(tl.float32)
+        grad = tl.exp(x - m) / d
+        if label_smoothing > 0:
+            grad = grad - eps
+        tl.store(saved_input_ptr + offsets, grad * grad_output)
