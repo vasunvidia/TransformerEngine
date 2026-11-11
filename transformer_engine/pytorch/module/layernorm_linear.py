@@ -182,6 +182,9 @@ class LayerNormLinearFwdArgs:
     cpu_offloading: bool
     is_grad_enabled: bool
 
+    # --- Residual input (see LayerNormLinear's return_layernorm_input) ---
+    return_layernorm_input: bool = False
+
     def any_requires_grad(self) -> bool:
         """Whether any differentiable input requires a gradient."""
         return any(
@@ -202,6 +205,7 @@ class LayerNormLinearBwdArgs:
     # --- Incoming gradients (populated at backward entry) ---
     grad_output: Optional[torch.Tensor] = None
     grad_ln_out: Optional[torch.Tensor] = None
+    grad_inp_return: Optional[torch.Tensor] = None
 
     # --- Saved / restored tensors (populated at backward entry) ---
     inputmat: Optional[torch.Tensor] = None
@@ -233,6 +237,7 @@ class LayerNormLinearBwdArgs:
     bwd_ln_sm_margin: int = 0
     return_layernorm_output: bool = False
     return_layernorm_output_gathered: bool = False
+    return_layernorm_input: bool = False
 
     # --- Numerical / dtype config ---
     activation_dtype: Optional[torch.dtype] = None
@@ -779,6 +784,7 @@ def _layernorm_linear_setup_ctx(
     bwd_args.bwd_ln_sm_margin = fwd_args.bwd_ln_sm_margin
     bwd_args.return_layernorm_output = fwd_args.return_layernorm_output
     bwd_args.return_layernorm_output_gathered = fwd_args.return_layernorm_output_gathered
+    bwd_args.return_layernorm_input = fwd_args.return_layernorm_input
 
     # Numerical / dtype config
     bwd_args.activation_dtype = fwd_args.activation_dtype
@@ -1408,11 +1414,36 @@ def _layernorm_linear_backward_impl(
         if args.return_layernorm_output and not args.return_layernorm_output_gathered:
             dgrad = dgrad + args.grad_ln_out
 
+        # Gradient of the returned input (return_layernorm_input): the residual connection's
+        # gradient, added to the norm's input gradient. RMSNorm adds it in the backward kernel
+        # (rmsnorm_bwd_add) instead of a separate addition.
+        grad_inp_return = args.grad_inp_return
+        args.grad_inp_return = None
+        if grad_inp_return is not None:
+            grad_inp_return = grad_inp_return.contiguous().view(dgrad.shape)
+        fuse_grad_inp_return = (
+            grad_inp_return is not None
+            and args.normalization == "RMSNorm"
+            and grad_inp_return.dtype == dgrad.dtype
+            and not isinstance(grad_inp_return, QuantizedTensorStorage)
+        )
+
         # Norm gradient
         dgamma = None
         dbeta = None
         nvtx_range_push(f"{nvtx_label}.norm")
-        if args.normalization == "LayerNorm":
+        if fuse_grad_inp_return:
+            dgrad, dgamma = tex.rmsnorm_bwd_add(
+                dgrad,
+                inputmat,
+                grad_inp_return,
+                rsigma,
+                ln_weight,
+                args.bwd_ln_sm_margin,
+                args.zero_centered_gamma,
+            )
+            dbeta = None
+        elif args.normalization == "LayerNorm":
             dgrad, dgamma, dbeta = tex.layernorm_bwd(
                 dgrad,
                 inputmat,
@@ -1432,6 +1463,9 @@ def _layernorm_linear_backward_impl(
                 args.zero_centered_gamma,
             )
             dbeta = None
+        if grad_inp_return is not None and not fuse_grad_inp_return:
+            dgrad = dgrad + grad_inp_return
+        del grad_inp_return
         nvtx_range_pop(f"{nvtx_label}.norm")
         clear_tensor_data(mu)
         clear_tensor_data(rsigma)
@@ -1481,7 +1515,9 @@ class _LayerNormLinear(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         fwd_args: LayerNormLinearFwdArgs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
         """Forward pass: compute the output and set up the autograd context.
 
         The tensors are positional so autograd tracks them; they are
@@ -1489,6 +1525,9 @@ class _LayerNormLinear(torch.autograd.Function):
         argument. ``weight_workspace`` is a non-differentiable cached tensor
         passed in via ``fwd_args`` and the freshly produced workspace is
         returned as a separate output so the module can refresh its cache.
+        The fourth output is the input itself when ``fwd_args.return_layernorm_input``
+        (autograd returns it as an alias whose gradient reaches this function's
+        backward), else ``None``.
         """
         fwd_args.inp = inp
         fwd_args.ln_weight = ln_weight
@@ -1520,7 +1559,8 @@ class _LayerNormLinear(torch.autograd.Function):
             if fwd_args.backward_override is not None:
                 bwd_args.reduce_and_update_bwd_fp8_tensors = False
 
-        return out, ln_out_return, new_weight_workspace
+        inp_return = inp if fwd_args.return_layernorm_input else None
+        return out, ln_out_return, new_weight_workspace, inp_return
 
     @staticmethod
     def backward(
@@ -1528,11 +1568,13 @@ class _LayerNormLinear(torch.autograd.Function):
         grad_output: torch.Tensor,
         grad_ln_out: Optional[torch.Tensor],
         _grad_weight_workspace,
+        grad_inp_return: Optional[torch.Tensor] = None,
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """Backward pass: compute gradients and reduce FP8 scaling factors."""
         bwd_args: LayerNormLinearBwdArgs = ctx.backward_objects
         bwd_args.grad_output = grad_output
         bwd_args.grad_ln_out = grad_ln_out
+        bwd_args.grad_inp_return = grad_inp_return
         bwd_args.setup_saved_tensors(ctx)
         nvtx_label = "transformer_engine._LayerNormLinear.backward"
         if bwd_args.ub_name is not None:
@@ -1608,6 +1650,18 @@ class LayerNormLinear(TransformerEngineBaseModule):
           forward pass.
     name : str, default = None
         name of the module, currently used for debugging purposes.
+    return_layernorm_input : bool, default = False
+                            if set to ``True``, the input tensor is also returned from the
+                            forward (last in the returned tuple), as an alias whose gradient is
+                            added to the input gradient inside this module's backward.
+                            Use it as the residual of a residual connection that adds the input
+                            back after this module: the residual gradient is then accumulated by
+                            the normalization backward instead of a separate addition. With
+                            RMSNorm it is passed to ``rmsnorm_bwd_add``, whose opt-in single-sweep
+                            kernel (``NVTE_RMSNORM_BWD_SINGLE_SWEEP=1``) gives bitwise the result
+                            of the separate addition; with LayerNorm (or a residual gradient of
+                            another dtype) the gradients are added after the normalization
+                            backward.
 
     Parallelism parameters
     ----------------------
@@ -1686,6 +1740,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         delay_wgrad_compute: bool = False,
         symmetric_ar_type: Optional[str] = None,
         name: Optional[str] = None,
+        return_layernorm_input: bool = False,
     ) -> None:
         super().__init__(name)
 
@@ -1704,6 +1759,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         )
         self.zero_centered_gamma = zero_centered_gamma
         self.symmetric_ar_type = symmetric_ar_type
+        self.return_layernorm_input = return_layernorm_input
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute, ub_bulk_wgrad)
 
@@ -2215,10 +2271,11 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 # misc
                 cpu_offloading=is_cpu_offload_enabled(),
                 is_grad_enabled=is_grad_enabled,
+                return_layernorm_input=self.return_layernorm_input,
             )
 
             if is_grad_enabled:
-                out, ln_out, new_weight_workspace = _LayerNormLinear.apply(
+                out, ln_out, new_weight_workspace, inp_return = _LayerNormLinear.apply(
                     inp,
                     self.layer_norm_weight,
                     self.layer_norm_bias,
@@ -2227,7 +2284,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
                     fwd_args,
                 )
             else:
-                out, ln_out, new_weight_workspace = _LayerNormLinear.forward(
+                out, ln_out, new_weight_workspace, inp_return = _LayerNormLinear.forward(
                     None,
                     inp,
                     self.layer_norm_weight,
@@ -2248,13 +2305,16 @@ class LayerNormLinear(TransformerEngineBaseModule):
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(bias_tensor, self.activation_dtype)
 
+        outputs = [out]
         if self.return_bias:
-            if self.return_layernorm_output:
-                return out, cast_if_needed(bias_tensor, self.activation_dtype), ln_out
-            return out, cast_if_needed(bias_tensor, self.activation_dtype)
+            outputs.append(cast_if_needed(bias_tensor, self.activation_dtype))
         if self.return_layernorm_output:
-            return out, ln_out
-        return out
+            outputs.append(ln_out)
+        if self.return_layernorm_input:
+            outputs.append(inp_return)
+        if len(outputs) == 1:
+            return out
+        return tuple(outputs)
 
     def _get_quantizers(self, fp8_output, fp8_grad, is_grad_enabled):
         if not self.fp8:
@@ -2360,13 +2420,16 @@ class LayerNormLinear(TransformerEngineBaseModule):
 
         if output_quantizer is not None:
             raise NotImplementedError("ONNX export of quantized output is not supported")
-        if self.return_layernorm_output and self.return_bias:
-            return output, bias_tensor.to(inp_dtype), ln_out_return
-        if self.return_layernorm_output:
-            return output, ln_out_return
+        outputs = [output]
         if self.return_bias:
-            return output, bias_tensor.to(inp_dtype)
-        return output
+            outputs.append(bias_tensor.to(inp_dtype))
+        if self.return_layernorm_output:
+            outputs.append(ln_out_return)
+        if self.return_layernorm_input:
+            outputs.append(inp)
+        if len(outputs) == 1:
+            return output
+        return tuple(outputs)
 
     def _customize_quantizers_float8_current_scaling(self, fwd: bool, recipe: Recipe) -> None:
         """Customize quantizers based on current scaling recipe + layernorm_linear."""

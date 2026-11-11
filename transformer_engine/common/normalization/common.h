@@ -319,16 +319,18 @@ void rmsnorm_fwd_mxfp8(const Tensor& x, const Tensor& gamma, float epsilon, Tens
 
 // Opt-in single-sweep RMSNorm backward (rmsnorm/rmsnorm_bwd_single_sweep.cu): one kernel for dx
 // and dgamma, selected by NVTE_RMSNORM_BWD_SINGLE_SWEEP=1 (or nvte_enable_rmsnorm_bwd_single_sweep)
-// for the configurations it supports.
+// for the configurations it supports. `add` (nullable): residual gradient added to dx
+// (rmsnorm_bwd_add), bitwise equal to a separate BF16 addition of the rmsnorm_bwd result.
 bool use_rmsnorm_bwd_single_sweep();
 bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor& dz, const Tensor& x,
                                                const Tensor& rsigma, const Tensor& gamma,
                                                const Tensor& dx, const Tensor& dgamma,
-                                               bool zero_centered_gamma, std::string* reason);
+                                               const Tensor* add, bool zero_centered_gamma,
+                                               std::string* reason);
 size_t rmsnorm_bwd_single_sweep_workspace_bytes(size_t rows, size_t cols);
 void rmsnorm_bwd_single_sweep(const Tensor& dz, const Tensor& x, const Tensor& rsigma,
-                              const Tensor& gamma, Tensor* dx, Tensor* dgamma, void* workspace,
-                              bool zero_centered_gamma, cudaStream_t stream);
+                              const Tensor& gamma, const Tensor* add, Tensor* dx, Tensor* dgamma,
+                              void* workspace, bool zero_centered_gamma, cudaStream_t stream);
 
 }  // namespace normalization
 }  // namespace transformer_engine

@@ -486,9 +486,13 @@ LayerNorm/RMSNorm SM Margins
                  :envvar:`NVTE_NORM_BWD_USE_CUDNN`. Supported: BF16 input, gradient and weight,
                  FP32 ``rsigma``, a number of rows (tokens) divisible by 32, a hidden size divisible
                  by 32 and at most 3072, 16-byte aligned tensors, and compute capability 9.0 or
-                 newer. Other configurations, and ``rmsnorm_bwd_add``, use the regular backward;
-                 the reason is printed once. The kernel does not apply
-                 :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` (it launches short CTAs, rows / 8 of them).
+                 newer. Other configurations use the regular backward; the reason is printed once.
+                 ``rmsnorm_bwd_add`` (``te.ops`` ``MakeExtraOutput`` + ``RMSNorm``,
+                 ``LayerNormLinear(return_layernorm_input=True)``) is covered too: the kernel adds
+                 the residual gradient to the BF16-rounded ``dx`` (one fp32 sum, rounded once),
+                 bitwise the result of the single-sweep backward followed by a separate addition.
+                 The kernel does not apply :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` (it launches
+                 short CTAs, rows / 8 of them).
                  Results agree with the regular backward to within BF16 rounding (the arithmetic
                  order differs, so they are not bitwise identical) and are deterministic; the
                  kernel can be captured in CUDA graphs. The variable is read at every call.

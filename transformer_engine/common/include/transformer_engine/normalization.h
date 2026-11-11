@@ -156,6 +156,12 @@ void nvte_rmsnorm_bwd(const NVTETensor dz, const NVTETensor x, const NVTETensor 
  * Calling this function with workspace set to an empty tensor will not perform the operation,
  * but instead set the shape and type of the workspace tensor to the required values.
  *
+ * With NVTE_RMSNORM_BWD_SINGLE_SWEEP=1 (or nvte_enable_rmsnorm_bwd_single_sweep), supported
+ * configurations (those of nvte_rmsnorm_bwd plus a BF16, 16-byte aligned `add` shaped like x)
+ * run the single-sweep kernel, which adds `add` to the BF16-rounded dx (one fp32 sum, rounded
+ * once): bitwise the single-sweep nvte_rmsnorm_bwd followed by a separate BF16 addition. The
+ * regular kernels add in fp32 before rounding dx.
+ *
  *  \param[in]     dz                  Incoming gradient tensor of shape [..., H].
  *  \param[in]     x                   Forward input tensor of shape [..., H].
  *  \param[in]     add                 Additional tensor to add to output gradient [..., H].

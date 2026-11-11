@@ -43,10 +43,18 @@
  *  Transformer Engine or cuDNN backends but agree to within bf16 rounding. Both outputs are
  *  bitwise reproducible from run to run.
  *
+ *  Residual gradient (rmsnorm_bwd_add): with an `add` tensor, the kernel adds it to dx in the
+ *  final store, dx = bf16(bf16(dx) + add), with the sum formed in fp32 and rounded once. That is
+ *  exactly what the single-sweep rmsnorm_bwd followed by a separate BF16 addition (PyTorch's
+ *  autograd gradient accumulation, `dx + add`) produces, bit for bit, so folding a residual
+ *  gradient into the normalization backward removes the addition kernel without changing the
+ *  result. (The regular rmsnorm_bwd_add kernels instead add in fp32 before the single rounding
+ *  of dx.) `add` is read with one 16-byte load per thread and row, next to the dx store.
+ *
  *  Origin: the single-sweep cluster kernel of the gpt-oss-20b "plus" workload
- *  (rmsnorm_bwd_cuda.cu, rmsnorm_bwd_single_sweep_kernel<8, false, false, false>, NVIDIA
- *  first-party), reduced to the plain backward: no residual-gradient add, no MXFP8 gradient
- *  emission, no dbias, dgamma written to the output tensor (not accumulated into main_grad).
+ *  (rmsnorm_bwd_cuda.cu, rmsnorm_bwd_single_sweep_kernel<8, HAS_RES, false, false>, NVIDIA
+ *  first-party), without the MXFP8 gradient emission and dbias, dgamma written to the output
+ *  tensor (not accumulated into main_grad).
  */
 
 #include <cooperative_groups.h>
@@ -92,6 +100,7 @@ struct Params {
   const uint16_t *x;      // [M, N] bf16
   const float *rsigma;    // [M]
   const uint16_t *gamma;  // [N] bf16
+  const uint16_t *add;    // [M, N] bf16 residual gradient added to dx, or nullptr
   uint16_t *dx;           // [M, N] bf16
   uint16_t *dgamma;       // [N] bf16
   float *part;            // [M / 32, N] fp32 partials of the 32-row blocks
@@ -190,6 +199,18 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
 }
 __device__ __forceinline__ float4 ld_cg_f4(const float *p) {
   return __ldcg(reinterpret_cast<const float4 *>(p));
+}
+// 8 bf16 sums a + b, each formed in fp32 and rounded once (= a BF16 tensor addition).
+__device__ __forceinline__ uint4 add_bf16x8(const uint4 a, const uint4 b) {
+  const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+  const uint32_t bw[4] = {b.x, b.y, b.z, b.w};
+  uint32_t o[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    o[i] = pack_bf16x2(__fadd_rn(bf2f(aw[i], 0), bf2f(bw[i], 0)),
+                       __fadd_rn(bf2f(aw[i], 1), bf2f(bw[i], 1)));
+  }
+  return make_uint4(o[0], o[1], o[2], o[3]);
 }
 
 // One CTA sums `nrows` fp32 rows of stride N into dst, rows in order (deterministic).
@@ -400,12 +421,25 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
     s_flag[0] = last;
   }
 
-  // ---- dx (bf16, staged in shared memory) to global
+  // ---- dx (bf16, staged in shared memory) to global, plus the residual gradient if given
   if (owner) {
+    if (p.add != nullptr) {
+      uint4 a[kRows];
 #pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-      *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) =
-          *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
+      for (int r = 0; r < kRows; ++r) {  // all loads in flight before the first store
+        a[r] = __ldg(reinterpret_cast<const uint4 *>(p.add + static_cast<size_t>(row0 + r) * N + c0));
+      }
+#pragma unroll
+      for (int r = 0; r < kRows; ++r) {
+        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) =
+            add_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), a[r]);
+      }
+    } else {
+#pragma unroll
+      for (int r = 0; r < kRows; ++r) {
+        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) =
+            *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
+      }
     }
   }
 
@@ -524,7 +558,7 @@ WorkspaceLayout workspace_layout(const size_t rows, const size_t cols) {
 bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x,
                                                const Tensor &rsigma, const Tensor &gamma,
                                                const Tensor &dx, const Tensor &dgamma,
-                                               const bool zero_centered_gamma,
+                                               const Tensor *add, const bool zero_centered_gamma,
                                                std::string *reason) {
   auto fail = [&](const std::string &why) {
     if (reason != nullptr) *reason = why;
@@ -559,6 +593,18 @@ bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x,
       !is_ptr_aligned<4>(rsigma.data.dptr) || !is_ptr_aligned<2>(dgamma.data.dptr)) {
     return fail("needs 16-byte aligned dz, x, dx and gamma");
   }
+  if (add != nullptr) {
+    if (add->data.dtype != bf16) {
+      return fail(concat_strings("needs a BF16 residual gradient (got ", to_string(add->data.dtype),
+                                 ")"));
+    }
+    if (add->data.shape != x.data.shape) {
+      return fail("needs a residual gradient shaped like x");
+    }
+    if (!is_ptr_aligned(add->data.dptr)) {
+      return fail("needs a 16-byte aligned residual gradient");
+    }
+  }
   if (zero_centered_gamma && use_zero_centered_gamma_in_weight_dtype()) {
     return fail("zero-centered gamma in weight dtype (NVTE_ZERO_CENTERED_GAMMA_IN_WTYPE)");
   }
@@ -574,8 +620,9 @@ size_t rmsnorm_bwd_single_sweep_workspace_bytes(const size_t rows, const size_t 
 }
 
 void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &rsigma,
-                              const Tensor &gamma, Tensor *dx, Tensor *dgamma, void *workspace,
-                              const bool zero_centered_gamma, cudaStream_t stream) {
+                              const Tensor &gamma, const Tensor *add, Tensor *dx, Tensor *dgamma,
+                              void *workspace, const bool zero_centered_gamma,
+                              cudaStream_t stream) {
   const auto [rows, cols] = x.flat_2d_dims();
   const Plan plan = make_plan(rows);
   const WorkspaceLayout layout = workspace_layout(rows, cols);
@@ -587,6 +634,7 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
   p.x = static_cast<const uint16_t *>(x.data.dptr);
   p.rsigma = static_cast<const float *>(rsigma.data.dptr);
   p.gamma = static_cast<const uint16_t *>(gamma.data.dptr);
+  p.add = add != nullptr ? static_cast<const uint16_t *>(add->data.dptr) : nullptr;
   p.dx = static_cast<uint16_t *>(dx->data.dptr);
   p.dgamma = static_cast<uint16_t *>(dgamma->data.dptr);
   p.part = reinterpret_cast<float *>(ws + layout.part);

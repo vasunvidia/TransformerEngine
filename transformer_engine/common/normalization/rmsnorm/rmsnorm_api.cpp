@@ -27,14 +27,15 @@ namespace {
 // Whether rmsnorm_bwd takes the opt-in single-sweep kernel (NVTE_RMSNORM_BWD_SINGLE_SWEEP=1).
 // When it is enabled but cannot take a configuration, the regular backward runs instead and
 // the reason is printed once per distinct reason.
+// `add` is the residual gradient of rmsnorm_bwd_add (nullptr for rmsnorm_bwd).
 bool select_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &rsigma,
                                      const Tensor &gamma, const Tensor &dx, const Tensor &dgamma,
-                                     const bool zero_centered_gamma) {
+                                     const Tensor *add, const bool zero_centered_gamma) {
   if (!use_rmsnorm_bwd_single_sweep()) {
     return false;
   }
   std::string reason;
-  if (is_supported_by_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, dx, dgamma,
+  if (is_supported_by_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, dx, dgamma, add,
                                                zero_centered_gamma, &reason)) {
     return true;
   }
@@ -193,7 +194,8 @@ void rmsnorm_bwd(const Tensor &dz, const Tensor &x, const Tensor &rsigma, const 
   // Opt-in single-sweep kernel (NVTE_RMSNORM_BWD_SINGLE_SWEEP=1), ahead of the TE and cuDNN
   // backends. It takes the workspace query and the launch alike; a workspace sized for another
   // backend (the setting changed between the two calls) sends the launch to the regular path.
-  if (select_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, *dx, *dgamma, zero_centered_gamma)) {
+  if (select_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, *dx, *dgamma, nullptr,
+                                      zero_centered_gamma)) {
     const size_t bytes = rmsnorm_bwd_single_sweep_workspace_bytes(rows, cols);
     if (workspace->data.numel() == 0) {
       workspace->data.shape = {bytes};
@@ -201,7 +203,7 @@ void rmsnorm_bwd(const Tensor &dz, const Tensor &x, const Tensor &rsigma, const 
       return;
     }
     if (workspace->data.dtype == DType::kByte && workspace->data.shape == Shape{bytes}) {
-      rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, dx, dgamma, workspace->data.dptr,
+      rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, nullptr, dx, dgamma, workspace->data.dptr,
                                zero_centered_gamma, stream);
       return;
     }
@@ -276,6 +278,23 @@ void rmsnorm_bwd_add(const Tensor &dz, const Tensor &x, const Tensor &add, const
     CheckInputTensor(gamma, "gamma");
     CheckOutputTensor(*dx, "dx");
     CheckOutputTensor(*dgamma, "dgamma");
+  }
+
+  // Opt-in single-sweep kernel with the residual gradient folded into its dx store (bitwise
+  // equal to its rmsnorm_bwd followed by a separate BF16 addition); see rmsnorm_bwd above.
+  if (select_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, *dx, *dgamma, &add,
+                                      zero_centered_gamma)) {
+    const size_t bytes = rmsnorm_bwd_single_sweep_workspace_bytes(rows, cols);
+    if (workspace->data.numel() == 0) {
+      workspace->data.shape = {bytes};
+      workspace->data.dtype = DType::kByte;
+      return;
+    }
+    if (workspace->data.dtype == DType::kByte && workspace->data.shape == Shape{bytes}) {
+      rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, &add, dx, dgamma, workspace->data.dptr,
+                               zero_centered_gamma, stream);
+      return;
+    }
   }
 
   NVTE_Norm_Backend norm_backend;
@@ -373,6 +392,6 @@ bool nvte_rmsnorm_bwd_uses_single_sweep(const NVTETensor dz, const NVTETensor x,
          is_supported_by_rmsnorm_bwd_single_sweep(
              *convertNVTETensorCheck(dz), *convertNVTETensorCheck(x),
              *convertNVTETensorCheck(rsigma), *convertNVTETensorCheck(gamma),
-             *convertNVTETensorCheck(dx), *convertNVTETensorCheck(dgamma), zero_centered_gamma,
-             nullptr);
+             *convertNVTETensorCheck(dx), *convertNVTETensorCheck(dgamma), nullptr,
+             zero_centered_gamma, nullptr);
 }
