@@ -307,3 +307,76 @@ def test_layernorm_linear_rmsnorm():
     assert_bf16_close(dx, dx_ref, "dx")
     for g, g_ref in zip(grads, grads_ref):
         assert_bf16_close(g, g_ref, "param grad")
+
+
+_RTC_CONTEXT_SCRIPT = """
+import os
+import sys
+import torch
+import transformer_engine.pytorch as te
+import transformer_engine_torch as tex
+
+ENV = "NVTE_RMSNORM_BWD_SINGLE_SWEEP"
+first_single_sweep = sys.argv[1] == "1"
+
+
+def inputs(shape, seed=0):
+    torch.manual_seed(seed)
+    x = (torch.randn(shape, device="cuda") * 2.0).bfloat16()
+    dz = torch.randn(shape, device="cuda").bfloat16()
+    gamma = (1.0 + 0.1 * torch.randn(shape[-1], device="cuda")).bfloat16()
+    rsigma = torch.rsqrt(x.float().pow(2).mean(dim=-1) + 1e-5).reshape(-1).contiguous()
+    return dz, x, rsigma, gamma
+
+
+# 1. Large-hidden backward on the main thread (single-sweep or stock), then the stock backward:
+#    loads TE's RTC norm kernels from the main thread and fills the caching allocator.
+for shape in ((8192, 3, 2880), (4096, 3072)):
+    os.environ[ENV] = "1" if first_single_sweep else "0"
+    tex.rmsnorm_bwd(*inputs(shape), 0, False)
+    os.environ[ENV] = "0"
+    tex.rmsnorm_bwd(*inputs((2048, shape[-1])), 0, False)
+torch.cuda.synchronize()
+
+# 2. te.RMSNorm: its backward runs on PyTorch's autograd worker thread, whose allocations the
+#    cache serves, so its first CUDA call can be a driver call of TE's RTC (occupancy query).
+for hidden in (2880, 3072):
+    norm = te.RMSNorm(hidden, eps=1e-5, device="cuda", dtype=torch.bfloat16)
+    inp = torch.randn(2048, 3, hidden, device="cuda").bfloat16()
+    grad = torch.randn_like(inp)
+    results = []
+    for enabled in ("0", "1"):
+        os.environ[ENV] = enabled
+        norm.zero_grad(set_to_none=True)
+        x = inp.clone().requires_grad_(True)
+        norm(x).backward(grad)
+        results.append((x.grad, norm.weight.grad.clone()))
+    torch.cuda.synchronize()
+    (dx0, dw0), (dx1, dw1) = results
+    torch.testing.assert_close(dx1.double(), dx0.double(), rtol=2**-7, atol=1e-3)
+    torch.testing.assert_close(
+        dw1.double(), dw0.double(), rtol=2**-7, atol=1e-4 * dw0.abs().max().item()
+    )
+print("OK")
+"""
+
+
+@pytest.mark.parametrize("first_single_sweep", [True, False])
+def test_stock_backward_after_large_hidden(first_single_sweep):
+    """Regression: a large-hidden backward on the main thread, then the stock backward and
+    te.RMSNorm (backward on the autograd thread) in the same process.
+
+    Used to fail in the stock half with "invalid device context" from TE's RTC occupancy query
+    (rtc.cpp did not call ensure_context_exists() before cuOccupancyMaxActiveBlocksPerMultiprocessor
+    / cuFuncSetAttribute). Runs in a fresh process: the failure needs a fresh autograd thread.
+    """
+    env = dict(os.environ)
+    env.pop(ENV, None)
+    result = subprocess.run(
+        [sys.executable, "-c", _RTC_CONTEXT_SCRIPT, "1" if first_single_sweep else "0"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

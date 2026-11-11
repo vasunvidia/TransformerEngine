@@ -135,16 +135,24 @@ CUfunction Kernel::get_function(int device_id) {
   return functions_[device_id];
 }
 
+// The driver calls below use the calling thread's current context, like launch() and
+// launch_cooperative(), so they need ensure_context_exists() as well: a thread that has made no
+// CUDA runtime call yet (e.g. PyTorch's autograd worker thread when the caching allocator serves
+// every allocation) has no current context, and get_function() only sets one in the thread that
+// first loads the module.
 void Kernel::set_function_cache_config(int device_id, CUfunc_cache cache_config) {
+  cuda_driver::ensure_context_exists();
   NVTE_CALL_CHECK_CUDA_DRIVER(cuFuncSetCacheConfig, get_function(device_id), cache_config);
 }
 
 void Kernel::set_function_attribute(int device_id, CUfunction_attribute attr, int value) {
+  cuda_driver::ensure_context_exists();
   NVTE_CALL_CHECK_CUDA_DRIVER(cuFuncSetAttribute, get_function(device_id), attr, value);
 }
 
 int Kernel::occupancy_max_active_blocks_per_sm(int device_id, int block_size,
                                                std::size_t dynamic_smem_bytes) {
+  cuda_driver::ensure_context_exists();
   int num_blocks = 0;
   NVTE_CALL_CHECK_CUDA_DRIVER(cuOccupancyMaxActiveBlocksPerMultiprocessor, &num_blocks,
                               get_function(device_id), block_size, dynamic_smem_bytes);
