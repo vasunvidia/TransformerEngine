@@ -1315,7 +1315,7 @@ class TestMultiTensorAdamFlatCapturable:
             multi_tensor_adam_flat_capturable(*args, torch.zeros(7, 33, device="cuda"), 1)
         with pytest.raises(RuntimeError, match="Float32"):
             multi_tensor_adam_flat_capturable(
-                *args, torch.zeros(7, 1, dtype=torch.float64, device="cuda"), 1
+                *args, torch.zeros(7, 1, dtype=torch.bfloat16, device="cuda"), 1
             )
         with pytest.raises(RuntimeError, match="device"):
             multi_tensor_adam_flat_capturable(*args, torch.zeros(7, 1), 1)
