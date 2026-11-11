@@ -8,6 +8,7 @@
 
 #include "common.h"
 
+#include <atomic>
 #include <bitset>
 #include <cstdint>
 #include <cstdlib>
@@ -572,6 +573,21 @@ bool& _zero_centered_gamma_in_weight_dtype() {
 
 bool& use_zero_centered_gamma_in_weight_dtype() { return _zero_centered_gamma_in_weight_dtype(); }
 
+// -1: follow NVTE_RMSNORM_BWD_SINGLE_SWEEP (read at every call, so it can be toggled at run
+// time); 0 / 1: forced by nvte_enable_rmsnorm_bwd_single_sweep.
+std::atomic<int>& _rmsnorm_bwd_single_sweep_override() {
+  static std::atomic<int> mode{-1};
+  return mode;
+}
+
+bool use_rmsnorm_bwd_single_sweep() {
+  const int mode = _rmsnorm_bwd_single_sweep_override().load(std::memory_order_relaxed);
+  if (mode >= 0) {
+    return mode != 0;
+  }
+  return transformer_engine::getenv<bool>("NVTE_RMSNORM_BWD_SINGLE_SWEEP");
+}
+
 bool use_cudnn_mxfp8_norm_output_in_input_dtype() {
   static bool flag =
       transformer_engine::getenv<bool>("NVTE_CUDNN_MXFP8_NORM_OUTPUT_IN_INPUT_DTYPE");
@@ -589,6 +605,12 @@ void nvte_enable_cudnn_norm_fwd(bool enable) {
 void nvte_enable_cudnn_norm_bwd(bool enable) {
   NVTE_API_CALL(nvte_enable_cudnn_norm_bwd);
   transformer_engine::normalization::_cudnn_norm_bwd_flag() = enable;
+}
+
+void nvte_enable_rmsnorm_bwd_single_sweep(bool enable) {
+  NVTE_API_CALL(nvte_enable_rmsnorm_bwd_single_sweep);
+  transformer_engine::normalization::_rmsnorm_bwd_single_sweep_override().store(
+      enable ? 1 : 0, std::memory_order_relaxed);
 }
 
 // Only for testing, not thread-safe

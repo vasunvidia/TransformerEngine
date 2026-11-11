@@ -315,3 +315,147 @@ INSTANTIATE_TEST_SUITE_P(
       std::to_string(std::get<7>(info.param));
     return name;
   });
+
+// Opt-in single-sweep RMSNorm backward (NVTE_RMSNORM_BWD_SINGLE_SWEEP /
+// nvte_enable_rmsnorm_bwd_single_sweep). BF16 only. Checks that the kernel is selected exactly
+// for the supported shapes, that dx and dgamma match the CPU reference and the regular backward
+// to within BF16 rounding (the arithmetic order differs, so the bits may differ), and that two
+// runs give bitwise identical results. Unsupported shapes must fall back to the regular backward
+// and give exactly its results.
+namespace {
+
+void run_rmsnorm_bwd(Tensor &dz, Tensor &x, Tensor &rsigma, Tensor &gamma, Tensor &dx,
+                     Tensor &dgamma, const int sm_count, const bool zero_centered_gamma) {
+  Tensor workspace;
+  nvte_rmsnorm_bwd(dz.data(), x.data(), rsigma.data(), gamma.data(), dx.data(), dgamma.data(),
+                   workspace.data(), sm_count, zero_centered_gamma, 0);
+  workspace = Tensor("workspace", workspace.rowwise_shape(), workspace.dtype());
+  nvte_rmsnorm_bwd(dz.data(), x.data(), rsigma.data(), gamma.data(), dx.data(), dgamma.data(),
+                   workspace.data(), sm_count, zero_centered_gamma, 0);
+}
+
+bool bitwise_equal(Tensor &a, Tensor &b, const size_t numel) {
+  a.to_cpu();
+  b.to_cpu();
+  return std::memcmp(a.rowwise_cpu_dptr<bf16>(), b.rowwise_cpu_dptr<bf16>(),
+                     numel * sizeof(bf16)) == 0;
+}
+
+}  // namespace
+
+class RMSNormBwdSingleSweepTestSuite
+    : public ::testing::TestWithParam<std::tuple<std::pair<size_t, size_t>, bool>> {};
+
+TEST_P(RMSNormBwdSingleSweepTestSuite, TestRMSNormBwdSingleSweep) {
+  if (getDeviceComputeCapability() < hopperComputeCapability) {
+    GTEST_SKIP() << "The single-sweep RMSNorm backward requires SM 9.0+";
+  }
+  const size_t N = std::get<0>(GetParam()).first;
+  const size_t H = std::get<0>(GetParam()).second;
+  const bool zero_centered_gamma = std::get<1>(GetParam());
+  const bool expect_single_sweep = N % 32 == 0 && H % 32 == 0 && H <= 3072;
+  const DType t = DType::kBFloat16;
+
+  Tensor input("input", std::vector<size_t>{N, H}, t);
+  Tensor z("z", std::vector<size_t>{N, H}, t);
+  Tensor gamma("gamma", std::vector<size_t>{H}, t);
+  Tensor rsigma("rsigma", std::vector<size_t>{N}, DType::kFloat32);
+  Tensor dz("dz", std::vector<size_t>{N, H}, t);
+  Tensor dx_default("dx_default", std::vector<size_t>{N, H}, t);
+  Tensor dgamma_default("dgamma_default", std::vector<size_t>{H}, t);
+  Tensor dx("dx", std::vector<size_t>{N, H}, t);
+  Tensor dgamma("dgamma", std::vector<size_t>{H}, t);
+  Tensor dx2("dx2", std::vector<size_t>{N, H}, t);
+  Tensor dgamma2("dgamma2", std::vector<size_t>{H}, t);
+  fillUniform(&input);
+  fillUniform(&gamma);
+  fillUniform(&dz);
+
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  const float epsilon = 1e-5;
+  Tensor workspace_fwd;
+  nvte_rmsnorm_fwd(input.data(), gamma.data(), epsilon, z.data(), rsigma.data(),
+                   workspace_fwd.data(), prop.multiProcessorCount, zero_centered_gamma, 0);
+  workspace_fwd = Tensor("workspace", workspace_fwd.rowwise_shape(), workspace_fwd.dtype());
+  nvte_rmsnorm_fwd(input.data(), gamma.data(), epsilon, z.data(), rsigma.data(),
+                   workspace_fwd.data(), prop.multiProcessorCount, zero_centered_gamma, 0);
+
+  nvte_enable_rmsnorm_bwd_single_sweep(false);
+  EXPECT_FALSE(nvte_rmsnorm_bwd_uses_single_sweep(dz.data(), input.data(), rsigma.data(),
+                                                  gamma.data(), dx.data(), dgamma.data(),
+                                                  zero_centered_gamma));
+  run_rmsnorm_bwd(dz, input, rsigma, gamma, dx_default, dgamma_default, prop.multiProcessorCount,
+                  zero_centered_gamma);
+
+  nvte_enable_rmsnorm_bwd_single_sweep(true);
+  EXPECT_EQ(nvte_rmsnorm_bwd_uses_single_sweep(dz.data(), input.data(), rsigma.data(),
+                                               gamma.data(), dx.data(), dgamma.data(),
+                                               zero_centered_gamma),
+            expect_single_sweep);
+  run_rmsnorm_bwd(dz, input, rsigma, gamma, dx, dgamma, prop.multiProcessorCount,
+                  zero_centered_gamma);
+  run_rmsnorm_bwd(dz, input, rsigma, gamma, dx2, dgamma2, prop.multiProcessorCount,
+                  zero_centered_gamma);
+  nvte_enable_rmsnorm_bwd_single_sweep(false);
+
+  cudaDeviceSynchronize();
+  auto err = cudaGetLastError();
+  ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+
+  // Deterministic: two runs, the same bits.
+  EXPECT_TRUE(bitwise_equal(dx, dx2, N * H)) << "dx differs between two runs";
+  EXPECT_TRUE(bitwise_equal(dgamma, dgamma2, H)) << "dgamma differs between two runs";
+  if (!expect_single_sweep) {
+    // Fallback: the regular backward, bit for bit.
+    EXPECT_TRUE(bitwise_equal(dx, dx_default, N * H)) << "fallback dx differs";
+    EXPECT_TRUE(bitwise_equal(dgamma, dgamma_default, H)) << "fallback dgamma differs";
+  }
+
+  // Against the CPU reference (the regular backward's tolerances).
+  rsigma.to_cpu();
+  std::vector<bf16> zeros(N * H, static_cast<bf16>(0.f));
+  std::vector<float> mu(N, 0.f);
+  std::unique_ptr<bf16[]> ref_dx = std::make_unique<bf16[]>(N * H);
+  std::unique_ptr<bf16[]> ref_dgamma = std::make_unique<bf16[]>(H);
+  std::unique_ptr<bf16[]> ref_dbeta = std::make_unique<bf16[]>(H);
+  compute_ref_backward(RMSNorm, dz.rowwise_cpu_dptr<bf16>(), zeros.data(),
+                       input.rowwise_cpu_dptr<bf16>(), mu.data(), rsigma.rowwise_cpu_dptr<float>(),
+                       gamma.rowwise_cpu_dptr<bf16>(), ref_dx.get(), ref_dgamma.get(),
+                       ref_dbeta.get(), N, H, zero_centered_gamma, false, false);
+  const double atol_bwd = 5e-4;
+  const double rtol_bwd = 5e-4;
+  compareResults("dx", dx, ref_dx.get(), true, atol_bwd, rtol_bwd);
+  compareResults("dgamma", dgamma, ref_dgamma.get(), true, atol_bwd, rtol_bwd);
+
+  // Against the regular backward: within BF16 rounding (adjacent values allowed).
+  dx_default.to_cpu();
+  dgamma_default.to_cpu();
+  compareResults("dx_vs_default", dx, dx_default.rowwise_cpu_dptr<bf16>(), true, atol_bwd,
+                 rtol_bwd);
+  compareResults("dgamma_vs_default", dgamma, dgamma_default.rowwise_cpu_dptr<bf16>(), true,
+                 atol_bwd, rtol_bwd);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  OperatorTest,
+  RMSNormBwdSingleSweepTestSuite,
+  ::testing::Combine(
+    ::testing::Values(
+      // supported: gpt-oss-20b (3 x 8192 tokens, hidden 2880) and other shapes
+      std::make_pair<size_t, size_t>(24576, 2880),
+      std::make_pair<size_t, size_t>(2048, 2880),
+      std::make_pair<size_t, size_t>(32, 2880),
+      std::make_pair<size_t, size_t>(4096, 3072),
+      std::make_pair<size_t, size_t>(96, 1024),
+      std::make_pair<size_t, size_t>(65536, 32),
+      // fallback: rows not divisible by 32, hidden size not divisible by 32, hidden size > 3072
+      std::make_pair<size_t, size_t>(71, 2880),
+      std::make_pair<size_t, size_t>(64, 2896),
+      std::make_pair<size_t, size_t>(64, 4096)),
+    ::testing::Values(false, true)),
+  [](const testing::TestParamInfo<RMSNormBwdSingleSweepTestSuite::ParamType>& info) {
+    return std::to_string(std::get<0>(info.param).first) + "X" +
+           std::to_string(std::get<0>(info.param).second) + "X" +
+           std::to_string(std::get<1>(info.param));
+  });

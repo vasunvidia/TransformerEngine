@@ -129,6 +129,11 @@ void nvte_rmsnorm_fwd(const NVTETensor x, const NVTETensor gamma, const float ep
  * Calling this function with workspace set to an empty tensor will not perform the operation,
  * but instead set the shape and type of the workspace tensor to the required values.
  *
+ * With NVTE_RMSNORM_BWD_SINGLE_SWEEP=1 (or nvte_enable_rmsnorm_bwd_single_sweep), supported
+ * configurations (see nvte_rmsnorm_bwd_uses_single_sweep) run a single kernel that computes
+ * dx and dgamma in one pass over dz and x, ignoring multiprocessorCount; its results agree
+ * with the default backward to within BF16 rounding and are deterministic.
+ *
  *  \param[in]     dz                  Incoming gradient tensor of shape [..., H].
  *  \param[in]     x                   Forward input tensor of shape [..., H].
  *  \param[in]     rsigma              Reciprocal of the root mean square of the input
@@ -180,6 +185,29 @@ void nvte_enable_cudnn_norm_fwd(bool enable);
  *  \param[in]  enable  Whether to enable cuDNN backend.
  */
 void nvte_enable_cudnn_norm_bwd(bool enable);
+
+/*! \brief Force the opt-in single-sweep RMSNorm backward on or off.
+ *
+ *  By default the single-sweep kernel is used when the environment variable
+ *  NVTE_RMSNORM_BWD_SINGLE_SWEEP is set to 1 (read at every call). This call overrides the
+ *  environment variable for the rest of the process. Either way, configurations the kernel
+ *  does not support use the regular backward (see nvte_rmsnorm_bwd).
+ *
+ *  \param[in]  enable  Whether to use the single-sweep RMSNorm backward.
+ */
+void nvte_enable_rmsnorm_bwd_single_sweep(bool enable);
+
+/*! \brief Whether nvte_rmsnorm_bwd would use the single-sweep kernel for these tensors.
+ *
+ *  True when the single-sweep backward is enabled (see nvte_enable_rmsnorm_bwd_single_sweep)
+ *  and supports the configuration: BF16 dz, x, gamma, dx and dgamma, FP32 rsigma, a number of
+ *  rows divisible by 32, a hidden size divisible by 32 and at most 3072, 16-byte aligned dz, x,
+ *  dx and gamma, and a device of compute capability 9.0 or newer.
+ */
+bool nvte_rmsnorm_bwd_uses_single_sweep(const NVTETensor dz, const NVTETensor x,
+                                        const NVTETensor rsigma, const NVTETensor gamma,
+                                        const NVTETensor dx, const NVTETensor dgamma,
+                                        const bool zero_centered_gamma);
 
 /*! \brief Control whether norm computes `gamma += 1.0` for zero-centered gamma
  *  in weight dtype. If set to false, it will compute in compute dtype.

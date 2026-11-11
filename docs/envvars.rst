@@ -451,6 +451,26 @@ LayerNorm/RMSNorm SM Margins
    :Default: ``0``
    :Description: Number of SMs to reserve during inference LayerNorm/RMSNorm operations.
 
+.. envvar:: NVTE_RMSNORM_BWD_SINGLE_SWEEP
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Compute the RMSNorm backward (``dx`` and ``dgamma``) with a single kernel that
+                 reads the incoming gradient and the input once and finishes the ``dgamma``
+                 column reduction in the same kernel, instead of the backward and finalize kernels
+                 of the Transformer Engine or cuDNN backend. Applies to every caller of
+                 ``nvte_rmsnorm_bwd`` (in PyTorch: ``RMSNorm``, ``LayerNormLinear``,
+                 ``LayerNormMLP`` and the ``te.ops.RMSNorm`` operation) and takes precedence over
+                 :envvar:`NVTE_NORM_BWD_USE_CUDNN`. Supported: BF16 input, gradient and weight,
+                 FP32 ``rsigma``, a number of rows (tokens) divisible by 32, a hidden size divisible
+                 by 32 and at most 3072, 16-byte aligned tensors, and compute capability 9.0 or
+                 newer. Other configurations, and ``rmsnorm_bwd_add``, use the regular backward;
+                 the reason is printed once. The kernel does not apply
+                 :envvar:`NVTE_BWD_LAYERNORM_SM_MARGIN` (it launches short CTAs, rows / 8 of them).
+                 Results agree with the regular backward to within BF16 rounding (the arithmetic
+                 order differs, so they are not bitwise identical) and are deterministic; the
+                 kernel can be captured in CUDA graphs. The variable is read at every call.
+
 GEMM Configuration
 ^^^^^^^^^^^^^^^^^^
 

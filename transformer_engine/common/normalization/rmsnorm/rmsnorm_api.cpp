@@ -7,7 +7,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <numeric>
+#include <set>
+#include <string>
 
 #include "../../common.h"
 #include "../common.h"
@@ -18,6 +21,34 @@
 namespace transformer_engine {
 
 using namespace normalization;
+
+namespace {
+
+// Whether rmsnorm_bwd takes the opt-in single-sweep kernel (NVTE_RMSNORM_BWD_SINGLE_SWEEP=1).
+// When it is enabled but cannot take a configuration, the regular backward runs instead and
+// the reason is printed once per distinct reason.
+bool select_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &rsigma,
+                                     const Tensor &gamma, const Tensor &dx, const Tensor &dgamma,
+                                     const bool zero_centered_gamma) {
+  if (!use_rmsnorm_bwd_single_sweep()) {
+    return false;
+  }
+  std::string reason;
+  if (is_supported_by_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, dx, dgamma,
+                                               zero_centered_gamma, &reason)) {
+    return true;
+  }
+  static std::mutex mutex;
+  static std::set<std::string> reported;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (reported.insert(reason).second) {
+    NVTE_WARN("NVTE_RMSNORM_BWD_SINGLE_SWEEP: using the regular RMSNorm backward: ", reason,
+              ". (Printed once per reason.)");
+  }
+  return false;
+}
+
+}  // namespace
 
 void rmsnorm_fwd(const Tensor &x, const Tensor &gamma, const float epsilon, Tensor *z,
                  Tensor *rsigma, Tensor *workspace, const int multiprocessorCount,
@@ -157,6 +188,23 @@ void rmsnorm_bwd(const Tensor &dz, const Tensor &x, const Tensor &rsigma, const 
     CheckInputTensor(gamma, "gamma");
     CheckOutputTensor(*dx, "dx");
     CheckOutputTensor(*dgamma, "dgamma");
+  }
+
+  // Opt-in single-sweep kernel (NVTE_RMSNORM_BWD_SINGLE_SWEEP=1), ahead of the TE and cuDNN
+  // backends. It takes the workspace query and the launch alike; a workspace sized for another
+  // backend (the setting changed between the two calls) sends the launch to the regular path.
+  if (select_rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, *dx, *dgamma, zero_centered_gamma)) {
+    const size_t bytes = rmsnorm_bwd_single_sweep_workspace_bytes(rows, cols);
+    if (workspace->data.numel() == 0) {
+      workspace->data.shape = {bytes};
+      workspace->data.dtype = DType::kByte;
+      return;
+    }
+    if (workspace->data.dtype == DType::kByte && workspace->data.shape == Shape{bytes}) {
+      rmsnorm_bwd_single_sweep(dz, x, rsigma, gamma, dx, dgamma, workspace->data.dptr,
+                               zero_centered_gamma, stream);
+      return;
+    }
   }
 
   NVTE_Norm_Backend norm_backend;
@@ -312,4 +360,19 @@ void nvte_rmsnorm_bwd_add(const NVTETensor dz,      // Nxhidden_size
                   *convertNVTETensorCheck(add), *convertNVTETensorCheck(rsigma),
                   *convertNVTETensorCheck(gamma), convertNVTETensor(dx), convertNVTETensor(dgamma),
                   convertNVTETensor(workspace), multiprocessorCount, zero_centered_gamma, stream);
+}
+
+bool nvte_rmsnorm_bwd_uses_single_sweep(const NVTETensor dz, const NVTETensor x,
+                                        const NVTETensor rsigma, const NVTETensor gamma,
+                                        const NVTETensor dx, const NVTETensor dgamma,
+                                        const bool zero_centered_gamma) {
+  NVTE_API_CALL(nvte_rmsnorm_bwd_uses_single_sweep);
+  using namespace transformer_engine;
+  using namespace transformer_engine::normalization;
+  return use_rmsnorm_bwd_single_sweep() &&
+         is_supported_by_rmsnorm_bwd_single_sweep(
+             *convertNVTETensorCheck(dz), *convertNVTETensorCheck(x),
+             *convertNVTETensorCheck(rsigma), *convertNVTETensorCheck(gamma),
+             *convertNVTETensorCheck(dx), *convertNVTETensorCheck(dgamma), zero_centered_gamma,
+             nullptr);
 }
