@@ -72,9 +72,13 @@ def kernels_of(fn):
     return [evt.key for evt in prof.key_averages()]
 
 
-def assert_bf16_close(actual, expected, name):
+def assert_bf16_close(actual, expected, name, addend=None):
+    """Within BF16 rounding. With a residual `addend`, the regular kernels round dx + add once and
+    the single-sweep kernel twice: allow one BF16 ulp of the addend's scale (cancellation)."""
     expected = expected.double()
     atol = 1e-4 * max(expected.abs().max().item(), 1.0)
+    if addend is not None:
+        atol = max(atol, 2**-7 * addend.abs().max().item())
     torch.testing.assert_close(
         actual.double(), expected, rtol=2**-7, atol=atol, msg=lambda m: f"{name}: {m}"
     )
@@ -108,7 +112,7 @@ def test_bwd_add_matches_regular_kernel(shape):
         dx_ref, dgamma_ref = tex.rmsnorm_bwd_add(dz, x, add, rsigma, gamma, 0, False)
     with single_sweep(True):
         dx, dgamma = tex.rmsnorm_bwd_add(dz, x, add, rsigma, gamma, 0, False)
-    assert_bf16_close(dx, dx_ref, "dx")
+    assert_bf16_close(dx, dx_ref, "dx", addend=add)
     assert_bf16_close(dgamma, dgamma_ref, "dgamma")
 
 
@@ -195,7 +199,7 @@ def test_ops_make_extra_output_rmsnorm(enabled):
         assert torch.equal(dx, dx_ref), "dx"
         assert torch.equal(dw, dw_ref), "dgamma"
     else:
-        assert_bf16_close(dx, dx_ref, "dx")
+        assert_bf16_close(dx, dx_ref, "dx", addend=dres)
         assert_bf16_close(dw, dw_ref, "dgamma")
 
 
@@ -264,7 +268,7 @@ def test_layernorm_linear_return_input(normalization, enabled, fp8, steps):
         # LayerNorm adds after the backward; single sweep folds the add bitwise
         assert torch.equal(dx, dx_ref), "input gradient"
     else:
-        assert_bf16_close(dx, dx_ref, "input gradient (regular rmsnorm_bwd_add)")
+        assert_bf16_close(dx, dx_ref, "input gradient (regular rmsnorm_bwd_add)", addend=dres)
 
 
 def test_layernorm_linear_return_input_kernels():
