@@ -127,4 +127,59 @@ void multi_tensor_adam_flat_cuda(at::Tensor grad, std::optional<at::Tensor> para
       num_groups, mode, at::cuda::getCurrentCUDAStream());
 }
 
+at::Tensor multi_tensor_adam_flat_hparams(const std::vector<float> &lr,
+                                          const std::vector<float> &beta1,
+                                          const std::vector<float> &beta2,
+                                          const std::vector<float> &epsilon,
+                                          const std::vector<float> &weight_decay,
+                                          const std::vector<int> &step,
+                                          const std::vector<int> &bias_correction) {
+  const size_t num_groups = lr.size();
+  NVTE_CHECK(beta1.size() == num_groups && beta2.size() == num_groups &&
+                 epsilon.size() == num_groups && weight_decay.size() == num_groups &&
+                 step.size() == num_groups && bias_correction.size() == num_groups,
+             "Every per-group hyperparameter list must have one value per parameter group");
+  auto hparams = at::empty({NVTE_MULTI_TENSOR_ADAM_FLAT_NUM_HPARAMS,
+                            static_cast<int64_t>(num_groups)},
+                           at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+  nvte_multi_tensor_adam_flat_hparams(lr.data(), beta1.data(), beta2.data(), epsilon.data(),
+                                      weight_decay.data(), step.data(), bias_correction.data(),
+                                      num_groups, hparams.data_ptr<float>());
+  return hparams;
+}
+
+void multi_tensor_adam_flat_capturable_cuda(at::Tensor grad, std::optional<at::Tensor> param,
+                                            at::Tensor master_param, at::Tensor exp_avg,
+                                            at::Tensor exp_avg_sq, at::Tensor segments,
+                                            std::optional<at::Tensor> grad_scale,
+                                            at::Tensor hparams, const int mode) {
+  for (const auto &t : {grad, master_param, exp_avg, exp_avg_sq, segments, hparams}) {
+    NVTE_CHECK(t.is_contiguous(), "multi_tensor_adam_flat_capturable expects contiguous tensors");
+  }
+  NVTE_CHECK(hparams.is_cuda() && hparams.device() == grad.device(),
+             "multi_tensor_adam_flat_capturable expects the hyperparameters on the device of the "
+             "gradients");
+  auto grad_cu = makeTransformerEngineTensor(grad);
+  auto master_param_cu = makeTransformerEngineTensor(master_param);
+  auto exp_avg_cu = makeTransformerEngineTensor(exp_avg);
+  auto exp_avg_sq_cu = makeTransformerEngineTensor(exp_avg_sq);
+  auto segments_cu = makeTransformerEngineTensor(segments);
+  auto hparams_cu = makeTransformerEngineTensor(hparams);
+  auto param_cu = TensorWrapper();  // empty: do not write model parameters
+  if (param.has_value()) {
+    NVTE_CHECK(param->is_contiguous(),
+               "multi_tensor_adam_flat_capturable expects contiguous tensors");
+    param_cu = makeTransformerEngineTensor(*param);
+  }
+  auto grad_scale_cu = TensorWrapper();  // empty: do not scale gradients
+  if (grad_scale.has_value()) {
+    grad_scale_cu = makeTransformerEngineTensor(*grad_scale);
+  }
+
+  nvte_multi_tensor_adam_flat_capturable_cuda(
+      grad_cu.data(), param_cu.data(), master_param_cu.data(), exp_avg_cu.data(),
+      exp_avg_sq_cu.data(), segments_cu.data(), grad_scale_cu.data(), hparams_cu.data(), mode,
+      at::cuda::getCurrentCUDAStream());
+}
+
 }  // namespace transformer_engine::pytorch

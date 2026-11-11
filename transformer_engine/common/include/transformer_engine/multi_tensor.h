@@ -257,6 +257,75 @@ void nvte_multi_tensor_adam_flat_cuda(const NVTETensor grad, NVTETensor param,
                                       const int *bias_correction, const size_t num_groups,
                                       const int mode, cudaStream_t stream);
 
+/*! \brief Number of rows of the hyperparameter table of nvte_multi_tensor_adam_flat_capturable_cuda.
+ *
+ * The rows are, in this order: learning rate, beta1, beta2, bias correction of the first moment
+ * (1 - beta1^step, or 1), bias correction of the second moment, epsilon, weight decay.
+ */
+#define NVTE_MULTI_TENSOR_ADAM_FLAT_NUM_HPARAMS 7
+
+/*!  \brief Fill the hyperparameter table of nvte_multi_tensor_adam_flat_capturable_cuda.
+ *
+ * Writes, on the host, the FP32 table of shape [NVTE_MULTI_TENSOR_ADAM_FLAT_NUM_HPARAMS,
+ * num_groups] (row-major) with the values nvte_multi_tensor_adam_flat_cuda computes from the same
+ * arguments (the bias corrections are computed here, on the host, by the same code). Copied to
+ * the device, the table makes nvte_multi_tensor_adam_flat_capturable_cuda bitwise equal to
+ * nvte_multi_tensor_adam_flat_cuda.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]      lr                Learning rate of each group (num_groups values).
+ *  \param[in]      beta1             Coefficient for the first moment of each group.
+ *  \param[in]      beta2             Coefficient for the second moment of each group.
+ *  \param[in]      epsilon           Term added to the denominator, for each group.
+ *  \param[in]      weight_decay      Weight decay of each group.
+ *  \param[in]      step              Iteration counter of each group (for the bias correction).
+ *  \param[in]      bias_correction   Whether to apply the bias correction, for each group.
+ *  \param[in]      num_groups        Number of parameter groups (at most
+ *                                    NVTE_MULTI_TENSOR_ADAM_FLAT_MAX_GROUPS).
+ *  \param[out]     hparams           Host array of NVTE_MULTI_TENSOR_ADAM_FLAT_NUM_HPARAMS *
+ *                                    num_groups floats.
+ */
+void nvte_multi_tensor_adam_flat_hparams(const float *lr, const float *beta1, const float *beta2,
+                                         const float *epsilon, const float *weight_decay,
+                                         const int *step, const int *bias_correction,
+                                         const size_t num_groups, float *hparams);
+
+/*!  \brief Capturable form of nvte_multi_tensor_adam_flat_cuda: the per-group hyperparameters
+ *          are read from a device table.
+ *
+ * Same update as nvte_multi_tensor_adam_flat_cuda, but the learning rate, betas, bias
+ * corrections, epsilon and weight decay of every group are read by the kernel from `hparams`
+ * (see nvte_multi_tensor_adam_flat_hparams), so a CUDA graph that captured the launch applies the
+ * values written to the table before each replay. No host value of the step depends on the
+ * iteration. With the table filled by nvte_multi_tensor_adam_flat_hparams from the same
+ * arguments, the result is bitwise equal to nvte_multi_tensor_adam_flat_cuda.
+ *
+ * A table with learning rate 0, betas 1, bias corrections 1 and weight decay 0 leaves the FP32
+ * parameters and moments unchanged for finite gradients (an exact no-op update).
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]      grad              Gradients (as in nvte_multi_tensor_adam_flat_cuda).
+ *  \param[out]     param             Model parameters, or an empty tensor.
+ *  \param[in,out]  master_param      FP32 parameters.
+ *  \param[in,out]  exp_avg           FP32 first moments.
+ *  \param[in,out]  exp_avg_sq        FP32 second moments.
+ *  \param[in]      segments          Int64 [num_segments, 3] segment table (start, end, group).
+ *  \param[in]      grad_scale        FP32 tensor with one element, or an empty tensor.
+ *  \param[in]      hparams           FP32 device tensor of shape
+ *                                    [NVTE_MULTI_TENSOR_ADAM_FLAT_NUM_HPARAMS, num_groups];
+ *                                    num_groups is at most NVTE_MULTI_TENSOR_ADAM_FLAT_MAX_GROUPS.
+ *  \param[in]      mode              0 for L2 regularization, 1 for decoupled weight decay (AdamW).
+ *  \param[in]      stream            CUDA stream used for this operation.
+ */
+void nvte_multi_tensor_adam_flat_capturable_cuda(const NVTETensor grad, NVTETensor param,
+                                                 NVTETensor master_param, NVTETensor exp_avg,
+                                                 NVTETensor exp_avg_sq, const NVTETensor segments,
+                                                 const NVTETensor grad_scale,
+                                                 const NVTETensor hparams, const int mode,
+                                                 cudaStream_t stream);
+
 /*!  \brief Compute and apply gradient update to parameters for SGD optimizer.
  *
  * \warning   This API is **experimental** and subject to change.

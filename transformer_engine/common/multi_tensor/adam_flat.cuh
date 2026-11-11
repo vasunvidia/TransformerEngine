@@ -33,6 +33,19 @@ namespace multi_tensor_adam_flat {
 /*! Maximum number of parameter groups of one launch. */
 constexpr int kMaxGroups = 32;
 
+/*! Rows of the device hyperparameter table of the capturable variant: a FP32 array of shape
+ *  [kNumHParams, num_groups] in this row order. */
+enum HParamRow : int {
+  kLr = 0,
+  kBeta1,
+  kBeta2,
+  kBeta1Correction,
+  kBeta2Correction,
+  kEpsilon,
+  kWeightDecay,
+  kNumHParams
+};
+
 /*! Per-group hyperparameters, passed by value to the kernel. */
 struct GroupArgs {
   float lr[kMaxGroups];
@@ -108,13 +121,22 @@ __device__ __forceinline__ int64_t first_segment_ending_after(const int64_t *seg
   return lo;
 }
 
-template <int kBlock, int kVec, int kUnroll, typename GradT, typename ParamT, bool kWriteParam>
+/*! Adam update of one launch.
+ *
+ *  kDeviceHParams = false: the per-group hyperparameters are the values in `groups`.
+ *  kDeviceHParams = true (capturable variant): they are read from the device table `hparams`
+ *  (FP32, [kNumHParams, groups.num_groups], see HParamRow); only groups.num_groups is used. The
+ *  arithmetic is the same, so equal hyperparameter values give bitwise equal results.
+ */
+template <int kBlock, int kVec, int kUnroll, typename GradT, typename ParamT, bool kWriteParam,
+          bool kDeviceHParams = false>
 __global__ void __launch_bounds__(kBlock)
     adam_flat_kernel(const GradT *__restrict__ g, ParamT *__restrict__ p,
                      float *__restrict__ p_master, float *__restrict__ m, float *__restrict__ v,
                      const int64_t *__restrict__ segments, const int64_t num_segments,
                      const int64_t numel, const float *__restrict__ grad_scale,
-                     const GroupArgs groups, const int mode) {
+                     const GroupArgs groups, const int mode,
+                     const float *__restrict__ hparams = nullptr) {
   constexpr int64_t kTile = static_cast<int64_t>(kBlock) * kVec * kUnroll;
   const bool has_scale = grad_scale != nullptr;
   const float scale = has_scale ? *grad_scale : 1.0f;
@@ -131,13 +153,25 @@ __global__ void __launch_bounds__(kBlock)
       const int64_t end = min(__ldg(segments + 3 * s + 1), tile_end);
       const int group = static_cast<int>(__ldg(segments + 3 * s + 2));
       if (group < 0 || group >= groups.num_groups) continue;
-      const float lr = groups.lr[group];
-      const float beta1 = groups.beta1[group];
-      const float beta2 = groups.beta2[group];
-      const float beta1_correction = groups.beta1_correction[group];
-      const float beta2_correction = groups.beta2_correction[group];
-      const float epsilon = groups.epsilon[group];
-      const float decay = groups.weight_decay[group];
+      float lr, beta1, beta2, beta1_correction, beta2_correction, epsilon, decay;
+      if constexpr (kDeviceHParams) {
+        const int n = groups.num_groups;
+        lr = __ldg(hparams + kLr * n + group);
+        beta1 = __ldg(hparams + kBeta1 * n + group);
+        beta2 = __ldg(hparams + kBeta2 * n + group);
+        beta1_correction = __ldg(hparams + kBeta1Correction * n + group);
+        beta2_correction = __ldg(hparams + kBeta2Correction * n + group);
+        epsilon = __ldg(hparams + kEpsilon * n + group);
+        decay = __ldg(hparams + kWeightDecay * n + group);
+      } else {
+        lr = groups.lr[group];
+        beta1 = groups.beta1[group];
+        beta2 = groups.beta2[group];
+        beta1_correction = groups.beta1_correction[group];
+        beta2_correction = groups.beta2_correction[group];
+        epsilon = groups.epsilon[group];
+        decay = groups.weight_decay[group];
+      }
 
       // Whole vectors inside [begin, end): vectorized loads, update, vectorized stores.
       float r_g[kUnroll][kVec];

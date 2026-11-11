@@ -12,7 +12,12 @@ import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import DelayedScaling, MXFP8BlockScaling, Float8BlockScaling
 from transformer_engine.pytorch import MultiheadAttention, quantized_model_init, is_bf16_available
 from transformer_engine.pytorch import QuantizedTensor
-from transformer_engine.pytorch.optimizers import multi_tensor_adam_flat, multi_tensor_applier
+from transformer_engine.pytorch.optimizers import (
+    multi_tensor_adam_flat,
+    multi_tensor_adam_flat_capturable,
+    multi_tensor_adam_flat_hparams,
+    multi_tensor_applier,
+)
 from transformer_engine.pytorch.optimizers.fused_adam import (
     _MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL,
 )
@@ -1107,6 +1112,223 @@ class TestMultiTensorAdamFlat:
                 mode=1,
             )
 
+
+
+class TestMultiTensorAdamFlatCapturable:
+    """multi_tensor_adam_flat_capturable is bitwise equal to multi_tensor_adam_flat.
+
+    The capturable op reads lr, betas, bias corrections, epsilon and weight decay from a device
+    table filled from multi_tensor_adam_flat_hparams, so one captured launch serves every step:
+    the table (and the gradients) change between graph replays.
+    """
+
+    layout = TestMultiTensorAdamFlat.layout
+    group_options = TestMultiTensorAdamFlat.group_options
+    max_norm = 1.0
+    num_steps = 5
+
+    def _setup(self, grad_dtype, param_dtype, misaligned):
+        device = "cuda"
+        segments = []
+        pos = 0
+        for i, (numel, padding) in enumerate(self.layout):
+            pos += padding
+            segments.append((pos, pos + numel, i % len(self.group_options)))
+            pos += numel
+        numel = pos + 5
+        offset = 1 if misaligned else 0
+
+        def flat(dtype, fill=None):
+            buf = torch.empty(numel + offset, dtype=dtype, device=device)
+            if fill is None:
+                buf.normal_()
+            else:
+                buf.fill_(fill)
+            return buf[offset:]
+
+        state = {
+            "grad": flat(grad_dtype),
+            "master": flat(torch.float32),
+            "exp_avg": flat(torch.float32, 0.0),
+            "exp_avg_sq": flat(torch.float32, 0.0),
+            "param": flat(param_dtype, -7.0) if param_dtype is not None else None,
+        }
+        ref = {}
+        for key, buf in state.items():
+            if buf is None:
+                ref[key] = None
+            else:
+                copy = torch.empty(numel + offset, dtype=buf.dtype, device=device)[offset:]
+                copy.copy_(buf)
+                ref[key] = copy
+        segments_t = torch.tensor(segments, dtype=torch.int64, device=device)
+        return numel, state, ref, segments_t
+
+    def _hyperparams(self, step):
+        # A changing learning rate (schedule) and step, per group.
+        return dict(
+            lr=[options["lr"] * (1.0 + 0.37 * step) for options in self.group_options],
+            beta1=[options["betas"][0] for options in self.group_options],
+            beta2=[options["betas"][1] for options in self.group_options],
+            epsilon=[options["eps"] for options in self.group_options],
+            weight_decay=[options["weight_decay"] for options in self.group_options],
+            step=[step] * len(self.group_options),
+            bias_correction=[1] * len(self.group_options),
+        )
+
+    def _noop_hyperparams(self):
+        n = len(self.group_options)
+        return dict(
+            lr=[0.0] * n,
+            beta1=[1.0] * n,
+            beta2=[1.0] * n,
+            epsilon=[options["eps"] for options in self.group_options],
+            weight_decay=[0.0] * n,
+            step=[1] * n,
+            bias_correction=[0] * n,
+        )
+
+    @staticmethod
+    def _grad_scale(grad, segments_t):
+        overflow = torch.zeros(1, dtype=torch.int, device="cuda")
+        grads = [grad[s:e] for s, e, _ in segments_t.tolist()]
+        norm, _ = multi_tensor_applier(te.optimizers.multi_tensor_l2norm, overflow, [grads], False)
+        scale = TestMultiTensorAdamFlatCapturable.max_norm / (norm + 1.0e-6)
+        return scale.clamp_max_(1.0)
+
+    @staticmethod
+    def _assert_bitwise(state, ref):
+        for key, buf in state.items():
+            if buf is not None:
+                assert torch.equal(_bits(buf), _bits(ref[key])), key
+
+    def test_hparams_table(self):
+        hyper = self._hyperparams(7)
+        table = multi_tensor_adam_flat_hparams(**hyper)
+        assert table.device.type == "cpu" and table.dtype == torch.float32
+        assert tuple(table.shape) == (7, len(self.group_options))
+        for i in range(len(self.group_options)):
+            beta1 = float(torch.tensor(hyper["beta1"][i], dtype=torch.float32))
+            beta2 = float(torch.tensor(hyper["beta2"][i], dtype=torch.float32))
+            expected = [
+                hyper["lr"][i],
+                beta1,
+                beta2,
+                1.0 - beta1**7,
+                1.0 - beta2**7,
+                hyper["epsilon"][i],
+                hyper["weight_decay"][i],
+            ]
+            expected = torch.tensor(expected, dtype=torch.float64).to(torch.float32)
+            assert torch.equal(_bits(table[:, i].contiguous()), _bits(expected))
+        noop = multi_tensor_adam_flat_hparams(**self._noop_hyperparams())
+        assert torch.all(noop[3:5] == 1.0)
+
+    @pytest.mark.parametrize("grad_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("param_dtype", [torch.bfloat16, torch.float32, None])
+    @pytest.mark.parametrize("clip", [True, False])
+    @pytest.mark.parametrize("adam_w_mode", [True, False])
+    @pytest.mark.parametrize("misaligned", [False, True])
+    @pytest.mark.parametrize("cuda_graph", [False, True])
+    def test_matches_flat_adam(
+        self, grad_dtype, param_dtype, clip, adam_w_mode, misaligned, cuda_graph
+    ):
+        """Bitwise equal to multi_tensor_adam_flat over several steps with changing lr / step,
+        eagerly or captured once and replayed; a no-op table leaves the state unchanged."""
+        if torch.bfloat16 in (grad_dtype, param_dtype) and not is_bf16_available():
+            pytest.skip("BF16 is not supported")
+        torch.manual_seed(1234)
+        numel, state, ref, segments_t = self._setup(grad_dtype, param_dtype, misaligned)
+        mode = 1 if adam_w_mode else 0
+        num_groups = len(self.group_options)
+        hparams = torch.zeros(7, num_groups, dtype=torch.float32, device="cuda")
+        grad_scale = torch.ones(1, dtype=torch.float32, device="cuda") if clip else None
+
+        def capturable_step():
+            multi_tensor_adam_flat_capturable(
+                state["grad"],
+                state["param"],
+                state["master"],
+                state["exp_avg"],
+                state["exp_avg_sq"],
+                segments_t,
+                grad_scale,
+                hparams,
+                mode,
+            )
+
+        graph = None
+        if cuda_graph:
+            # Capture on garbage-free inputs; the capture itself does not run the kernel.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                capturable_step()
+            torch.cuda.synchronize()
+            self._assert_bitwise(state, ref)  # capture did not modify anything
+
+        noop_step = 3
+        for step in range(1, self.num_steps + 1):
+            # Large gradients, so that clipping changes them.
+            new_grad = (torch.randn(numel, device="cuda") * 10).to(grad_dtype)
+            state["grad"].copy_(new_grad)
+            ref["grad"].copy_(new_grad)
+            if step == noop_step:
+                # A no-op table: everything stays bitwise unchanged.
+                before = {k: (v.clone() if v is not None else None) for k, v in state.items()}
+                hparams.copy_(multi_tensor_adam_flat_hparams(**self._noop_hyperparams()))
+                if clip:
+                    grad_scale.copy_(self._grad_scale(state["grad"], segments_t))
+                graph.replay() if graph is not None else capturable_step()
+                self._assert_bitwise(state, before)
+                continue
+            # Real steps are numbered without the no-op one.
+            real_step = step if step < noop_step else step - 1
+            hyper = self._hyperparams(real_step)
+            ref_scale = self._grad_scale(ref["grad"], segments_t) if clip else None
+            multi_tensor_adam_flat(
+                ref["grad"],
+                ref["param"],
+                ref["master"],
+                ref["exp_avg"],
+                ref["exp_avg_sq"],
+                segments_t,
+                ref_scale,
+                mode=mode,
+                **hyper,
+            )
+            hparams.copy_(multi_tensor_adam_flat_hparams(**hyper), non_blocking=True)
+            if clip:
+                grad_scale.copy_(self._grad_scale(state["grad"], segments_t))
+            graph.replay() if graph is not None else capturable_step()
+            torch.cuda.synchronize()
+            self._assert_bitwise(state, ref)
+
+    def test_rejects_bad_hparams(self):
+        buf = torch.zeros(8, device="cuda")
+        segments = torch.tensor([[0, 8, 0]], dtype=torch.int64, device="cuda")
+        args = (buf, None, buf.clone(), buf.clone(), buf.clone(), segments, None)
+        with pytest.raises(RuntimeError, match="shape"):
+            multi_tensor_adam_flat_capturable(*args, torch.zeros(6, 1, device="cuda"), 1)
+        with pytest.raises(RuntimeError, match="parameter groups"):
+            multi_tensor_adam_flat_capturable(*args, torch.zeros(7, 33, device="cuda"), 1)
+        with pytest.raises(RuntimeError, match="Float32"):
+            multi_tensor_adam_flat_capturable(
+                *args, torch.zeros(7, 1, dtype=torch.float64, device="cuda"), 1
+            )
+        with pytest.raises(RuntimeError, match="device"):
+            multi_tensor_adam_flat_capturable(*args, torch.zeros(7, 1), 1)
+        with pytest.raises(RuntimeError, match="parameter groups"):
+            multi_tensor_adam_flat_hparams(
+                lr=[1e-3] * 33,
+                beta1=[0.9] * 33,
+                beta2=[0.999] * 33,
+                epsilon=[1e-8] * 33,
+                weight_decay=[0.0] * 33,
+                step=[1] * 33,
+                bias_correction=[1] * 33,
+            )
 
 class TestFusedSGD(TestFusedOptimizer):
 

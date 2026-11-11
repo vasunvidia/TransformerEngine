@@ -741,6 +741,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("beta1"), py::arg("beta2"), py::arg("epsilon"), py::arg("weight_decay"),
         py::arg("step"), py::arg("bias_correction"), py::arg("mode"),
         py::call_guard<py::gil_scoped_release>());
+  m.def("multi_tensor_adam_flat_hparams",
+        &transformer_engine::pytorch::multi_tensor_adam_flat_hparams,
+        "Host table of per-group hyperparameters (incl. bias corrections) for "
+        "multi_tensor_adam_flat_capturable, computed as multi_tensor_adam_flat computes them",
+        py::arg("lr"), py::arg("beta1"), py::arg("beta2"), py::arg("epsilon"),
+        py::arg("weight_decay"), py::arg("step"), py::arg("bias_correction"));
+  m.def("multi_tensor_adam_flat_capturable",
+        &transformer_engine::pytorch::multi_tensor_adam_flat_capturable_cuda,
+        "multi_tensor_adam_flat with the per-group hyperparameters read from a device table "
+        "(CUDA graph capturable)",
+        py::arg("grad"), py::arg("param"), py::arg("master_param"), py::arg("exp_avg"),
+        py::arg("exp_avg_sq"), py::arg("segments"), py::arg("grad_scale"), py::arg("hparams"),
+        py::arg("mode"), py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_sgd", &transformer_engine::pytorch::multi_tensor_sgd_cuda,
         "Fused SGD optimizer for list of contiguous tensors",
         py::call_guard<py::gil_scoped_release>());

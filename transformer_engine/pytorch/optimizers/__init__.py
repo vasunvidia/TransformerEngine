@@ -13,6 +13,8 @@ from transformer_engine_torch import (
     multi_tensor_adam_capturable,
     multi_tensor_adam_capturable_master,
     multi_tensor_adam_flat,
+    multi_tensor_adam_flat_capturable,
+    multi_tensor_adam_flat_hparams,
     multi_tensor_sgd,
 )
 from .fused_adam import FusedAdam
