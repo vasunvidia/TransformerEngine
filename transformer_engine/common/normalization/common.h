@@ -322,15 +322,20 @@ void rmsnorm_fwd_mxfp8(const Tensor& x, const Tensor& gamma, float epsilon, Tens
 // for the configurations it supports. `add` (nullable): residual gradient added to dx
 // (rmsnorm_bwd_add), bitwise equal to a separate BF16 addition of the rmsnorm_bwd result.
 bool use_rmsnorm_bwd_single_sweep();
+// Fused backward (nvte_rmsnorm_bwd_fused): `dz2` (nullable) is a second incoming gradient summed
+// into dz (one BF16 addition), `dx_q` (nullable) an MXFP8 tensor that also receives the final dx
+// quantized row-wise and column-wise.
 bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor& dz, const Tensor& x,
                                                const Tensor& rsigma, const Tensor& gamma,
                                                const Tensor& dx, const Tensor& dgamma,
                                                const Tensor* add, bool zero_centered_gamma,
-                                               std::string* reason);
+                                               std::string* reason, const Tensor* dz2 = nullptr,
+                                               const Tensor* dx_q = nullptr);
 size_t rmsnorm_bwd_single_sweep_workspace_bytes(size_t rows, size_t cols);
 void rmsnorm_bwd_single_sweep(const Tensor& dz, const Tensor& x, const Tensor& rsigma,
                               const Tensor& gamma, const Tensor* add, Tensor* dx, Tensor* dgamma,
-                              void* workspace, bool zero_centered_gamma, cudaStream_t stream);
+                              void* workspace, bool zero_centered_gamma, cudaStream_t stream,
+                              const Tensor* dz2 = nullptr, Tensor* dx_q = nullptr);
 
 }  // namespace normalization
 }  // namespace transformer_engine

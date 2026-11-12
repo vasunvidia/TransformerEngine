@@ -428,6 +428,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm_bwd", &transformer_engine::pytorch::rmsnorm_bwd, "Backward of RMSNorm");
   m.def("rmsnorm_bwd_add", &transformer_engine::pytorch::rmsnorm_bwd_add,
         "Fused backward of RMSNorm + add");
+  m.def("rmsnorm_bwd_fused", &transformer_engine::pytorch::rmsnorm_bwd_fused,
+        "Fused single-sweep RMSNorm backward: dz + dz2, residual gradient add, optional MXFP8 "
+        "copy of dx. Returns [dx, dgamma, dx_quantized or None]",
+        py::arg("dz"), py::arg("dz2"), py::arg("x"), py::arg("add"), py::arg("rsigma"),
+        py::arg("gamma"), py::arg("zero_centered_gamma"), py::arg("quantizer"));
+  m.def("rmsnorm_bwd_fused_supported", &transformer_engine::pytorch::rmsnorm_bwd_fused_supported,
+        "Whether rmsnorm_bwd_fused supports these tensors", py::arg("dz"), py::arg("dz2"),
+        py::arg("x"), py::arg("add"), py::arg("rsigma"), py::arg("gamma"),
+        py::arg("zero_centered_gamma"));
   m.def("multi_tensor_quantize", &transformer_engine::pytorch::multi_tensor_quantize,
         "Multi-tensor quantize", py::arg("tensor_list"), py::arg("quantizer_list"));
   m.def("split_quantize", &transformer_engine::pytorch::split_quantize,

@@ -51,6 +51,21 @@
  *  result. (The regular rmsnorm_bwd_add kernels instead add in fp32 before the single rounding
  *  of dx.) `add` is read with one 16-byte load per thread and row, next to the dx store.
  *
+ *  Fused backward (nvte_rmsnorm_bwd_fused, independent of NVTE_RMSNORM_BWD_SINGLE_SWEEP):
+ *   - `dz2`: a second incoming gradient (the normalized output feeding two consumers, e.g. a
+ *     MoE router and the experts). The kernel forms dz = bf16(dz + dz2) (one fp32 sum, rounded
+ *     once) before the backward, bitwise what autograd's gradient accumulation of the two would
+ *     hand a separate backward. dz2 is read with one 16-byte load per thread and row, issued
+ *     before the wait for the dz/x slabs.
+ *   - `dx_q`: the final dx (after the residual gradient) also quantized to MXFP8, row-wise and
+ *     column-wise (E4M3 or E5M2, compact or GEMM-swizzled scales, padding zeroed). The values
+ *     and scales are those of the MXFP8 quantizer applied to the bf16 dx: per 32-element block
+ *     amax -> E8M0 scale (float_to_e8m0(amax / fp8_max)) -> cvt.rn.satfinite(x * 2^-scale).
+ *     A row-wise block is 4 adjacent threads (shuffle); a column-wise block is the 32 rows of the
+ *     cluster, whose 4 per-CTA column maxima are exchanged through distributed shared memory.
+ *     This lets the consumer of dx (e.g. the GEMMs of the preceding Linear) skip its own
+ *     quantization pass over dx.
+ *
  *  Origin: the single-sweep cluster kernel of the gpt-oss-20b "plus" workload
  *  (rmsnorm_bwd_cuda.cu, rmsnorm_bwd_single_sweep_kernel<8, HAS_RES, false, false>, NVIDIA
  *  first-party), without the MXFP8 gradient emission and dbias, dgamma written to the output
@@ -66,10 +81,13 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#include "../../cast/mxfp8/swizzle.cuh"
 #include "../../common.h"
 #include "../../util/cuda_runtime.h"
+#include "../../util/ptx_arch_spec.cuh"
 #include "../../util/system.h"
 #include "../../utils.cuh"
 #include "../common.h"
@@ -109,6 +127,14 @@ struct Params {
   int *tickets;           // [kTicketSlot], zero at rest
   int M, N, nb32, group, ngroups;
   int zero_centered;
+  // Fused backward (nvte_rmsnorm_bwd_fused)
+  const uint16_t *dz2;    // [M, N] bf16 second incoming gradient summed into dz, or nullptr
+  uint8_t *q_row;         // [M, N] fp8 row-wise MXFP8 dx (only with the quantizing kernel)
+  uint8_t *q_col;         // [M, N] fp8 column-wise MXFP8 dx
+  uint8_t *s_row;         // e8m0 row-wise scales [M, s_row_cols]
+  uint8_t *s_col;         // e8m0 column-wise scales [M / 32, s_col_cols]
+  int s_row_cols, s_col_cols;  // padded scale columns (multiples of 4 and of 128)
+  int swizzled;           // scales in GEMM-swizzled layout
 };
 
 // Row blocks per level-1 group and the number of level-1 groups (<= kMaxGroups).
@@ -186,6 +212,14 @@ __device__ __forceinline__ void st_dsmem_f4(uint32_t addr, float4 v) {
                "f"(v.y), "f"(v.z), "f"(v.w)
                : "memory");
 }
+__device__ __forceinline__ float4 ld_dsmem_f4(uint32_t addr) {
+  float4 v;
+  asm volatile("ld.shared::cluster.v4.f32 {%0, %1, %2, %3}, [%4];"
+               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+               : "r"(addr)
+               : "memory");
+  return v;
+}
 __device__ __forceinline__ float bf2f(uint32_t packed, int hi) {
   return __uint_as_float(hi ? (packed & 0xFFFF0000u) : (packed << 16));
 }
@@ -237,6 +271,145 @@ __device__ __forceinline__ void reduce_rows_f32(const float *base, int nrows, in
   }
 }
 
+// ---- MXFP8 emission of dx (fused backward)
+// kQuant: 0 = none, 1 = E4M3, 2 = E5M2.
+template <int kQuant>
+using QuantOType = std::conditional_t<kQuant == 2, fp8e5m2, fp8e4m3>;
+
+// Eight fp32 values times per-value multipliers, converted to eight FP8 values (element 0 in the
+// lowest byte), as the MXFP8 quantizer does: cvt.rn.satfinite(x * 2^-scale).
+template <int kQuant>
+__device__ __forceinline__ uint2 quantize_8x(const float (&v)[8], const float (&m)[8]) {
+  using OTypex2 = std::conditional_t<kQuant == 2, ptx::fp8e5m2x2, ptx::fp8e4m3x2>;
+  OTypex2 o[4];
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    ptx::mul_cvt_2x(o[k], ptx::floatx2{v[2 * k], v[2 * k + 1]},
+                    ptx::floatx2{m[2 * k], m[2 * k + 1]});
+  }
+  const auto u = [&](int k) {
+    return static_cast<uint32_t>(reinterpret_cast<const uint16_t &>(o[k]));
+  };
+  return make_uint2(u(0) | (u(1) << 16), u(2) | (u(3) << 16));
+}
+
+__device__ __forceinline__ void unpack_bf16x8(const uint4 a, float (&f)[8]) {
+  const uint32_t w[4] = {a.x, a.y, a.z, a.w};
+#pragma unroll
+  for (int c = 0; c < 8; ++c) f[c] = bf2f(w[c >> 1], c & 1);
+}
+
+// Row-wise scale index of (row, scale column j); column-wise of (block row j, column).
+__device__ __forceinline__ size_t row_scale_idx(const Params &p, int row, int j) {
+  return p.swizzled ? dispatch::mxfp8::swizzle::gemm_swizzled_scale_idx(row, j, p.s_row_cols / 4)
+                    : static_cast<size_t>(row) * p.s_row_cols + j;
+}
+__device__ __forceinline__ size_t col_scale_idx(const Params &p, int blk32, int col) {
+  return p.swizzled ? dispatch::mxfp8::swizzle::gemm_swizzled_scale_idx(
+                          col, blk32, (p.nb32 + 3) / 4)
+                    : static_cast<size_t>(blk32) * p.s_col_cols + col;
+}
+
+// The CTA's 8 x N slab of final dx (bf16, in shared memory) to MXFP8 row-wise and column-wise.
+// Called by every thread of every CTA of the cluster (it contains cluster barriers). s_camax
+// (N floats of this CTA's shared memory, no longer used otherwise) holds the per-column maxima.
+template <int kQuant>
+__device__ __forceinline__ void quantize_slab(const Params &p, const uint16_t *s_dx, float *s_camax,
+                                              cg::cluster_group &cluster, const int rank,
+                                              const int row0, const int blk32) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  constexpr float kMaxNormRcp = Quantized_Limits<QuantOType<kQuant>>::max_norm_rcp;
+  const int N = p.N;
+  const int tid = threadIdx.x;
+  const bool owner = tid < (N >> 3);
+  const int c0 = tid * 8;
+  float cmax[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) cmax[c] = 0.0f;
+
+  // Row-wise: a 32-column block is 4 adjacent threads (N % 32 == 0, so no group mixes owners
+  // and idle threads).
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+    float f[8];
+    float amax = 0.0f;
+    if (owner) {
+      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dx + r * N + c0), f);
+#pragma unroll
+      for (int c = 0; c < 8; ++c) {
+        amax = fmaxf(amax, fabsf(f[c]));
+        cmax[c] = fmaxf(cmax[c], fabsf(f[c]));
+      }
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    if (owner) {
+      const e8m0_t e = ptx::float_to_e8m0(amax * kMaxNormRcp);
+      const float mult = ptx::exp2f_rcp<float>(e);
+      const float m[8] = {mult, mult, mult, mult, mult, mult, mult, mult};
+      *reinterpret_cast<uint2 *>(p.q_row + static_cast<size_t>(row0 + r) * N + c0) =
+          quantize_8x<kQuant>(f, m);
+      if ((tid & 3) == 0) p.s_row[row_scale_idx(p, row0 + r, tid >> 2)] = e;
+    }
+  }
+  // Row-wise scale padding (columns N / 32 .. s_row_cols - 1) of this CTA's rows.
+  {
+    const int npad = p.s_row_cols - (N >> 5);
+    for (int t = tid; t < kRows * npad; t += kThreads) {
+      p.s_row[row_scale_idx(p, row0 + t / npad, (N >> 5) + t % npad)] = 0;
+    }
+  }
+
+  // Column-wise: the block is the cluster's 32 rows; exchange the per-CTA maxima.
+  if (owner) {
+    *reinterpret_cast<float4 *>(s_camax + c0) = make_float4(cmax[0], cmax[1], cmax[2], cmax[3]);
+    *reinterpret_cast<float4 *>(s_camax + c0 + 4) =
+        make_float4(cmax[4], cmax[5], cmax[6], cmax[7]);
+  }
+  cluster.sync();
+  if (owner) {
+#pragma unroll
+    for (int q = 0; q < kCluster; ++q) {
+      if (q == rank) continue;
+      const uint32_t a = mapa_u32(smem_u32(s_camax + c0), q);
+      const float4 v0 = ld_dsmem_f4(a);
+      const float4 v1 = ld_dsmem_f4(a + 16u);
+      cmax[0] = fmaxf(cmax[0], v0.x); cmax[1] = fmaxf(cmax[1], v0.y);  // NOLINT(*)
+      cmax[2] = fmaxf(cmax[2], v0.z); cmax[3] = fmaxf(cmax[3], v0.w);  // NOLINT(*)
+      cmax[4] = fmaxf(cmax[4], v1.x); cmax[5] = fmaxf(cmax[5], v1.y);  // NOLINT(*)
+      cmax[6] = fmaxf(cmax[6], v1.z); cmax[7] = fmaxf(cmax[7], v1.w);  // NOLINT(*)
+    }
+  }
+  cluster.sync();  // every peer has read this CTA's maxima (shared memory stays valid until here)
+  if (owner) {
+    e8m0_t e[8];
+    float m[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      e[c] = ptx::float_to_e8m0(cmax[c] * kMaxNormRcp);
+      m[c] = ptx::exp2f_rcp<float>(e[c]);
+    }
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      float f[8];
+      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dx + r * N + c0), f);
+      *reinterpret_cast<uint2 *>(p.q_col + static_cast<size_t>(row0 + r) * N + c0) =
+          quantize_8x<kQuant>(f, m);
+    }
+    if (rank == 0) {
+#pragma unroll
+      for (int c = 0; c < 8; ++c) p.s_col[col_scale_idx(p, blk32, c0 + c)] = e[c];
+    }
+  }
+  // Column-wise scale padding (columns N .. s_col_cols - 1) of this 32-row block.
+  if (rank == kCluster - 1) {
+    for (int t = tid; t < p.s_col_cols - N; t += kThreads) {
+      p.s_col[col_scale_idx(p, blk32, N + t)] = 0;
+    }
+  }
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+}
+
 // Blocking ticket (levels 2 and 3): fences this CTA's stores, returns true (CTA-uniform) for
 // the last arrival, which also re-arms the ticket.
 __device__ __forceinline__ bool ticket_last(int *counter, int target, int *s_flag) {
@@ -256,6 +429,7 @@ __device__ __forceinline__ bool ticket_last(int *counter, int target, int *s_fla
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 
 // ------------------------------------------------------------------------------- the kernel
+template <int kQuant>
 __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(const Params p) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   extern __shared__ __align__(128) uint8_t smem[];
@@ -310,8 +484,24 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
 #pragma unroll
     for (int c = 0; c < 8; ++c) g[c] = bf2f(gw[c >> 1], c & 1) + add;
   }
+  // Second incoming gradient: loads in flight while the slabs arrive, summed into the dz slab.
+  const bool has_dz2 = p.dz2 != nullptr;
+  uint4 d2[kRows];
+  if (has_dz2 && owner) {
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      d2[r] = __ldg(reinterpret_cast<const uint4 *>(p.dz2 + static_cast<size_t>(row0 + r) * N + c0));
+    }
+  }
   __syncthreads();  // s_rsigma
   mbar_wait(mbar, 0);
+  if (has_dz2 && owner) {
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+      uint4 *dst = reinterpret_cast<uint4 *>(s_dz + r * N + c0);
+      *dst = add_bf16x8(*dst, d2[r]);
+    }
+  }
 
   // ---- sweep 1: per-row sum of dz * g * x
   {
@@ -431,8 +621,9 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
       }
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
-        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) =
-            add_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), a[r]);
+        const uint4 v = add_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), a[r]);
+        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) = v;
+        if constexpr (kQuant != 0) *reinterpret_cast<uint4 *>(s_dz + r * N + c0) = v;
       }
     } else {
 #pragma unroll
@@ -441,6 +632,11 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
             *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
       }
     }
+  }
+
+  // ---- MXFP8 emission of the final dx (staged in the dz slab; the x slab holds the maxima)
+  if constexpr (kQuant != 0) {
+    quantize_slab<kQuant>(p, s_dz, reinterpret_cast<float *>(s_x), cluster, rank, row0, blk32);
   }
 
   // ---- in-kernel dgamma reduction: 3-level tree of fixed-order sums, each level finished by
@@ -559,7 +755,8 @@ bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x,
                                                const Tensor &rsigma, const Tensor &gamma,
                                                const Tensor &dx, const Tensor &dgamma,
                                                const Tensor *add, const bool zero_centered_gamma,
-                                               std::string *reason) {
+                                               std::string *reason, const Tensor *dz2,
+                                               const Tensor *dx_q) {
   auto fail = [&](const std::string &why) {
     if (reason != nullptr) *reason = why;
     return false;
@@ -605,6 +802,44 @@ bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x,
       return fail("needs a 16-byte aligned residual gradient");
     }
   }
+  if (dz2 != nullptr) {
+    if (dz2->data.dtype != bf16 || dz2->data.shape != dz.data.shape) {
+      return fail("needs a BF16 second gradient shaped like dz");
+    }
+    if (!is_ptr_aligned(dz2->data.dptr)) {
+      return fail("needs a 16-byte aligned second gradient");
+    }
+  }
+  if (dx_q != nullptr) {
+    if (!is_mxfp8_scaling(dx_q->scaling_mode)) {
+      return fail("quantized dx: needs MXFP8 scaling");
+    }
+    if (!dx_q->has_data() || !dx_q->has_columnwise_data()) {
+      return fail("quantized dx: needs row-wise and column-wise data");
+    }
+    const DType qt = dx_q->data.dtype;
+    if ((qt != DType::kFloat8E4M3 && qt != DType::kFloat8E5M2) ||
+        dx_q->columnwise_data.dtype != qt) {
+      return fail("quantized dx: needs E4M3 or E5M2 data in both directions");
+    }
+    if (rows % 128 != 0) {
+      return fail(concat_strings("quantized dx: needs rows divisible by 128 (got ", rows, ")"));
+    }
+    if (dx_q->data.numel() != rows * cols || dx_q->columnwise_data.numel() != rows * cols) {
+      return fail("quantized dx: data shaped unlike x");
+    }
+    const Shape srow{rows, DIVUP(cols / 32, size_t{4}) * 4};
+    const Shape scol{DIVUP(rows / 32, size_t{4}) * 4, DIVUP(cols, size_t{128}) * 128};
+    if (dx_q->scale_inv.shape != srow || dx_q->columnwise_scale_inv.shape != scol) {
+      return fail("quantized dx: unexpected scale shapes");
+    }
+    if (!is_ptr_aligned<8>(dx_q->data.dptr, dx_q->columnwise_data.dptr)) {
+      return fail("quantized dx: needs 8-byte aligned data");
+    }
+    if (cuda::sm_arch(cuda::current_device()) < 100) {
+      return fail("quantized dx: requires SM 10.0+");
+    }
+  }
   if (zero_centered_gamma && use_zero_centered_gamma_in_weight_dtype()) {
     return fail("zero-centered gamma in weight dtype (NVTE_ZERO_CENTERED_GAMMA_IN_WTYPE)");
   }
@@ -621,8 +856,8 @@ size_t rmsnorm_bwd_single_sweep_workspace_bytes(const size_t rows, const size_t 
 
 void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &rsigma,
                               const Tensor &gamma, const Tensor *add, Tensor *dx, Tensor *dgamma,
-                              void *workspace, const bool zero_centered_gamma,
-                              cudaStream_t stream) {
+                              void *workspace, const bool zero_centered_gamma, cudaStream_t stream,
+                              const Tensor *dz2, Tensor *dx_q) {
   const auto [rows, cols] = x.flat_2d_dims();
   const Plan plan = make_plan(rows);
   const WorkspaceLayout layout = workspace_layout(rows, cols);
@@ -646,6 +881,21 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
   p.group = plan.group;
   p.ngroups = plan.ngroups;
   p.zero_centered = zero_centered_gamma ? 1 : 0;
+  p.dz2 = dz2 != nullptr ? static_cast<const uint16_t *>(dz2->data.dptr) : nullptr;
+  p.q_row = p.q_col = p.s_row = p.s_col = nullptr;
+  p.s_row_cols = p.s_col_cols = 0;
+  p.swizzled = 0;
+  int quant = 0;
+  if (dx_q != nullptr) {
+    quant = dx_q->data.dtype == DType::kFloat8E5M2 ? 2 : 1;
+    p.q_row = static_cast<uint8_t *>(dx_q->data.dptr);
+    p.q_col = static_cast<uint8_t *>(dx_q->columnwise_data.dptr);
+    p.s_row = static_cast<uint8_t *>(dx_q->scale_inv.dptr);
+    p.s_col = static_cast<uint8_t *>(dx_q->columnwise_scale_inv.dptr);
+    p.s_row_cols = static_cast<int>(dx_q->scale_inv.shape[1]);
+    p.s_col_cols = static_cast<int>(dx_q->columnwise_scale_inv.shape[1]);
+    p.swizzled = dx_q->with_gemm_swizzled_scales ? 1 : 0;
+  }
 
   p.tickets = ticket_slot(cuda::current_device(), stream);
   if (p.tickets == nullptr) {
@@ -656,8 +906,10 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
   }
 
   const size_t smem = smem_bytes(p.N);
-  NVTE_CHECK_CUDA(cudaFuncSetAttribute(rmsnorm_bwd_single_sweep_kernel,
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+  auto kernel = quant == 2   ? rmsnorm_bwd_single_sweep_kernel<2>
+                : quant == 1 ? rmsnorm_bwd_single_sweep_kernel<1>
+                             : rmsnorm_bwd_single_sweep_kernel<0>;
+  NVTE_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        static_cast<int>(smem)));
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(static_cast<unsigned>(rows / kRows), 1, 1);
@@ -671,7 +923,7 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
   attr[0].val.clusterDim.z = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  NVTE_CHECK_CUDA(cudaLaunchKernelEx(&cfg, rmsnorm_bwd_single_sweep_kernel, p));
+  NVTE_CHECK_CUDA(cudaLaunchKernelEx(&cfg, kernel, p));
 }
 
 }  // namespace normalization

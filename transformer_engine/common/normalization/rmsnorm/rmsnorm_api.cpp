@@ -395,3 +395,61 @@ bool nvte_rmsnorm_bwd_uses_single_sweep(const NVTETensor dz, const NVTETensor x,
              *convertNVTETensorCheck(dx), *convertNVTETensorCheck(dgamma), nullptr,
              zero_centered_gamma, nullptr);
 }
+
+namespace {
+const transformer_engine::Tensor *optional_tensor(const NVTETensor t) {
+  return t == nullptr ? nullptr : transformer_engine::convertNVTETensorCheck(t);
+}
+}  // namespace
+
+bool nvte_rmsnorm_bwd_fused_supported(const NVTETensor dz, const NVTETensor dz2,
+                                      const NVTETensor x, const NVTETensor add,
+                                      const NVTETensor rsigma, const NVTETensor gamma,
+                                      const NVTETensor dx, const NVTETensor dgamma,
+                                      const NVTETensor dx_quantized,
+                                      const bool zero_centered_gamma) {
+  NVTE_API_CALL(nvte_rmsnorm_bwd_fused_supported);
+  using namespace transformer_engine;
+  using namespace transformer_engine::normalization;
+  return is_supported_by_rmsnorm_bwd_single_sweep(
+      *convertNVTETensorCheck(dz), *convertNVTETensorCheck(x), *convertNVTETensorCheck(rsigma),
+      *convertNVTETensorCheck(gamma), *convertNVTETensorCheck(dx), *convertNVTETensorCheck(dgamma),
+      optional_tensor(add), zero_centered_gamma, nullptr, optional_tensor(dz2),
+      optional_tensor(dx_quantized));
+}
+
+void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor dz2, const NVTETensor x,
+                            const NVTETensor add, const NVTETensor rsigma, const NVTETensor gamma,
+                            NVTETensor dx, NVTETensor dgamma, NVTETensor dx_quantized,
+                            NVTETensor workspace, const bool zero_centered_gamma,
+                            cudaStream_t stream) {
+  NVTE_API_CALL(nvte_rmsnorm_bwd_fused);
+  using namespace transformer_engine;
+  using namespace transformer_engine::normalization;
+  const Tensor &dz_t = *convertNVTETensorCheck(dz);
+  const Tensor &x_t = *convertNVTETensorCheck(x);
+  const Tensor &rsigma_t = *convertNVTETensorCheck(rsigma);
+  const Tensor &gamma_t = *convertNVTETensorCheck(gamma);
+  Tensor *dx_t = convertNVTETensorCheck(dx);
+  Tensor *dgamma_t = convertNVTETensorCheck(dgamma);
+  Tensor *workspace_t = convertNVTETensorCheck(workspace);
+  const Tensor *dz2_t = optional_tensor(dz2);
+  const Tensor *add_t = optional_tensor(add);
+  Tensor *dxq_t = dx_quantized == nullptr ? nullptr : convertNVTETensorCheck(dx_quantized);
+  std::string reason;
+  NVTE_CHECK(is_supported_by_rmsnorm_bwd_single_sweep(dz_t, x_t, rsigma_t, gamma_t, *dx_t,
+                                                      *dgamma_t, add_t, zero_centered_gamma,
+                                                      &reason, dz2_t, dxq_t),
+             "nvte_rmsnorm_bwd_fused: unsupported configuration: ", reason);
+  const auto [rows, cols] = x_t.flat_2d_dims();
+  const size_t bytes = rmsnorm_bwd_single_sweep_workspace_bytes(rows, cols);
+  if (workspace_t->data.numel() == 0) {
+    workspace_t->data.shape = {bytes};
+    workspace_t->data.dtype = DType::kByte;
+    return;
+  }
+  NVTE_CHECK(workspace_t->data.dtype == DType::kByte && workspace_t->data.shape == Shape{bytes},
+             "nvte_rmsnorm_bwd_fused: unexpected workspace");
+  rmsnorm_bwd_single_sweep(dz_t, x_t, rsigma_t, gamma_t, add_t, dx_t, dgamma_t,
+                           workspace_t->data.dptr, zero_centered_gamma, stream, dz2_t, dxq_t);
+}

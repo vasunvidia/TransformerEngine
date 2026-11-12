@@ -215,6 +215,51 @@ bool nvte_rmsnorm_bwd_uses_single_sweep(const NVTETensor dz, const NVTETensor x,
                                         const NVTETensor dx, const NVTETensor dgamma,
                                         const bool zero_centered_gamma);
 
+/*! \brief Fused single-sweep RMSNorm backward for a pre-norm residual block.
+ *
+ *  Always runs the single-sweep kernel (regardless of NVTE_RMSNORM_BWD_SINGLE_SWEEP); check
+ *  nvte_rmsnorm_bwd_fused_supported first. Three optional fusions:
+ *   - `dz2`: a second incoming gradient of the normalized output (e.g. when it feeds a MoE
+ *     router and the experts). dz = dz + dz2 is formed in fp32 and rounded to BF16 once, as a
+ *     separate BF16 addition would.
+ *   - `add`: a residual gradient added to the BF16-rounded dx (as nvte_rmsnorm_bwd_add with the
+ *     single-sweep kernel).
+ *   - `dx_quantized`: an MXFP8 tensor (row-wise and column-wise data, E4M3 or E5M2, compact or
+ *     GEMM-swizzled scales, rows divisible by 128, compute capability 10.0+) that receives the
+ *     final dx quantized exactly as the MXFP8 quantizer would quantize dx.
+ *  Results are bitwise those of the single-sweep nvte_rmsnorm_bwd(_add) applied to the BF16
+ *  sum dz + dz2, followed by MXFP8 quantization of dx.
+ *
+ *  Calling this function with workspace set to an empty tensor will not perform the operation,
+ *  but instead set the shape and type of the workspace tensor to the required values.
+ *
+ *  \param[in]     dz                  Incoming gradient tensor of shape [..., H].
+ *  \param[in]     dz2                 Second incoming gradient [..., H], or NULL.
+ *  \param[in]     x                   Forward input tensor of shape [..., H].
+ *  \param[in]     add                 Residual gradient added to dx [..., H], or NULL.
+ *  \param[in]     rsigma              Reciprocal RMS of the input. Shape: [N].
+ *  \param[in]     gamma               Gamma tensor of shape [H].
+ *  \param[out]    dx                  Output gradient of shape [..., H].
+ *  \param[out]    dgamma              Gradient for gamma tensor of shape [H].
+ *  \param[out]    dx_quantized        MXFP8 copy of dx, or NULL.
+ *  \param[out]    workspace           Workspace tensor.
+ *  \param[in]     zero_centered_gamma Multiply normalized values by @f$ \gamma+1 @f$.
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_rmsnorm_bwd_fused(const NVTETensor dz, const NVTETensor dz2, const NVTETensor x,
+                            const NVTETensor add, const NVTETensor rsigma, const NVTETensor gamma,
+                            NVTETensor dx, NVTETensor dgamma, NVTETensor dx_quantized,
+                            NVTETensor workspace, const bool zero_centered_gamma,
+                            cudaStream_t stream);
+
+/*! \brief Whether nvte_rmsnorm_bwd_fused supports these tensors (NULL for absent optional ones). */
+bool nvte_rmsnorm_bwd_fused_supported(const NVTETensor dz, const NVTETensor dz2,
+                                      const NVTETensor x, const NVTETensor add,
+                                      const NVTETensor rsigma, const NVTETensor gamma,
+                                      const NVTETensor dx, const NVTETensor dgamma,
+                                      const NVTETensor dx_quantized,
+                                      const bool zero_centered_gamma);
+
 /*! \brief Control whether norm computes `gamma += 1.0` for zero-centered gamma
  *  in weight dtype. If set to false, it will compute in compute dtype.
  *
