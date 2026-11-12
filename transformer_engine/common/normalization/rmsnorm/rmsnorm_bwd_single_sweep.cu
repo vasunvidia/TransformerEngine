@@ -61,8 +61,9 @@
  *     column-wise (E4M3 or E5M2, compact or GEMM-swizzled scales, padding zeroed). The values
  *     and scales are those of the MXFP8 quantizer applied to the bf16 dx: per 32-element block
  *     amax -> E8M0 scale (float_to_e8m0(amax / fp8_max)) -> cvt.rn.satfinite(x * 2^-scale).
- *     A row-wise block is 4 adjacent threads (shuffle); a column-wise block is the 32 rows of the
- *     cluster, whose 4 per-CTA column maxima are exchanged through distributed shared memory.
+ *     The row-wise quantization runs in the dx store loop (a 32-column block is 4 adjacent threads,
+ *     shuffle max); a column-wise block is the 32 rows of the cluster, whose 4 per-CTA column
+ *     maxima are pushed into every peer's shared memory ahead of one split cluster barrier.
  *     This lets the consumer of dx (e.g. the GEMMs of the preceding Linear) skip its own
  *     quantization pass over dx.
  *
@@ -212,14 +213,6 @@ __device__ __forceinline__ void st_dsmem_f4(uint32_t addr, float4 v) {
                "f"(v.y), "f"(v.z), "f"(v.w)
                : "memory");
 }
-__device__ __forceinline__ float4 ld_dsmem_f4(uint32_t addr) {
-  float4 v;
-  asm volatile("ld.shared::cluster.v4.f32 {%0, %1, %2, %3}, [%4];"
-               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
-               : "r"(addr)
-               : "memory");
-  return v;
-}
 __device__ __forceinline__ float bf2f(uint32_t packed, int hi) {
   return __uint_as_float(hi ? (packed & 0xFFFF0000u) : (packed << 16));
 }
@@ -310,35 +303,54 @@ __device__ __forceinline__ size_t col_scale_idx(const Params &p, int blk32, int 
                     : static_cast<size_t>(blk32) * p.s_col_cols + col;
 }
 
-// The CTA's 8 x N slab of final dx (bf16, in shared memory) to MXFP8 row-wise and column-wise.
-// Called by every thread of every CTA of the cluster (it contains cluster barriers). s_camax
-// (N floats of this CTA's shared memory, no longer used otherwise) holds the per-column maxima.
+// The CTA's dx store with MXFP8 emission. Per row: the final dx (dz slab, plus the residual
+// gradient) is stored in BF16, kept in the dz slab, and quantized row-wise right away (a 32-column
+// block is 4 adjacent threads; N % 32 == 0, so no block mixes owners and idle threads); the
+// per-column maxima over the CTA's rows accumulate in registers. Column-wise blocks are the
+// cluster's 32 rows: every CTA pushes its maxima into each peer's inbox (`inbox`, kCluster x N
+// floats in the no longer used x slab), one split cluster barrier (row-wise scale padding in
+// between), then each CTA quantizes its rows column-wise from the dz slab. Called by every thread
+// of every CTA of the cluster.
 template <int kQuant>
-__device__ __forceinline__ void quantize_slab(const Params &p, const uint16_t *s_dx, float *s_camax,
-                                              cg::cluster_group &cluster, const int rank,
-                                              const int row0, const int blk32) {
+__device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_dz, float *inbox,
+                                                   const int rank, const int row0,
+                                                   const int blk32) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr float kMaxNormRcp = Quantized_Limits<QuantOType<kQuant>>::max_norm_rcp;
   const int N = p.N;
   const int tid = threadIdx.x;
   const bool owner = tid < (N >> 3);
   const int c0 = tid * 8;
+  const bool has_add = p.add != nullptr;
   float cmax[8];
 #pragma unroll
   for (int c = 0; c < 8; ++c) cmax[c] = 0.0f;
 
-  // Row-wise: a 32-column block is 4 adjacent threads (N % 32 == 0, so no group mixes owners
-  // and idle threads).
+  uint4 a[kRows];
+  if (owner && has_add) {
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {  // all loads in flight before the first store
+      a[r] = __ldg(reinterpret_cast<const uint4 *>(p.add + static_cast<size_t>(row0 + r) * N + c0));
+    }
+  }
 #pragma unroll
   for (int r = 0; r < kRows; ++r) {
     float f[8];
     float amax = 0.0f;
     if (owner) {
-      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dx + r * N + c0), f);
+      uint4 *slot = reinterpret_cast<uint4 *>(s_dz + r * N + c0);
+      uint4 v = *slot;
+      if (has_add) {
+        v = add_bf16x8(v, a[r]);
+        *slot = v;
+      }
+      *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) = v;
+      unpack_bf16x8(v, f);
 #pragma unroll
       for (int c = 0; c < 8; ++c) {
-        amax = fmaxf(amax, fabsf(f[c]));
-        cmax[c] = fmaxf(cmax[c], fabsf(f[c]));
+        const float m = fabsf(f[c]);
+        amax = fmaxf(amax, m);
+        cmax[c] = fmaxf(cmax[c], m);
       }
     }
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
@@ -352,36 +364,40 @@ __device__ __forceinline__ void quantize_slab(const Params &p, const uint16_t *s
       if ((tid & 3) == 0) p.s_row[row_scale_idx(p, row0 + r, tid >> 2)] = e;
     }
   }
-  // Row-wise scale padding (columns N / 32 .. s_row_cols - 1) of this CTA's rows.
-  {
+
+  // Column maxima to every CTA of the cluster (slot `rank` of each inbox).
+  if (owner) {
+#pragma unroll
+    for (int q = 0; q < kCluster; ++q) {
+      const uint32_t dst = mapa_u32(smem_u32(inbox + rank * N + c0), q);
+      st_dsmem_f4(dst, make_float4(cmax[0], cmax[1], cmax[2], cmax[3]));
+      st_dsmem_f4(dst + 16u, make_float4(cmax[4], cmax[5], cmax[6], cmax[7]));
+    }
+  }
+  asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+  {  // row-wise scale padding (columns N / 32 .. s_row_cols - 1) of this CTA's rows
     const int npad = p.s_row_cols - (N >> 5);
     for (int t = tid; t < kRows * npad; t += kThreads) {
       p.s_row[row_scale_idx(p, row0 + t / npad, (N >> 5) + t % npad)] = 0;
     }
   }
-
-  // Column-wise: the block is the cluster's 32 rows; exchange the per-CTA maxima.
-  if (owner) {
-    *reinterpret_cast<float4 *>(s_camax + c0) = make_float4(cmax[0], cmax[1], cmax[2], cmax[3]);
-    *reinterpret_cast<float4 *>(s_camax + c0 + 4) =
-        make_float4(cmax[4], cmax[5], cmax[6], cmax[7]);
+  if (rank == kCluster - 1) {  // column-wise scale padding (columns N ..) of this 32-row block
+    for (int t = tid; t < p.s_col_cols - N; t += kThreads) {
+      p.s_col[col_scale_idx(p, blk32, N + t)] = 0;
+    }
   }
-  cluster.sync();
+  asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+
   if (owner) {
 #pragma unroll
     for (int q = 0; q < kCluster; ++q) {
-      if (q == rank) continue;
-      const uint32_t a = mapa_u32(smem_u32(s_camax + c0), q);
-      const float4 v0 = ld_dsmem_f4(a);
-      const float4 v1 = ld_dsmem_f4(a + 16u);
+      const float4 v0 = *reinterpret_cast<const float4 *>(inbox + q * N + c0);
+      const float4 v1 = *reinterpret_cast<const float4 *>(inbox + q * N + c0 + 4);
       cmax[0] = fmaxf(cmax[0], v0.x); cmax[1] = fmaxf(cmax[1], v0.y);  // NOLINT(*)
       cmax[2] = fmaxf(cmax[2], v0.z); cmax[3] = fmaxf(cmax[3], v0.w);  // NOLINT(*)
       cmax[4] = fmaxf(cmax[4], v1.x); cmax[5] = fmaxf(cmax[5], v1.y);  // NOLINT(*)
       cmax[6] = fmaxf(cmax[6], v1.z); cmax[7] = fmaxf(cmax[7], v1.w);  // NOLINT(*)
     }
-  }
-  cluster.sync();  // every peer has read this CTA's maxima (shared memory stays valid until here)
-  if (owner) {
     e8m0_t e[8];
     float m[8];
 #pragma unroll
@@ -392,19 +408,13 @@ __device__ __forceinline__ void quantize_slab(const Params &p, const uint16_t *s
 #pragma unroll
     for (int r = 0; r < kRows; ++r) {
       float f[8];
-      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dx + r * N + c0), f);
+      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), f);
       *reinterpret_cast<uint2 *>(p.q_col + static_cast<size_t>(row0 + r) * N + c0) =
           quantize_8x<kQuant>(f, m);
     }
     if (rank == 0) {
 #pragma unroll
       for (int c = 0; c < 8; ++c) p.s_col[col_scale_idx(p, blk32, c0 + c)] = e[c];
-    }
-  }
-  // Column-wise scale padding (columns N .. s_col_cols - 1) of this 32-row block.
-  if (rank == kCluster - 1) {
-    for (int t = tid; t < p.s_col_cols - N; t += kThreads) {
-      p.s_col[col_scale_idx(p, blk32, N + t)] = 0;
     }
   }
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -612,7 +622,10 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
   }
 
   // ---- dx (bf16, staged in shared memory) to global, plus the residual gradient if given
-  if (owner) {
+  if constexpr (kQuant != 0) {
+    // with its MXFP8 copy (the x slab is the column-maxima inbox from here on)
+    store_dx_quantized<kQuant>(p, s_dz, reinterpret_cast<float *>(s_x), rank, row0, blk32);
+  } else if (owner) {
     if (p.add != nullptr) {
       uint4 a[kRows];
 #pragma unroll
@@ -621,9 +634,8 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
       }
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
-        const uint4 v = add_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), a[r]);
-        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) = v;
-        if constexpr (kQuant != 0) *reinterpret_cast<uint4 *>(s_dz + r * N + c0) = v;
+        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) =
+            add_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), a[r]);
       }
     } else {
 #pragma unroll
@@ -632,11 +644,6 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
             *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
       }
     }
-  }
-
-  // ---- MXFP8 emission of the final dx (staged in the dz slab; the x slab holds the maxima)
-  if constexpr (kQuant != 0) {
-    quantize_slab<kQuant>(p, s_dz, reinterpret_cast<float *>(s_x), cluster, rank, row0, blk32);
   }
 
   // ---- in-kernel dgamma reduction: 3-level tree of fixed-order sums, each level finished by
