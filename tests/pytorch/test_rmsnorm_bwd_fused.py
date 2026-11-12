@@ -23,6 +23,7 @@ import torch
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
 from transformer_engine.common import recipe
+from transformer_engine.pytorch.constants import FP8BwdTensorIdx
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
 ENV = "NVTE_RMSNORM_BWD_SINGLE_SWEEP"
@@ -85,14 +86,23 @@ def reference(dz, dz2, x, add, rsigma, gamma, zcg, quantizer):
 
 
 def assert_mxfp8_equal(a, b):
+    """Data and scales bitwise. Swizzled scales: the whole buffers (the quantizer zeroes the
+    padding, so must the kernel). Compact scales: the valid region (the quantizer leaves the
+    padding uninitialized; the kernel writes zeros there)."""
     assert isinstance(a, MXFP8Tensor), type(a)
     assert a.shape == b.shape and a.dtype == b.dtype
     assert a._fp8_dtype == b._fp8_dtype
     assert a._with_gemm_swizzled_scales == b._with_gemm_swizzled_scales
+    rows, cols = a.numel() // a.shape[-1], a.shape[-1]
+    valid = {"_rowwise_scale_inv": (rows, cols // 32), "_columnwise_scale_inv": (rows // 32, cols)}
     for name in ("_rowwise_data", "_columnwise_data", "_rowwise_scale_inv", "_columnwise_scale_inv"):
-        ta, tb = getattr(a, name), getattr(b, name)
+        ta, tb = getattr(a, name).view(torch.uint8), getattr(b, name).view(torch.uint8)
         assert ta.shape == tb.shape, (name, ta.shape, tb.shape)
-        assert torch.equal(ta.view(torch.uint8), tb.view(torch.uint8)), f"{name} differs"
+        if name in valid and not a._with_gemm_swizzled_scales:
+            r, c = valid[name]
+            assert not ta[:, c:].any() and not ta[r:].any(), f"{name}: padding not zero"
+            ta, tb = ta[:r, :c], tb[:r, :c]
+        assert torch.equal(ta, tb), f"{name} differs"
 
 
 def kernels_of(fn):
@@ -221,7 +231,7 @@ def test_quantized_grad_into_linear(bias):
         a = inp.clone().requires_grad_(True)
         with te.autocast(enabled=True, recipe=mx):
             out = lin(a)
-        quantizer = lin.quantizers["scaling_bwd"][tex.FP8BwdTensorIdx.GRAD_OUTPUT1].copy()
+        quantizer = lin.quantizers["scaling_bwd"][FP8BwdTensorIdx.GRAD_OUTPUT1].copy()
         quantizer.internal = False
         quantizer.set_usage(rowwise=True, columnwise=True)
         out.backward(grad_fn(quantizer))
