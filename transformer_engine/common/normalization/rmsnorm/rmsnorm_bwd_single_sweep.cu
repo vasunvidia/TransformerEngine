@@ -274,15 +274,16 @@ __device__ __forceinline__ void reduce_rows_f32(const float *base, int nrows, in
 template <int kQuant>
 using QuantOType = std::conditional_t<kQuant == 2, fp8e5m2, fp8e4m3>;
 
-// Eight fp32 values times per-value multipliers, converted to eight FP8 values (element 0 in the
-// lowest byte), as the MXFP8 quantizer does: cvt.rn.satfinite(x * 2^-scale).
+// Eight BF16 values (4 packed pairs) times per-value multipliers, converted to eight FP8 values
+// (element 0 in the lowest byte), as the MXFP8 quantizer does: cvt.rn.satfinite(x * 2^-scale)
+// (the BF16 -> FP32 conversion is exact).
 template <int kQuant>
-__device__ __forceinline__ uint2 quantize_8x(const float (&v)[8], const float (&m)[8]) {
+__device__ __forceinline__ uint2 quantize_8x(const uint32_t (&w)[4], const float (&m)[8]) {
   using OTypex2 = std::conditional_t<kQuant == 2, ptx::fp8e5m2x2, ptx::fp8e4m3x2>;
   OTypex2 o[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
-    ptx::mul_cvt_2x(o[k], ptx::floatx2{v[2 * k], v[2 * k + 1]},
+    ptx::mul_cvt_2x(o[k], reinterpret_cast<const ptx::bf16x2 &>(w[k]),
                     ptx::floatx2{m[2 * k], m[2 * k + 1]});
   }
   const auto u = [&](int k) {
@@ -291,11 +292,15 @@ __device__ __forceinline__ uint2 quantize_8x(const float (&v)[8], const float (&
   return make_uint2(u(0) | (u(1) << 16), u(2) | (u(3) << 16));
 }
 
-__device__ __forceinline__ void unpack_bf16x8(const uint4 a, float (&f)[8]) {
-  const uint32_t w[4] = {a.x, a.y, a.z, a.w};
-#pragma unroll
-  for (int c = 0; c < 8; ++c) f[c] = bf2f(w[c >> 1], c & 1);
+// Per-lane max of |a| and |b| on packed BF16 pairs (the magnitude is exact; the sign is dropped
+// by the caller).
+__device__ __forceinline__ uint32_t absmax_bf16x2(const uint32_t a, const uint32_t b) {
+  uint32_t d;
+  asm("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
 }
+__device__ __forceinline__ float abs_lo(const uint32_t w) { return fabsf(bf2f(w, 0)); }
+__device__ __forceinline__ float abs_hi(const uint32_t w) { return fabsf(bf2f(w, 1)); }
 
 // Row-wise scale index of (row, scale column j); column-wise of (block row j, column).
 __device__ __forceinline__ size_t row_scale_idx(const Params &p, int row, int j) {
@@ -317,7 +322,7 @@ __device__ __forceinline__ size_t col_scale_idx(const Params &p, int blk32, int 
 // between), then each CTA quantizes its rows column-wise from the dz slab. Called by every thread
 // of every CTA of the cluster.
 template <int kQuant>
-__device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_dz, float *inbox,
+__device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_dz, uint32_t *inbox,
                                                    const int rank, const int row0,
                                                    const int blk32) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -327,9 +332,7 @@ __device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_
   const bool owner = tid < (N >> 3);
   const int c0 = tid * 8;
   const bool has_add = p.add != nullptr;
-  float cmax[8];
-#pragma unroll
-  for (int c = 0; c < 8; ++c) cmax[c] = 0.0f;
+  uint32_t cmax[4] = {0u, 0u, 0u, 0u};  // per-column |max| over the CTA's rows, BF16 pairs
 
   uint4 a[kRows];
   if (owner && has_add) {
@@ -340,7 +343,7 @@ __device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_
   }
 #pragma unroll
   for (int r = 0; r < kRows; ++r) {
-    float f[8];
+    uint32_t w[4] = {0u, 0u, 0u, 0u};
     float amax = 0.0f;
     if (owner) {
       uint4 *slot = reinterpret_cast<uint4 *>(s_dz + r * N + c0);
@@ -350,13 +353,11 @@ __device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_
         *slot = v;
       }
       *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) = v;
-      unpack_bf16x8(v, f);
+      w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w;  // NOLINT(*)
 #pragma unroll
-      for (int c = 0; c < 8; ++c) {
-        const float m = fabsf(f[c]);
-        amax = fmaxf(amax, m);
-        cmax[c] = fmaxf(cmax[c], m);
-      }
+      for (int k = 0; k < 4; ++k) cmax[k] = absmax_bf16x2(cmax[k], w[k]);
+      const uint32_t m2 = absmax_bf16x2(absmax_bf16x2(w[0], w[1]), absmax_bf16x2(w[2], w[3]));
+      amax = fmaxf(abs_lo(m2), abs_hi(m2));
     }
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
@@ -365,18 +366,19 @@ __device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_
       const float mult = ptx::exp2f_rcp<float>(e);
       const float m[8] = {mult, mult, mult, mult, mult, mult, mult, mult};
       *reinterpret_cast<uint2 *>(p.q_row + static_cast<size_t>(row0 + r) * N + c0) =
-          quantize_8x<kQuant>(f, m);
+          quantize_8x<kQuant>(w, m);
       if ((tid & 3) == 0) p.s_row[row_scale_idx(p, row0 + r, tid >> 2)] = e;
     }
   }
 
-  // Column maxima to every CTA of the cluster (slot `rank` of each inbox).
+  // Column maxima to every CTA of the cluster (slot `rank` of each inbox: kCluster x N / 2 pairs).
   if (owner) {
 #pragma unroll
     for (int q = 0; q < kCluster; ++q) {
-      const uint32_t dst = mapa_u32(smem_u32(inbox + rank * N + c0), q);
-      st_dsmem_f4(dst, make_float4(cmax[0], cmax[1], cmax[2], cmax[3]));
-      st_dsmem_f4(dst + 16u, make_float4(cmax[4], cmax[5], cmax[6], cmax[7]));
+      const uint32_t dst = mapa_u32(smem_u32(inbox + rank * (N >> 1) + (c0 >> 1)), q);
+      asm volatile("st.shared::cluster.v4.b32 [%0], {%1, %2, %3, %4};" ::"r"(dst), "r"(cmax[0]),
+                   "r"(cmax[1]), "r"(cmax[2]), "r"(cmax[3])
+                   : "memory");
     }
   }
   asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
@@ -396,26 +398,27 @@ __device__ __forceinline__ void store_dx_quantized(const Params &p, uint16_t *s_
   if (owner) {
 #pragma unroll
     for (int q = 0; q < kCluster; ++q) {
-      const float4 v0 = *reinterpret_cast<const float4 *>(inbox + q * N + c0);
-      const float4 v1 = *reinterpret_cast<const float4 *>(inbox + q * N + c0 + 4);
-      cmax[0] = fmaxf(cmax[0], v0.x); cmax[1] = fmaxf(cmax[1], v0.y);  // NOLINT(*)
-      cmax[2] = fmaxf(cmax[2], v0.z); cmax[3] = fmaxf(cmax[3], v0.w);  // NOLINT(*)
-      cmax[4] = fmaxf(cmax[4], v1.x); cmax[5] = fmaxf(cmax[5], v1.y);  // NOLINT(*)
-      cmax[6] = fmaxf(cmax[6], v1.z); cmax[7] = fmaxf(cmax[7], v1.w);  // NOLINT(*)
+      const uint4 v = *reinterpret_cast<const uint4 *>(inbox + q * (N >> 1) + (c0 >> 1));
+      cmax[0] = absmax_bf16x2(cmax[0], v.x);
+      cmax[1] = absmax_bf16x2(cmax[1], v.y);
+      cmax[2] = absmax_bf16x2(cmax[2], v.z);
+      cmax[3] = absmax_bf16x2(cmax[3], v.w);
     }
     e8m0_t e[8];
     float m[8];
 #pragma unroll
-    for (int c = 0; c < 8; ++c) {
-      e[c] = ptx::float_to_e8m0(cmax[c] * kMaxNormRcp);
-      m[c] = ptx::exp2f_rcp<float>(e[c]);
+    for (int k = 0; k < 4; ++k) {
+      e[2 * k] = ptx::float_to_e8m0(abs_lo(cmax[k]) * kMaxNormRcp);
+      e[2 * k + 1] = ptx::float_to_e8m0(abs_hi(cmax[k]) * kMaxNormRcp);
     }
 #pragma unroll
+    for (int c = 0; c < 8; ++c) m[c] = ptx::exp2f_rcp<float>(e[c]);
+#pragma unroll
     for (int r = 0; r < kRows; ++r) {
-      float f[8];
-      unpack_bf16x8(*reinterpret_cast<const uint4 *>(s_dz + r * N + c0), f);
+      const uint4 v = *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
+      const uint32_t w[4] = {v.x, v.y, v.z, v.w};
       *reinterpret_cast<uint2 *>(p.q_col + static_cast<size_t>(row0 + r) * N + c0) =
-          quantize_8x<kQuant>(f, m);
+          quantize_8x<kQuant>(w, m);
     }
     if (rank == 0) {
 #pragma unroll
@@ -633,7 +636,7 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
   // ---- dx (bf16, staged in shared memory) to global, plus the residual gradient if given
   if constexpr (kQuant != 0) {
     // with its MXFP8 copy (the x slab is the column-maxima inbox from here on)
-    store_dx_quantized<kQuant>(p, s_dz, reinterpret_cast<float *>(s_x), rank, row0, blk32);
+    store_dx_quantized<kQuant>(p, s_dz, reinterpret_cast<uint32_t *>(s_x), rank, row0, blk32);
   } else if (owner) {
     if (p.add != nullptr) {
       uint4 a[kRows];
