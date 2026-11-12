@@ -64,6 +64,8 @@
  *     The row-wise quantization runs in the dx store loop (a 32-column block is 4 adjacent threads,
  *     shuffle max); a column-wise block is the 32 rows of the cluster, whose 4 per-CTA column
  *     maxima are pushed into every peer's shared memory ahead of one split cluster barrier.
+ *  With a residual gradient, its 8-row slab is prefetched into L2 (one bulk prefetch, issued with
+ *  the slab loads), so the loads at the dx store hit L2.
  *     This lets the consumer of dx (e.g. the GEMMs of the preceding Linear) skip its own
  *     quantization pass over dx.
  *
@@ -189,6 +191,9 @@ __device__ __forceinline__ void bulk_g2s(void *dst, const void *src, uint32_t by
           "r"(smem_u32(dst)),
       "l"(src), "r"(bytes), "r"(smem_u32(bar))
       : "memory");
+}
+__device__ __forceinline__ void bulk_prefetch_l2(const void *src, uint32_t bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void mbar_wait(uint64_t *bar, uint32_t parity) {
   asm volatile(
@@ -483,6 +488,10 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
              mbar);
     bulk_g2s(s_x, p.x + static_cast<size_t>(row0) * N, static_cast<uint32_t>(kRows * N * 2),
              mbar);
+    // The residual gradient is read only at the dx store: start bringing its slab into L2 now.
+    if (p.add != nullptr) {
+      bulk_prefetch_l2(p.add + static_cast<size_t>(row0) * N, static_cast<uint32_t>(kRows * N * 2));
+    }
   }
   if (tid < kRows) s_rsigma[tid] = p.rsigma[row0 + tid];
   float g[8];
