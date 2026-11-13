@@ -90,6 +90,64 @@ void nvte_multi_tensor_l2norm_single_launch_cuda(
     NVTETensor ret, NVTETensor ret_per_tensor, int per_tensor, int max_chunks_per_tensor,
     cudaStream_t stream);
 
+/*!  \brief Block-sum layout of nvte_multi_tensor_l2norm_single_launch_cuda, for the split form
+ *          (nvte_multi_tensor_l2norm_single_launch_partials_cuda and
+ *          nvte_multi_tensor_l2norm_single_launch_finalize_cuda).
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]     chunk_size              Number of tensor elements processed by a CUDA block.
+ *  \param[in]     tensor_lists            2D array of input tensors (one list: the whole norm).
+ *  \param[in]     num_tensor_lists        Size (dim0) of tensor_lists (must be 1).
+ *  \param[in]     num_tensors_per_list    Size (dim1) of tensor_lists.
+ *  \param[out]    first_slot              Host array of num_tensors_per_list elements (or null):
+ *                                         block-sum slot of chunk 0 of every tensor (chunk c of
+ *                                         tensor t has slot first_slot[t] + c).
+ *  \return Number of FP32 elements of the block-sum array (as
+ *          nvte_multi_tensor_l2norm_single_launch_output_size).
+ */
+size_t nvte_multi_tensor_l2norm_single_launch_slots(int chunk_size, NVTETensor **tensor_lists,
+                                                    const size_t num_tensor_lists,
+                                                    const size_t num_tensors_per_list,
+                                                    int64_t *first_slot);
+
+/*!  \brief Block sums of the single-launch L2 norm for a subset of the tensors of a norm.
+ *
+ * Runs the main kernels of nvte_multi_tensor_l2norm_single_launch_cuda for these tensors and
+ * stores the block sums of tensor t at first_slot[t] + chunk in `output`, the slots the whole
+ * tensor list gives them (nvte_multi_tensor_l2norm_single_launch_slots). Once the block sums of
+ * every tensor of the norm are stored, nvte_multi_tensor_l2norm_single_launch_finalize_cuda
+ * returns the bits of nvte_multi_tensor_l2norm_single_launch_cuda over the whole list. Does not
+ * synchronize with the host and can be captured in a CUDA graph.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]     chunk_size              Number of tensor elements processed by a CUDA block.
+ *  \param[in,out] noop_flag               Set to 1 if a block sum is not finite.
+ *  \param[in]     tensor_lists            2D array of input tensors (one list, one dtype).
+ *  \param[in]     num_tensor_lists        Size (dim0) of tensor_lists (must be 1).
+ *  \param[in]     num_tensors_per_list    Size (dim1) of tensor_lists.
+ *  \param[in]     first_slot              Host array: block-sum slot of chunk 0 of every tensor.
+ *  \param[in,out] output                  FP32 block-sum array, zero-initialized before its first
+ *                                         use.
+ *  \param[in]     stream                  CUDA stream used for this operation.
+ */
+void nvte_multi_tensor_l2norm_single_launch_partials_cuda(
+    int chunk_size, NVTETensor noop_flag, NVTETensor **tensor_lists, const size_t num_tensor_lists,
+    const size_t num_tensors_per_list, const int64_t *first_slot, NVTETensor output,
+    cudaStream_t stream);
+
+/*!  \brief L2 norm from the block-sum array of nvte_multi_tensor_l2norm_single_launch_partials_cuda.
+ *
+ * \warning   This API is **experimental** and subject to change.
+ *
+ *  \param[in]     output                  FP32 block-sum array.
+ *  \param[out]    ret                     L2 norm (FP32, one element).
+ *  \param[in]     stream                  CUDA stream used for this operation.
+ */
+void nvte_multi_tensor_l2norm_single_launch_finalize_cuda(NVTETensor output, NVTETensor ret,
+                                                          cudaStream_t stream);
+
 /*!  \brief Computes L2 norm for a list of tensors after unscaling.
  *
  * Unscaling is only done for computing the L2 norm. The tensors themselves are not updated.

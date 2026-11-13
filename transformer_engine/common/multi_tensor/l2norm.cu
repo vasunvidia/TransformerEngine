@@ -685,6 +685,74 @@ void multi_tensor_l2norm_single_launch_cuda(int chunk_size, Tensor noop_flag,
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
 
+/* Split form of multi_tensor_l2norm_single_launch_cuda, for norms whose tensors become ready at
+ * different times (e.g. gradient buckets whose reduce-scatters finish one after the other):
+ *
+ * - multi_tensor_l2norm_single_launch_slots: the block-sum slot of chunk 0 of every tensor of the
+ *   whole list (the layout of multi_tensor_apply<1>, see multi_tensor_apply_1_layout) and the
+ *   size of the block-sum array;
+ * - multi_tensor_l2norm_single_launch_partials: the main kernels for any subset of the list, each
+ *   tensor's block sums stored at the slots the whole list gives it;
+ * - multi_tensor_l2norm_single_launch_finalize: `cleanup_single_launch` over the block-sum array.
+ *
+ * Once every tensor's block sums are stored (in any order, by any number of partials calls), the
+ * finalize returns the bits of multi_tensor_l2norm_single_launch_cuda (and so of
+ * multi_tensor_l2norm_cuda) over the whole list: same block arithmetic, same slots, same sum
+ * order. The block-sum array must be zero-initialized once (slots no block owns stay zero); stored
+ * slots are overwritten, so the array can be reused for every evaluation of the same list.
+ */
+size_t multi_tensor_l2norm_single_launch_slots(int chunk_size,
+                                               const std::vector<std::vector<Tensor *>> &tensor_lists,
+                                               int64_t *first_slot) {
+  NVTE_CHECK(tensor_lists.size() == 1, "multi_tensor_l2norm_single_launch expects 1 tensor list.");
+  return static_cast<size_t>(
+             multi_tensor_apply_1_layout(chunk_size, tensor_lists[0], first_slot)) *
+         kMultiTensorApplyMaxBlocks;
+}
+
+void multi_tensor_l2norm_single_launch_partials_cuda(
+    int chunk_size, Tensor noop_flag, std::vector<std::vector<Tensor *>> tensor_lists,
+    const int64_t *first_slot, Tensor output, cudaStream_t stream) {
+  NVTE_CHECK(tensor_lists.size() == 1, "multi_tensor_l2norm_single_launch expects 1 tensor list.");
+  const std::vector<Tensor *> &tensors = tensor_lists[0];
+  const size_t num_tensors = tensors.size();
+  if (num_tensors == 0) return;
+  NVTE_CHECK(chunk_size > 0, "chunk_size must be positive.");
+  const DType dtype = tensors[0]->dtype();
+  NVTE_CHECK(output.dtype() == DType::kFloat32, "output must be FP32.");
+  std::vector<int64_t> slots(first_slot, first_slot + num_tensors);
+  for (size_t t = 0; t < num_tensors; t++) {
+    NVTE_CHECK(tensors[t]->dtype() == dtype,
+               "multi_tensor_l2norm_single_launch expects tensors of one dtype.");
+    const int64_t chunks =
+        (static_cast<int64_t>(tensors[t]->numel()) + chunk_size - 1) / chunk_size;
+    NVTE_CHECK(chunks > 0, "multi_tensor_l2norm_single_launch expects non-empty tensors.");
+    NVTE_CHECK(slots[t] >= 0 && slots[t] + chunks <= static_cast<int64_t>(output.numel()),
+               "Block-sum slots [", slots[t], ", ", slots[t] + chunks, ") of tensor ", t,
+               " are outside the block-sum array of ", output.numel(), " elements.");
+  }
+  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+      dtype, x_t,
+      launch_l2norm_single_launch<x_t>(chunk_size, reinterpret_cast<int *>(noop_flag.data.dptr),
+                                       tensors, slots, reinterpret_cast<float *>(output.data.dptr),
+                                       nullptr, false, -1, stream););
+}
+
+void multi_tensor_l2norm_single_launch_finalize_cuda(Tensor output, Tensor ret,
+                                                     cudaStream_t stream) {
+  NVTE_CHECK(output.dtype() == DType::kFloat32, "output must be FP32.");
+  NVTE_CHECK(ret.dtype() == DType::kFloat32, "ret must be FP32.");
+  const size_t numel = output.numel();
+  NVTE_CHECK(numel > 0 && numel % kMultiTensorApplyMaxBlocks == 0,
+             "The block-sum array must hold a positive multiple of ", kMultiTensorApplyMaxBlocks,
+             " elements (multi_tensor_l2norm_single_launch_slots), got ", numel, ".");
+  cleanup_single_launch<<<1, 512, 0, stream>>>(
+      reinterpret_cast<const float *>(output.data.dptr),
+      static_cast<int64_t>(numel / kMultiTensorApplyMaxBlocks), nullptr,
+      reinterpret_cast<float *>(ret.data.dptr), nullptr, false, -1);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
 void multi_tensor_l2norm_cuda(int chunk_size, Tensor noop_flag,
                               std::vector<std::vector<Tensor *>> tensor_lists, Tensor output,
                               Tensor output_per_tensor, Tensor ret, Tensor ret_per_tensor,
@@ -800,4 +868,38 @@ void nvte_multi_tensor_l2norm_single_launch_cuda(
       *convertNVTETensorCheck(output), *convertNVTETensorCheck(output_per_tensor),
       *convertNVTETensorCheck(ret), *convertNVTETensorCheck(ret_per_tensor), per_tensor,
       max_chunks_per_tensor, stream);
+}
+
+size_t nvte_multi_tensor_l2norm_single_launch_slots(int chunk_size, NVTETensor **tensor_lists,
+                                                    const size_t num_tensor_lists,
+                                                    const size_t num_tensors_per_list,
+                                                    int64_t *first_slot) {
+  NVTE_API_CALL(nvte_multi_tensor_l2norm_single_launch_slots);
+  using namespace transformer_engine;
+
+  return multi_tensor_l2norm::multi_tensor_l2norm_single_launch_slots(
+      chunk_size, convert_tensor_array(tensor_lists, num_tensor_lists, num_tensors_per_list),
+      first_slot);
+}
+
+void nvte_multi_tensor_l2norm_single_launch_partials_cuda(
+    int chunk_size, NVTETensor noop_flag, NVTETensor **tensor_lists, const size_t num_tensor_lists,
+    const size_t num_tensors_per_list, const int64_t *first_slot, NVTETensor output,
+    cudaStream_t stream) {
+  NVTE_API_CALL(nvte_multi_tensor_l2norm_single_launch_partials_cuda);
+  using namespace transformer_engine;
+
+  multi_tensor_l2norm::multi_tensor_l2norm_single_launch_partials_cuda(
+      chunk_size, *convertNVTETensorCheck(noop_flag),
+      convert_tensor_array(tensor_lists, num_tensor_lists, num_tensors_per_list), first_slot,
+      *convertNVTETensorCheck(output), stream);
+}
+
+void nvte_multi_tensor_l2norm_single_launch_finalize_cuda(NVTETensor output, NVTETensor ret,
+                                                          cudaStream_t stream) {
+  NVTE_API_CALL(nvte_multi_tensor_l2norm_single_launch_finalize_cuda);
+  using namespace transformer_engine;
+
+  multi_tensor_l2norm::multi_tensor_l2norm_single_launch_finalize_cuda(
+      *convertNVTETensorCheck(output), *convertNVTETensorCheck(ret), stream);
 }

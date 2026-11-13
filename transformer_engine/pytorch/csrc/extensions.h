@@ -686,6 +686,15 @@ std::tuple<at::Tensor, at::Tensor> multi_tensor_l2norm_single_launch_cuda(
     int chunk_size, at::Tensor noop_flag, std::vector<std::vector<at::Tensor>> tensor_lists,
     at::optional<bool> per_tensor_python);
 
+std::tuple<std::vector<int64_t>, int64_t> multi_tensor_l2norm_single_launch_slots(
+    int chunk_size, std::vector<std::vector<at::Tensor>> tensor_lists);
+
+void multi_tensor_l2norm_single_launch_partials_cuda(
+    int chunk_size, at::Tensor noop_flag, std::vector<std::vector<at::Tensor>> tensor_lists,
+    at::Tensor output, std::vector<int64_t> first_slot);
+
+at::Tensor multi_tensor_l2norm_single_launch_finalize_cuda(at::Tensor output);
+
 std::tuple<at::Tensor, at::Tensor> multi_tensor_unscale_l2norm_cuda(
     int chunk_size, at::Tensor noop_flag, std::vector<std::vector<at::Tensor>> tensor_lists,
     at::Tensor inv_scale, at::optional<bool> per_tensor_python);

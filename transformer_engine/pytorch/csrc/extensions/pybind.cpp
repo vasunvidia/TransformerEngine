@@ -721,6 +721,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Computes L2 norm for a list of contiguous tensors with one main kernel launch (bitwise "
         "equal to multi_tensor_l2norm)",
         py::call_guard<py::gil_scoped_release>());
+  m.def("multi_tensor_l2norm_single_launch_slots",
+        &transformer_engine::pytorch::multi_tensor_l2norm_single_launch_slots,
+        "Block-sum slots (chunk 0 of every tensor) and block-sum array size of "
+        "multi_tensor_l2norm_single_launch for a list of tensors",
+        py::arg("chunk_size"), py::arg("tensor_lists"));
+  m.def("multi_tensor_l2norm_single_launch_partials",
+        &transformer_engine::pytorch::multi_tensor_l2norm_single_launch_partials_cuda,
+        "Block sums of multi_tensor_l2norm_single_launch for a subset of a norm's tensors, stored "
+        "at the given slots of a block-sum array",
+        py::call_guard<py::gil_scoped_release>());
+  m.def("multi_tensor_l2norm_single_launch_finalize",
+        &transformer_engine::pytorch::multi_tensor_l2norm_single_launch_finalize_cuda,
+        "L2 norm from a block-sum array of multi_tensor_l2norm_single_launch_partials (bitwise "
+        "equal to multi_tensor_l2norm_single_launch over the whole list)",
+        py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_unscale_l2norm",
         &transformer_engine::pytorch::multi_tensor_unscale_l2norm_cuda,
         "Computes L2 norm for a list of contiguous tensors after unscaling (unscaling is only "

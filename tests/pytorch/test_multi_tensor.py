@@ -452,6 +452,132 @@ def test_multi_tensor_l2norm_single_launch_rejects_mixed_dtypes():
         )
 
 
+def _l2norm_split(chunk_size, tensors, groups, output=None):
+    """Split single-launch L2 norm: the partials of every group of tensor indices (in the given
+    order), then the finalize. Returns (norm, block-sum array)."""
+    first_slot, size = tex.multi_tensor_l2norm_single_launch_slots(chunk_size, [tensors])
+    assert len(first_slot) == len(tensors)
+    if output is None:
+        output = torch.zeros(size, dtype=torch.float32, device=tensors[0].device)
+    assert output.numel() == size
+    overflow = torch.zeros(1, dtype=torch.int32, device=tensors[0].device)
+    for group in groups:
+        tex.multi_tensor_l2norm_single_launch_partials(
+            chunk_size,
+            overflow,
+            [[tensors[i] for i in group]],
+            output,
+            [first_slot[i] for i in group],
+        )
+    return tex.multi_tensor_l2norm_single_launch_finalize(output), output
+
+
+def _split_groups(num_tensors, num_groups, seed):
+    """Tensor indices in num_groups groups: contiguous runs of random length, issued in a random
+    order, plus one group of interleaved indices."""
+    gen = torch.Generator().manual_seed(seed)
+    cuts = sorted(torch.randperm(max(num_tensors - 1, 1), generator=gen)[: num_groups - 1].tolist())
+    bounds = [0] + [c + 1 for c in cuts] + [num_tensors]
+    groups = [list(range(a, b)) for a, b in zip(bounds[:-1], bounds[1:]) if a < b]
+    order = torch.randperm(len(groups), generator=gen).tolist()
+    groups = [groups[i] for i in order]
+    if len(groups) > 2:  # merge two groups into one strided group
+        groups = [sorted(groups[0] + groups[1], reverse=True)] + groups[2:]
+    return groups
+
+
+@pytest.mark.parametrize("case", list(_layout_cases))
+@pytest.mark.parametrize("in_type", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_groups", [1, 3, 17])
+def test_multi_tensor_l2norm_single_launch_split(case, in_type, num_groups):
+    applier = MultiTensorApply(64)
+    tensors = _random_list(_layout_cases[case], in_type, torch.device("cuda"), seed=7)
+    overflow = torch.zeros(1, dtype=torch.int32, device="cuda")
+    norm_ref, _ = applier(tex.multi_tensor_l2norm, overflow, [tensors], False)
+    groups = _split_groups(len(tensors), num_groups, seed=num_groups)
+    norm, output = _l2norm_split(64, tensors, groups)
+    assert torch.equal(norm.view(torch.int32), norm_ref.view(torch.int32))
+    # The block-sum array is reused: every stored slot is overwritten by the next evaluation.
+    new = _random_list(_layout_cases[case], in_type, torch.device("cuda"), seed=8)
+    norm_ref, _ = applier(tex.multi_tensor_l2norm, overflow, [new], False)
+    norm, _ = _l2norm_split(64, new, list(reversed(groups)), output)
+    assert torch.equal(norm.view(torch.int32), norm_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("rank", [0, 5])
+def test_multi_tensor_l2norm_single_launch_split_bucket_shards(rank):
+    # As test_multi_tensor_l2norm_single_launch_bucket_shards, partials per bucket shard.
+    buffers = _moe_grad_buffers(
+        layers=24, hidden=288, ffn=288, experts=32, heads=64, kv_heads=8, head_dim=8, vocab=2011
+    )
+    views = _bucket_shard_views(
+        buffers, 7_680_000, 8, rank, torch.bfloat16, torch.device("cuda"), rank
+    )
+    # Group the views by their shard (one storage per bucket shard), last bucket first.
+    by_storage = {}
+    for i, v in enumerate(views):
+        by_storage.setdefault(v.untyped_storage().data_ptr(), []).append(i)
+    groups = list(reversed(list(by_storage.values())))
+    assert len(groups) > 10
+    overflow = torch.zeros(1, dtype=torch.int32, device="cuda")
+    norm_ref, _ = MultiTensorApply(2048 * 32)(tex.multi_tensor_l2norm, overflow, [views], False)
+    norm, _ = _l2norm_split(2048 * 32, views, groups)
+    assert torch.equal(norm.view(torch.int32), norm_ref.view(torch.int32))
+
+
+def test_multi_tensor_l2norm_single_launch_split_cuda_graph():
+    sizes = [7777 * 77, 555, 2048 * 32 + 1] * 40
+    tensors = _random_list(sizes, torch.bfloat16, torch.device("cuda"), 3)
+    first_slot, size = tex.multi_tensor_l2norm_single_launch_slots(2048 * 32, [tensors])
+    output = torch.zeros(size, dtype=torch.float32, device="cuda")
+    overflow = torch.zeros(1, dtype=torch.int32, device="cuda")
+    groups = _split_groups(len(tensors), 9, seed=1)
+
+    def run():
+        for group in groups:
+            tex.multi_tensor_l2norm_single_launch_partials(
+                2048 * 32, overflow, [[tensors[i] for i in group]], output,
+                [first_slot[i] for i in group],
+            )
+        return tex.multi_tensor_l2norm_single_launch_finalize(output)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()  # warm-up
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        norm = run()
+    for seed in (11, 12):
+        new = _random_list(sizes, torch.bfloat16, torch.device("cuda"), seed)
+        for t, v in zip(tensors, new):
+            t.copy_(v)
+        graph.replay()
+        norm_ref, _ = MultiTensorApply(2048 * 32)(
+            tex.multi_tensor_l2norm, overflow, [tensors], False
+        )
+        assert torch.equal(norm.view(torch.int32), norm_ref.view(torch.int32))
+
+
+def test_multi_tensor_l2norm_single_launch_split_checks():
+    tensors = _random_list([555, 2048 * 32 + 1], torch.bfloat16, torch.device("cuda"), 1)
+    first_slot, size = tex.multi_tensor_l2norm_single_launch_slots(2048 * 32, [tensors])
+    assert first_slot == [0, 1] and size == 320
+    output = torch.zeros(size, dtype=torch.float32, device="cuda")
+    overflow = torch.zeros(1, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="outside the block-sum array"):
+        tex.multi_tensor_l2norm_single_launch_partials(
+            2048 * 32, overflow, [tensors[1:]], output, [319]
+        )
+    with pytest.raises(RuntimeError, match="one slot per tensor"):
+        tex.multi_tensor_l2norm_single_launch_partials(
+            2048 * 32, overflow, [tensors], output, [0]
+        )
+    with pytest.raises(RuntimeError, match="multiple of 320"):
+        tex.multi_tensor_l2norm_single_launch_finalize(output[:100])
+
+
 @pytest.mark.parametrize("input_size_pair", input_size_pairs)
 @pytest.mark.parametrize("applier", appliers)
 @pytest.mark.parametrize("repeat", [1, 55])
