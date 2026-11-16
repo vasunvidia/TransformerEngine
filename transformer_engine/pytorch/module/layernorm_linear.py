@@ -1345,8 +1345,11 @@ def _layernorm_linear_backward_impl(
                 nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                 return dw, db
 
-            # Choose whether to call wgrad GEMM now or delay
-            if args.wgrad_store is not None and args.wgrad_store.delay_wgrad_compute():
+            # Choose whether to call wgrad GEMM now or delay (in WeightGradStore stream
+            # mode: issue it on the wgrad stream now, unless it also produces the bias grad)
+            if args.wgrad_store is not None and args.wgrad_store.defer_wgrad(
+                produces_bias_grad=wgrad_gemm_kwargs["bias"] is not None
+            ):
                 if (
                     wgrad_gemm_kwargs["ub"] is not None
                     or wgrad_gemm_kwargs["ub_type"] is not None
@@ -1709,6 +1712,8 @@ class LayerNormLinear(TransformerEngineBaseModule):
                    Requires PyTorch version 2.7.0 or higher. When set to ``None``, standard all-reduce
                    is used.
     """
+
+    _supports_wgrad_stream = True
 
     def __init__(
         self,

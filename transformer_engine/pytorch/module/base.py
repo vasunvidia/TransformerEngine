@@ -2065,7 +2065,35 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         should actually be executed or just return without doing anything.
         User can also manually call this method to check that before calling into backward_dw().
         """
-        return self.wgrad_store is not None and self.wgrad_store.delay_wgrad_compute()
+        return self.wgrad_store is not None and self.wgrad_store.needs_backward_dw()
+
+    # Modules whose backward supports WeightGradStore stream mode (set_wgrad_stream).
+    _supports_wgrad_stream = False
+
+    def set_wgrad_stream(self, wgrad_stream, *, tag=None, hold=False, new_group=False) -> None:
+        """Run this module's weight-gradient GEMM on ``wgrad_stream`` (a
+        :class:`transformer_engine.pytorch.WeightGradStream`) as soon as the backward pass
+        reaches it, instead of inline (``None`` restores inline wgrads).
+
+        The GEMM writes into ``main_grad`` (requires ``fuse_wgrad_accumulation=True``), so the
+        backward returns the usual dummy wgrad to autograd before the GEMM has run: consumers
+        of ``main_grad`` must wait on the wgrad stream (``WeightGradStream.join`` or a stream
+        wait). See :meth:`WeightGradStore.set_wgrad_stream` for ``tag`` / ``hold`` /
+        ``new_group``.
+        """
+        if wgrad_stream is not None:
+            if not self._supports_wgrad_stream:
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support a weight-gradient stream"
+                )
+            if not getattr(self, "fuse_wgrad_accumulation", False):
+                raise ValueError(
+                    "set_wgrad_stream needs fuse_wgrad_accumulation=True (the wgrad GEMM must "
+                    "write into main_grad)"
+                )
+        if self.wgrad_store is None:
+            raise ValueError("set_wgrad_stream: module has no WeightGradStore")
+        self.wgrad_store.set_wgrad_stream(wgrad_stream, tag=tag, hold=hold, new_group=new_group)
 
     def backward_dw(self):
         """

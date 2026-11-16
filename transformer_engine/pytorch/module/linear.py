@@ -1641,8 +1641,11 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                 return dw, db
 
-            # Choose whether to call wgrad GEMM now or delay
-            if bwd_args.wgrad_store is not None and bwd_args.wgrad_store.delay_wgrad_compute():
+            # Choose whether to call wgrad GEMM now or delay (in WeightGradStore stream
+            # mode: issue it on the wgrad stream now, unless it also produces the bias grad)
+            if bwd_args.wgrad_store is not None and bwd_args.wgrad_store.defer_wgrad(
+                produces_bias_grad=wgrad_gemm_kwargs["bias"] is not None
+            ):
                 if (
                     wgrad_gemm_kwargs["ub"] is not None
                     or wgrad_gemm_kwargs["ub_type"] is not None
@@ -2015,6 +2018,8 @@ class Linear(TransformerEngineBaseModule):
                        Requires an input quantizer that can safely reproduce its result from the
                        original input. Cannot work with FP8 DelayedScaling recipe.
     """
+
+    _supports_wgrad_stream = True
 
     def __init__(
         self,

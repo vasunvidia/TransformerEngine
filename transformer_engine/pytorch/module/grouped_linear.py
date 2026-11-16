@@ -1759,6 +1759,8 @@ class GroupedLinear(TransformerEngineBaseModule):
     The TP communication should be handled in the dispatch and combine stages of MoE models.
     """
 
+    _supports_wgrad_stream = True
+
     def __init__(
         self,
         num_gemms: int,

@@ -4,7 +4,7 @@
 
 """Python interface for GEMM extensions"""
 
-from typing import Callable, Iterable, Literal, Optional, Tuple, Union, List
+from typing import Callable, Dict, Iterable, Literal, Optional, Tuple, Union, List
 import itertools
 import math
 import os
@@ -43,6 +43,7 @@ __all__ = [
     "general_grouped_gemm",
     "general_grouped_gemm_for_grouped_tensor",
     "get_cublas_workspace",
+    "register_cublas_workspace_stream",
 ]
 
 
@@ -57,9 +58,47 @@ def get_cublas_workspace_size_bytes() -> None:
     return 4_194_304
 
 
+# Streams with their own GEMM workspaces (see register_cublas_workspace_stream): CUDA stream
+# handle -> workspace key (> 0). Key 0 is the shared per-device workspace.
+_workspace_stream_keys: Dict[int, int] = {}
+
+
+def register_cublas_workspace_stream(stream: torch.cuda.Stream) -> int:
+    """Give GEMMs launched on ``stream`` their own cuBLAS / grouped-GEMM workspaces.
+
+    By default every GEMM of a device shares one cuBLAS workspace (and one grouped-GEMM setup
+    workspace per group count), which is only safe while all GEMMs run on one stream. A stream
+    that runs GEMMs concurrently with the compute stream (e.g. the weight-gradient stream of
+    :class:`transformer_engine.pytorch.WeightGradStream`) is registered here; GEMMs launched
+    while it is the current stream then use workspaces of their own. The plain cuBLAS workspace
+    is allocated now, so that it is never first allocated during CUDA-graph capture.
+    Returns the stream's workspace key. Idempotent.
+    """
+    handle = stream.cuda_stream
+    key = _workspace_stream_keys.get(handle)
+    if key is None:
+        key = len(_workspace_stream_keys) + 1
+        _workspace_stream_keys[handle] = key
+    get_cublas_workspace(stream.device.index, False, False, key)
+    return key
+
+
+def _workspace_stream_key() -> int:
+    """Workspace key of the current stream (0 unless registered)."""
+    if not _workspace_stream_keys:
+        return 0
+    return _workspace_stream_keys.get(torch.cuda.current_stream().cuda_stream, 0)
+
+
 @functools.lru_cache(maxsize=None)
-def get_cublas_workspace(device: int, ub: bool, grouped_gemm: bool) -> torch.Tensor:
-    """Returns workspace for cublas GEMM."""
+def get_cublas_workspace(
+    device: int, ub: bool, grouped_gemm: bool, stream_key: int = 0
+) -> torch.Tensor:
+    """Returns workspace for cublas GEMM.
+
+    ``stream_key`` selects a separate workspace for a stream registered with
+    :func:`register_cublas_workspace_stream` (0: the shared workspace).
+    """
     assert not (ub and grouped_gemm), "UB is unsupported for grouped GEMM."
 
     if ub:
@@ -771,7 +810,9 @@ def general_gemm(
 
     alpha = validate_gemm_scale(alpha, True)
     beta = validate_gemm_scale(beta, accumulate)
-    workspace = get_cublas_workspace(A.device.index, ub is not None, False)
+    workspace = get_cublas_workspace(
+        A.device.index, ub is not None, False, 0 if ub is not None else _workspace_stream_key()
+    )
 
     # Temporary hack to route NVFP4 GEMM with UE5M3 scale factors to
     # cuDNN Frontend kernels. UE5M3-specific logic should be removed
@@ -1020,7 +1061,7 @@ def strided_batched_gemm(
     transa = layout[0] == "T"
     transb = layout[1] == "T"
     beta = validate_gemm_scale(beta, accumulate)
-    workspace = get_cublas_workspace(out.device.index, False, False)
+    workspace = get_cublas_workspace(out.device.index, False, False, _workspace_stream_key())
     sm_count = get_sm_count()
     return tex.strided_batched_gemm(
         A,
@@ -1076,7 +1117,7 @@ def general_grouped_gemm(
     out_dtype = TE_DType[out[0].dtype] if D_dtype is None else D_dtype
 
     sm_count = get_sm_count()
-    workspaces = get_cublas_workspace(A[0].device.index, False, True)
+    workspaces = get_cublas_workspace(A[0].device.index, False, True, _workspace_stream_key())
 
     if grad and use_bias:
         grad_bias = [
@@ -1182,8 +1223,13 @@ def _get_fp32_zeros_tensor(num_tensors: int, device: torch.device) -> torch.Tens
 
 
 @functools.lru_cache(maxsize=None)
-def _get_grouped_gemm_setup_workspace(device: int, num_tensors: int) -> torch.Tensor:
-    """Persistent setup workspace (per-group pointer/dim arrays) for grouped-tensor GEMM."""
+def _get_grouped_gemm_setup_workspace(
+    device: int, num_tensors: int, stream_key: int = 0
+) -> torch.Tensor:
+    """Persistent setup workspace (per-group pointer/dim arrays) for grouped-tensor GEMM.
+
+    One per registered stream (``stream_key``, see ``register_cublas_workspace_stream``):
+    grouped GEMMs on two concurrent streams must not share the pointer arrays."""
     return torch.empty(
         get_grouped_gemm_setup_workspace_size(num_tensors),
         dtype=torch.uint8,
@@ -1192,7 +1238,7 @@ def _get_grouped_gemm_setup_workspace(device: int, num_tensors: int) -> torch.Te
 
 
 @functools.lru_cache(maxsize=None)
-def _get_grouped_cublas_workspace(device: int, layout: str) -> torch.Tensor:
+def _get_grouped_cublas_workspace(device: int, layout: str, stream_key: int = 0) -> torch.Tensor:
     """Persistent cuBLAS workspace for the grouped-tensor GEMM path, one per GEMM layout.
 
     Grouped cuBlasLt GEMM kernels in cuBLAS versions <= 13.7 leave behind stale descriptors in the
@@ -1299,12 +1345,13 @@ def general_grouped_gemm_for_grouped_tensor(
     if not alpha.is_cuda or not beta.is_cuda:
         raise ValueError("alpha and beta must be CUDA tensors.")
 
-    workspace_setup = _get_grouped_gemm_setup_workspace(device.index, num_tensors)
+    stream_key = _workspace_stream_key()
+    workspace_setup = _get_grouped_gemm_setup_workspace(device.index, num_tensors, stream_key)
     # Each grouped-GEMM layout gets its own persistent cuBLAS workspace: two grouped
     # GEMMs sharing one workspace can deadlock under CUDA-graph replay (see
     # _get_grouped_cublas_workspace). wgrad (NT) is the case seen in TE; fprop (TN) and
     # dgrad (NN) have also been reported to conflict, so all three layouts are isolated.
-    workspace_cublas = _get_grouped_cublas_workspace(device.index, layout)
+    workspace_cublas = _get_grouped_cublas_workspace(device.index, layout, stream_key)
 
     sm_count = get_sm_count()
     sm_count = sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))

@@ -390,12 +390,12 @@ class GroupedLinear(BasicOperation):
         # before DDP/FSDP inspects the parameter to install backward hooks.
         if name == "weight" and param is not None and getattr(self, "single_grouped_weight", False):
             wgrad_store = getattr(self, "wgrad_store", None)
-            if wgrad_store is not None and wgrad_store.delay_wgrad_compute():
+            if wgrad_store is not None and wgrad_store.needs_backward_dw():
                 param.skip_backward_post_hook = True
 
     def _apply_delay_wgrad_param_hooks(self) -> None:
         """Set ``skip_backward_post_hook`` on weights when delaying wgrad (bias uses main backward)."""
-        if not self.wgrad_store.delay_wgrad_compute():
+        if not self.wgrad_store.needs_backward_dw():
             return
         if self.single_grouped_weight:
             # A meta-device op may be created as a parameterless shell and have its
@@ -427,7 +427,19 @@ class GroupedLinear(BasicOperation):
 
     def need_backward_dw(self) -> bool:
         """Return whether :meth:`backward_dw` must run to finish weight gradients."""
-        return self.wgrad_store is not None and self.wgrad_store.delay_wgrad_compute()
+        return self.wgrad_store is not None and self.wgrad_store.needs_backward_dw()
+
+    def set_wgrad_stream(self, wgrad_stream, *, tag=None, hold=False, new_group=False) -> None:
+        """Run this op's grouped weight-gradient GEMM on ``wgrad_stream`` (a
+        :class:`transformer_engine.pytorch.WeightGradStream`) as soon as the backward pass
+        reaches it (``None``: inline again). Needs ``accumulate_into_main_grad=True``; see
+        ``TransformerEngineBaseModule.set_wgrad_stream``."""
+        if wgrad_stream is not None and not self._accumulate_into_main_grad:
+            raise ValueError(
+                "set_wgrad_stream needs accumulate_into_main_grad=True (the wgrad GEMM must "
+                "write into main_grad)"
+            )
+        self.wgrad_store.set_wgrad_stream(wgrad_stream, tag=tag, hold=hold, new_group=new_group)
 
     def backward_dw(self) -> None:
         """Execute delayed weight gradient grouped GEMMs (see ``delay_wgrad_compute``)."""
