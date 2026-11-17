@@ -20,6 +20,7 @@
 #include "common/util/cuda_runtime.h"
 #include "common/util/curanddx.hpp"
 #include "common/util/ptx.cuh"
+#include "common/util/system.h"
 #include "common/utils.cuh"
 #include "customized_pipeline.cuh"
 #include "cutlass/arch/barrier.h"
@@ -49,6 +50,47 @@ using cute::Shape;   // Avoid conflict with transformer_engine::Shape
 using cute::Tensor;  // Avoid conflict with transformer_engine::Tensor
 
 constexpr int kMaxTensorsPerKernel = 64;
+
+// Tile-scheduler workspace handling
+// (NVTE_NVFP4_GROUP_CAST_SELF_RESET / NVTE_NVFP4_GROUP_CAST_ZERO_KERNEL).
+//
+// The persistent kernel below hands out tiles through a 4-byte atomic counter in global memory
+// (TileScheduler::fetch_tile_id_counter) that has to be 0 when the kernel starts.  By default the
+// launcher zeroes it with a cudaMemsetAsync before every launch; inside a CUDA graph that is a
+// memset node in front of every launch, which costs far more stream time than a kernel -> kernel
+// dependency.
+//   kTileSchedulerWorkspaceMemset (default): cudaMemsetAsync before every launch (unchanged).
+//   kTileSchedulerWorkspaceZeroKernel (NVTE_NVFP4_GROUP_CAST_ZERO_KERNEL=1): a 1-block kernel
+//       zeroes the word instead of the memset.
+//   kTileSchedulerWorkspaceSelfReset (NVTE_NVFP4_GROUP_CAST_SELF_RESET=1, takes precedence):
+//       nothing is launched before the kernel; the kernel resets the workspace itself when its
+//       last CTA is done, so a workspace that was zeroed once stays zero between launches.  The
+//       workspace is then two words (tile counter, done-CTA count) and must not be shared by
+//       launches that can run concurrently (the PyTorch caller keys it by stream).
+enum TileSchedulerWorkspaceMode : int {
+  kTileSchedulerWorkspaceMemset = 0,
+  kTileSchedulerWorkspaceZeroKernel = 1,
+  kTileSchedulerWorkspaceSelfReset = 2,
+};
+
+// Read at every launch (as NVTE_NVFP4_DISABLE_RHT_CAST_FUSION): the PyTorch caller picks the
+// workspace with the same rule in the same call, and a captured graph keeps the mode it was
+// captured with.
+inline int tile_scheduler_workspace_mode() {
+  if (transformer_engine::getenv<bool>("NVTE_NVFP4_GROUP_CAST_SELF_RESET")) {
+    return kTileSchedulerWorkspaceSelfReset;
+  }
+  if (transformer_engine::getenv<bool>("NVTE_NVFP4_GROUP_CAST_ZERO_KERNEL")) {
+    return kTileSchedulerWorkspaceZeroKernel;
+  }
+  return kTileSchedulerWorkspaceMemset;
+}
+
+__global__ static void zero_tile_scheduler_workspace_kernel(uint32_t *tile_scheduler_workspace) {
+  if (threadIdx.x == 0) {
+    tile_scheduler_workspace[0] = 0u;
+  }
+}
 
 struct MultiAmaxHadamardCastFusionArgs {
   // (output) Amax buffer for input A amax buffer
@@ -178,7 +220,8 @@ __launch_bounds__(512, 1) __global__ static void group_row_col_rht_gemm_device(
     TA const *A, AStride dA, ASmemLayout sAlayout, CUTE_GRID_CONSTANT TmaLoadA const tma_load_a,
     TB const *B, BStride dB, BSmemLayout sBlayout, CUTE_GRID_CONSTANT TmaLoadB const tma_load_b,
     TQA *QA, QAStride dQA, TSFA *SFA, TSFALayout sfa_layout, MultiAmaxHadamardCastFusionArgs args,
-    uint32_t *tile_scheduler_workspace, TiledMMA mma, const size_t *rng_state) {
+    uint32_t *tile_scheduler_workspace, uint32_t tile_scheduler_self_reset, TiledMMA mma,
+    const size_t *rng_state) {
   using namespace cute;
 
   // Abort immediately if compilation is not supported
@@ -657,6 +700,26 @@ __launch_bounds__(512, 1) __global__ static void group_row_col_rht_gemm_device(
         ++sched_pipeline_consumer_state;
         scheduler.update_work_tile_info();
       } while (scheduler.is_valid());
+      if (tile_scheduler_self_reset != 0u) {
+        // Self-reset of the tile-scheduler workspace (NVTE_NVFP4_GROUP_CAST_SELF_RESET).  This warp
+        // is the only one that touches the tile counter, and it has just issued this CTA's last
+        // atomic on it (the loop stops after fetching an invalid tile), so it counts the CTA as done
+        // in the second word.  The CTA that completes the count is the last one still touching the
+        // workspace and zeroes both words, leaving the workspace ready for the next launch without a
+        // host-side memset.  Threadfence-reduction pattern: the fence before the done increment
+        // orders this CTA's counter atomics before its increment; the fence after the completing
+        // increment orders the reset after every CTA's atomics.
+        if (cute::elect_one_sync()) {
+          __threadfence();
+          const uint32_t num_ctas = gridDim.x * gridDim.y * gridDim.z;
+          const uint32_t done = atomicAdd(tile_scheduler_workspace + 1, 1u);
+          if (done == num_ctas - 1u) {
+            __threadfence();
+            atomicExch(tile_scheduler_workspace, 0u);
+            atomicExch(tile_scheduler_workspace + 1, 0u);
+          }
+        }
+      }
     } else if (is_epilogue_col_quant_warp) {
       // Warp responsible for quantizing output of Hadamard transform to FP4 for columnwise usage,
       // and writing result tensors/scales to global memory.
@@ -1271,16 +1334,25 @@ void group_row_col_rht_gemm_ntt_w_sfc(int packed_sequence_length, int hidden_siz
   NVTE_CHECK_CUDA(
       cudaFuncSetAttribute(*kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-  // Set workspace and set to zero
-  NVTE_CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<void *>(tile_scheduler_workspace), 0,
-                                  sizeof(uint32_t), stream));
+  // Tile-scheduler workspace: zero it here (memset node or 1-block kernel) or rely on the kernel's
+  // self-reset, see tile_scheduler_workspace_mode().
+  const int ws_mode = tile_scheduler_workspace_mode();
+  const uint32_t tile_scheduler_self_reset =
+      (ws_mode == kTileSchedulerWorkspaceSelfReset) ? 1u : 0u;
+  if (ws_mode == kTileSchedulerWorkspaceZeroKernel) {
+    zero_tile_scheduler_workspace_kernel<<<1, 32, 0, stream>>>(tile_scheduler_workspace);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+  } else if (ws_mode == kTileSchedulerWorkspaceMemset) {
+    NVTE_CHECK_CUDA(cudaMemsetAsync(reinterpret_cast<void *>(tile_scheduler_workspace), 0,
+                                    sizeof(uint32_t), stream));
+  }
 
   // Launch kernel
   cutlass::ClusterLaunchParams params = {dimGrid, dimBlock, dimCluster, smem_size, stream};
   cutlass::Status status = cutlass::launch_kernel_on_cluster(
       params, (void const *)kernel_ptr, M, N, k_tile_size, cluster_shape, cluster_tile_shape, A, dA,
       sA, tma_load_a, B, dB, sB, tma_load_b, QA, dQA, SFA, sfa_layout, args,
-      tile_scheduler_workspace, mma, rng_state);
+      tile_scheduler_workspace, tile_scheduler_self_reset, mma, rng_state);
   NVTE_CHECK_CUDA(cudaGetLastError());
   NVTE_CHECK(status == cutlass::Status::kSuccess, "Kernel launch failed.");
 }
@@ -1388,8 +1460,14 @@ void group_hadamard_transform_cast_fusion(const Tensor &input_, std::vector<Tens
 
   uint32_t *tile_scheduler_workspace = nullptr;
   NVTE_CHECK(quant_workspace.data.dptr != nullptr, "Quantization workspace must be provided.");
-  NVTE_CHECK(quant_workspace.data.buffer_size_bytes() >= sizeof(uint32_t),
-             "Quantization workspace must be at least 4 bytes.");
+  const size_t min_workspace_bytes =
+      (detail::tile_scheduler_workspace_mode() == detail::kTileSchedulerWorkspaceSelfReset)
+          ? 2 * sizeof(uint32_t)
+          : sizeof(uint32_t);
+  NVTE_CHECK(quant_workspace.data.buffer_size_bytes() >= min_workspace_bytes,
+             "Quantization workspace must be at least ", min_workspace_bytes,
+             " bytes (NVTE_NVFP4_GROUP_CAST_SELF_RESET=1 needs 8: tile counter + done-CTA count, "
+             "zeroed once and not shared between concurrently running launches).");
   tile_scheduler_workspace = reinterpret_cast<uint32_t *>(quant_workspace.data.dptr);
 
   // Template arguments

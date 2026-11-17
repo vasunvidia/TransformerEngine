@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -145,6 +146,79 @@ py::object create_empty_quantized_tensor(py::handle quantizer, const std::vector
 
 namespace {
 
+// Tile-scheduler workspace for the grouped fused RHT cast kernels
+// (nvte_group_hadamard_transform_cast_fusion[_graph_safe]).
+//
+// Default: a fresh 4-byte buffer per call that the launcher zeroes with cudaMemsetAsync (one memset
+// node per launch inside a CUDA graph). With NVTE_NVFP4_GROUP_CAST_SELF_RESET=1 the kernel resets
+// its workspace itself at the end of every launch (tile counter word + done-CTA word), the launcher
+// skips the memset, and this returns a persistent 8-byte buffer per (device, stream) that was zeroed
+// once. Keying by stream is what makes the reuse safe: launches on one stream are serialized, so
+// two launches that can run concurrently (different streams, including streams forked inside a
+// graph capture) never share a workspace. (Replaying two graphs captured on the same stream
+// concurrently on different streams would share it; that is not supported in this mode.)
+// The buffer is allocated with cudaMalloc and zeroed synchronously on a private stream, outside
+// any graph and outside the caching allocator, also when first requested during a capture, so it
+// is zero before its first use whatever the capture/replay order, its address stays valid for the
+// life of the process, and the kernel's self-reset keeps it at zero between launches and replays.
+bool nvfp4_group_cast_self_reset() {
+  return transformer_engine::getenv<bool>("NVTE_NVFP4_GROUP_CAST_SELF_RESET");
+}
+
+at::Tensor get_tile_scheduler_workspace(cudaStream_t stream) {
+  if (!nvfp4_group_cast_self_reset()) {
+    return at::empty({1}, at::device(at::kCUDA).dtype(torch::kInt32));
+  }
+  const int device = static_cast<int>(c10::cuda::current_device());
+  static std::mutex mutex;
+  static std::map<std::pair<int, cudaStream_t>, at::Tensor> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto key = std::make_pair(device, stream);
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    constexpr size_t kBytes = 2 * sizeof(int32_t);
+    void *ptr = nullptr;
+    {
+      // Allowed while another stream is capturing (as in PyTorch's own allocator).
+      cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+      NVTE_CHECK_CUDA(cudaThreadExchangeStreamCaptureMode(&mode));
+      cudaStream_t init_stream = nullptr;
+      NVTE_CHECK_CUDA(cudaMalloc(&ptr, kBytes));
+      NVTE_CHECK_CUDA(cudaStreamCreateWithFlags(&init_stream, cudaStreamNonBlocking));
+      NVTE_CHECK_CUDA(cudaMemsetAsync(ptr, 0, kBytes, init_stream));
+      NVTE_CHECK_CUDA(cudaStreamSynchronize(init_stream));
+      NVTE_CHECK_CUDA(cudaStreamDestroy(init_stream));
+      NVTE_CHECK_CUDA(cudaThreadExchangeStreamCaptureMode(&mode));
+    }
+    // Never freed: graphs may hold the address for the life of the process (8 bytes per stream).
+    at::Tensor workspace = at::from_blob(ptr, {2}, [](void *) {},
+                                         at::device(at::Device(at::kCUDA, device))
+                                             .dtype(torch::kInt32));
+    it = cache.emplace(key, std::move(workspace)).first;
+  }
+  return it->second;
+}
+
+// NVTE_NVFP4_GROUP_CAST_SELF_RESET_CHECK=1 (debug, eager launches only): synchronize after the
+// launch and verify that the kernel left both workspace words at zero.
+void check_tile_scheduler_workspace_reset(const at::Tensor &workspace, cudaStream_t stream) {
+  if (!nvfp4_group_cast_self_reset() ||
+      !transformer_engine::getenv<bool>("NVTE_NVFP4_GROUP_CAST_SELF_RESET_CHECK")) {
+    return;
+  }
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  NVTE_CHECK_CUDA(cudaStreamIsCapturing(stream, &capture_status));
+  if (capture_status != cudaStreamCaptureStatusNone) {
+    return;
+  }
+  NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
+  int32_t words[2] = {-1, -1};
+  NVTE_CHECK_CUDA(cudaMemcpy(words, workspace.data_ptr(), sizeof(words), cudaMemcpyDeviceToHost));
+  NVTE_CHECK(words[0] == 0 && words[1] == 0,
+             "NVTE_NVFP4_GROUP_CAST_SELF_RESET: tile-scheduler workspace not reset after the launch "
+             "(counter=", words[0], ", done=", words[1], ").");
+}
+
 // helper functions for NVFP4 grouped quantization (cuda graph safe with shapes stored in device without D2H copy)
 void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
                                GroupedTensorWrapper &grouped_output_tensor,
@@ -200,7 +274,7 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   }
 
   // RHT cast fusion
-  auto tile_scheduler_workspace_torch = at::empty({1}, at::device(at::kCUDA).dtype(torch::kInt32));
+  auto tile_scheduler_workspace_torch = get_tile_scheduler_workspace(stream);
   auto nvte_tile_scheduler_workspace = makeTransformerEngineTensor(tile_scheduler_workspace_torch);
 
   auto rht_matrix_nvte = makeTransformerEngineTensor(nvfp4_quantizer_cpp->rht_matrix);
@@ -209,6 +283,7 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
         grouped_input_tensor.data(), grouped_output_tensor.data(), rht_matrix_nvte.data(),
         quant_config_cpp, nvte_tile_scheduler_workspace.data(), stream);
   });
+  check_tile_scheduler_workspace_reset(tile_scheduler_workspace_torch, stream);
 }
 
 void group_quantize_nvfp4_row_scaled_impl(const GroupedTensorWrapper &grouped_input_tensor,
@@ -1866,8 +1941,7 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
 
   if (all_aligned_token_dim) {
     // allocate a tile scheduler workspace
-    auto tile_scheduler_workspace_torch =
-        at::empty({1}, at::device(at::kCUDA).dtype(torch::kInt32));
+    auto tile_scheduler_workspace_torch = get_tile_scheduler_workspace(stream);
     auto nvte_tile_scheduler_workspace =
         makeTransformerEngineTensor(tile_scheduler_workspace_torch);
     // call the fully-fused grouped kernel for rowwise quantization & colwise RHT quantization transpose
@@ -1875,6 +1949,7 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
         input.data(), reinterpret_cast<NVTETensor *>(nvte_tensor_output_list.data()),
         rht_matrix_nvte.data(), split_sections.data(), num_tensors, quant_config_list[0],
         nvte_tile_scheduler_workspace.data(), stream);
+    check_tile_scheduler_workspace_reset(tile_scheduler_workspace_torch, stream);
   } else {
     // Separate quantization for rowwise usage and columnwise usage
     // Rowwise quantization fusion with grouped version

@@ -408,6 +408,18 @@ Kernel Configuration
    :Default: ``0``
    :Description: Enable row-scaled NVFP4 tensors for forward activation quantizers in the ``NVFP4BlockScaling`` recipe. When set to ``1`` (or when ``NVFP4BlockScaling(row_scaled_activation=True)`` is used), rowwise ``amax`` metadata is stored as one FP32 value per tensor row instead of a single scalar.
 
+.. envvar:: NVTE_NVFP4_GROUP_CAST_SELF_RESET
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Grouped NVFP4 quantization with random Hadamard transform (PyTorch ``group_quantize`` / ``split_quantize``, SM100 family): the fused grouped RHT cast kernel resets its tile-scheduler counter itself when its last CTA finishes, and a persistent, once-zeroed workspace per (device, stream) is used, so no ``cudaMemsetAsync`` precedes each launch (no memset node per launch inside a CUDA graph). Outputs are bitwise unchanged. Launches on one stream share the workspace, so two CUDA graphs captured on the same stream must not be replayed concurrently. Takes precedence over :envvar:`NVTE_NVFP4_GROUP_CAST_ZERO_KERNEL`. ``NVTE_NVFP4_GROUP_CAST_SELF_RESET_CHECK=1`` (debug) synchronizes after every eager launch and checks that the workspace was reset.
+
+.. envvar:: NVTE_NVFP4_GROUP_CAST_ZERO_KERNEL
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Grouped NVFP4 RHT cast: zero the per-call tile-scheduler counter with a one-block kernel instead of ``cudaMemsetAsync`` (a kernel node instead of a memset node inside a CUDA graph). Outputs are bitwise unchanged.
+
 .. envvar:: NVTE_NVFP4_4OVER6
 
    :Type: ``str`` (``none``, ``weights``, ``activations``, or ``all``)
