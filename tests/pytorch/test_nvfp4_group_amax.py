@@ -29,7 +29,8 @@ def _quantizer(sr: bool, columnwise: bool = True) -> NVFP4Quantizer:
     return q
 
 
-def _inputs(counts, hidden=256, extra_rows=64, seed=0):
+def _inputs(counts, hidden=256, extra_rows=128, seed=0):
+    # TE's graph-safe grouped amax needs the total rows to be a multiple of 128
     torch.manual_seed(seed)
     rows = sum(counts) + extra_rows
     x = (torch.randn(rows, hidden, device="cuda") * 3).to(torch.bfloat16)
