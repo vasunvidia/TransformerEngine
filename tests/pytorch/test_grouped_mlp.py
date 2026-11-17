@@ -3053,6 +3053,112 @@ class TestGroupedMLPFusedOp:
                 f"{name} depends on the prior contents of the buffer"
             )
 
+    @pytest.mark.parametrize(
+        "quantization,group_size,hidden_size",
+        (
+            ("mxfp8", 4, 256),
+            ("nvfp4_rht", 4, 256),
+            ("nvfp4_rht", 32, 2944),  # gpt-oss, expert width padded to a multiple of 128
+        ),
+    )
+    @pytest.mark.parametrize("splits", ("empty_groups", "one_group", "no_rows"))
+    def test_grouped_mlp_rows_beyond_splits_skip_zero(
+        self,
+        monkeypatch,
+        quantization: str,
+        group_size: int,
+        hidden_size: int,
+        splits: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = "cuda",
+        split_alignment: int = 256,
+        tail_rows: int = 3 * 256,
+    ) -> None:
+        """NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS=0: the rows past sum(split_sizes) are not zeroed
+        (they keep the buffer's prior contents, here NaN), and every row inside the groups, the
+        weight gradients and the activation gradients are bitwise equal to the default (zeroing)
+        run. Split patterns: empty groups, every token in one group, no token in any group."""
+        if quantization == "mxfp8" and not mxfp8_available:
+            pytest.skip(reason_for_no_mxfp8)
+        if quantization in nvfp4_variant_names and not nvfp4_available:
+            pytest.skip(reason_for_no_nvfp4)
+        if not te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported():
+            pytest.skip("Fused grouped MLP is not supported on this system")
+
+        if splits == "empty_groups":
+            sizes = [split_alignment * (i % 4) for i in range(group_size)]
+        elif splits == "one_group":
+            sizes = [0] * group_size
+            sizes[group_size // 2] = 4 * split_alignment
+        else:
+            sizes = [0] * group_size
+        split_sizes = torch.tensor(sizes, dtype=torch.int64, device=device)
+        active = int(split_sizes.sum())
+        num_tokens = active + tail_rows
+        recipe = make_recipe(quantization)
+        torch.manual_seed(1234)
+        x_base = torch.empty((num_tokens, hidden_size), device=device, dtype=dtype).uniform_(-1, 1)
+        x_base[active:] = 0  # the router's dummy rows
+        probs_base = torch.rand((num_tokens,), device=device, dtype=dtype)
+        probs_base[active:] = 0
+        dy_base = torch.empty((num_tokens, hidden_size), device=device, dtype=dtype).uniform_(-1, 1)
+        dy_base[active:] = 0  # a combine backward writes zeros there
+        linear_kwargs = dict(bias=False, device=device, dtype=dtype, split_alignment=split_alignment)
+        module = te.ops.Sequential(
+            te.ops.GroupedLinear(group_size, hidden_size, 2 * hidden_size, **linear_kwargs),
+            te.ops.ScaledSwiGLU(glu_interleave_size=32),
+            te.ops.GroupedLinear(group_size, hidden_size, hidden_size, **linear_kwargs),
+        )
+        with torch.no_grad():
+            for fc in (module[0], module[2]):
+                for i in range(group_size):
+                    getattr(fc, f"weight{i}").normal_(std=0.02)
+
+        def run(zero):
+            monkeypatch.setenv("NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS", "1" if zero else "0")
+            x = x_base.detach().clone().requires_grad_(True)
+            probs = probs_base.detach().clone().requires_grad_(True)
+            out_buf = torch.full((num_tokens, hidden_size), float("nan"), dtype=dtype, device=device)
+            dgrad_buf = torch.full_like(out_buf, float("nan"))
+            op_kwargs = {
+                module[0]: {GRAD_INPUT_BUFFER_KEY: dgrad_buf},
+                module[2]: {OUTPUT_BUFFER_KEY: out_buf},
+            }
+            for fc in (module[0], module[2]):
+                for i in range(group_size):
+                    getattr(fc, f"weight{i}").grad = None
+            torch.manual_seed(7)  # stochastic rounding of NVFP4 gradients
+            with te.autocast(enabled=True, recipe=recipe):
+                y = module(x, split_sizes, probs, split_sizes, op_kwargs=op_kwargs)
+            y.backward(dy_base)
+            torch.cuda.synchronize()
+            wgrads = [
+                getattr(fc, f"weight{i}").grad.clone()
+                for fc in (module[0], module[2])
+                for i in range(group_size)
+            ]
+            return y.detach(), dgrad_buf, probs.grad, wgrads
+
+        y_ref, dx_ref, dp_ref, wg_ref = run(True)
+        assert isinstance(
+            module._module_groups[0]._forward_ops[0][0], te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        )
+        y, dx, dp, wg = run(False)
+        for name, value, ref in (("y", y, y_ref), ("dx", dx, dx_ref)):
+            assert torch.equal(ref[active:], torch.zeros_like(ref[active:])), name
+            assert torch.isnan(value[active:]).all(), f"{name}: tail rows were written"
+            assert torch.equal(
+                value[:active].view(torch.int16), ref[:active].view(torch.int16)
+            ), f"{name}: rows inside the groups differ"
+            assert torch.isfinite(value[:active]).all(), f"{name} is not finite"
+        # Gradients of the probabilities (rows inside the groups) and of every weight.
+        assert torch.equal(dp[:active], dp_ref[:active])
+        assert torch.isfinite(dp[:active]).all()
+        for i, (a, b) in enumerate(zip(wg, wg_ref)):
+            assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"wgrad {i}"
+            assert torch.isfinite(a).all(), f"wgrad {i}"
+
     @pytest.mark.parametrize("single_grouped_weight", (False, True))
     @pytest.mark.parametrize("delay_wgrad_compute", (False, True))
     @pytest.mark.parametrize("zero_out_wgrad", (False, True))

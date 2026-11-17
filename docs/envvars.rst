@@ -198,6 +198,17 @@ General
                  epilogue's. Requires a cuDNN front-end whose GLU wrapper accepts
                  ``fast_quant_epilogue``; otherwise the forward raises.
 
+.. envvar:: NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``1``
+   :Description: The fused grouped MLP zeroes the rows of its FC2 output and FC1 grad-input that lie
+                 past ``sum(split_sizes)`` (rows no grouped GEMM writes). Its cost is proportional to
+                 those rows, i.e. to the slack of a fixed-size token buffer. Set to ``0`` to skip it
+                 when every consumer of these tensors reads only rows inside the groups (for example
+                 a combine that gathers the routed rows through a row-id map); the rows past the last
+                 group are then undefined.
+
 Attention Backend Selection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

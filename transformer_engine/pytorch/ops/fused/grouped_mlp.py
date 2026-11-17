@@ -363,7 +363,16 @@ def _zero_rows_beyond_splits(out: torch.Tensor, split_sizes: torch.Tensor) -> No
     zero routing probability then produces NaN (0 x NaN). Zeroing them on the device makes the op's
     output fully defined. Cost is one small graph-safe kernel whose work is proportional to the
     unassigned rows; rows that belong to a group are not touched.
+
+    ``NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS=0`` skips it. The kernel writes every unassigned row,
+    so its cost grows with the buffer's slack: with a static dispatch budget of twice the routed
+    rows, half of each output is zeroed per call (~180 MB at 65536 x 2944 BF16, ~30 us on GB300).
+    A caller whose consumers read only rows inside the groups (e.g. a combine that gathers the
+    routed rows through a row-id map) can turn it off; the rows past the last group are then left
+    undefined, as before this kernel was added.
     """
+    if os.getenv("NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS", "1") == "0":
+        return
     tex.zero_rows_beyond_splits(out, split_sizes)
 
 
