@@ -652,6 +652,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("split_sizes"), py::arg("device"), py::kw_only(), py::arg("strides"),
         py::arg("include_leading_zero"), py::arg("dtypes"), py::arg("bulk_allocate") = false,
         py::arg("split_alignment") = 1);
+  m.def("zero_rows_beyond_splits", &transformer_engine::pytorch::zero_rows_beyond_splits,
+        "Zero the rows of a grouped output past sum(split_sizes) (rows no group owns)",
+        py::arg("data"), py::arg("split_sizes"));
   m.def("get_num_cublas_streams", &nvte_get_num_compute_streams, "Get number of compute streams",
         py::call_guard<py::gil_scoped_release>());
 

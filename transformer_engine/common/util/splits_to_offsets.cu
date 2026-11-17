@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../common.h"
+#include "../util/cuda_runtime.h"
 #include "../util/logging.h"
 #include "../utils.cuh"
 
@@ -183,6 +184,44 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+
+// Zeroes bytes [sum(split_sizes) * row_bytes, num_rows * row_bytes) of a row-major buffer: the rows
+// that belong to no group. Every block computes the (clamped) total itself, so the kernel needs no
+// host value and no second launch; blocks then grid-stride over the tail only, so its cost does not
+// grow with the number of rows the groups cover.
+template <size_t kThreads>
+__global__ void __launch_bounds__(kThreads)
+    zero_rows_beyond_splits_kernel(const void *__restrict__ split_sizes, DType split_sizes_dtype,
+                                   size_t num_splits, char *__restrict__ data, size_t num_rows,
+                                   size_t row_bytes, bool vectorized) {
+  __shared__ int64_t warp_sums[kThreads / 32];
+  const size_t tid = threadIdx.x;
+  int64_t partial = 0;
+  for (size_t i = tid; i < num_splits; i += kThreads) {
+    partial += load_split_size(split_sizes, split_sizes_dtype, i);
+  }
+  for (int offset = 16; offset > 0; offset /= 2) {
+    partial += __shfl_down_sync(0xffffffff, partial, offset);
+  }
+  if (tid % 32 == 0) warp_sums[tid / 32] = partial;
+  __syncthreads();
+  int64_t total = 0;
+  for (size_t w = 0; w < kThreads / 32; ++w) total += warp_sums[w];
+  const size_t first_row = total <= 0 ? 0
+                           : static_cast<size_t>(total) >= num_rows ? num_rows
+                                                                     : static_cast<size_t>(total);
+  const size_t begin = first_row * row_bytes;
+  const size_t end = num_rows * row_bytes;
+  const size_t stride = static_cast<size_t>(gridDim.x) * kThreads;
+  const size_t start = static_cast<size_t>(blockIdx.x) * kThreads + tid;
+  if (vectorized) {  // data and row_bytes are 16-byte aligned
+    uint4 *vec = reinterpret_cast<uint4 *>(data);
+    for (size_t i = begin / 16 + start; i < end / 16; i += stride) vec[i] = make_uint4(0, 0, 0, 0);
+  } else {
+    for (size_t i = begin + start; i < end; i += stride) data[i] = 0;
+  }
+}
+
 }  // namespace
 
 }  // namespace transformer_engine::splits_to_offsets
@@ -327,4 +366,40 @@ void nvte_splits_to_offsets_multi_v2(NVTETensor split_sizes, size_t split_alignm
     }
     NVTE_CHECK_CUDA(cudaGetLastError());
   }
+}
+
+void nvte_zero_rows_beyond_splits(const NVTETensor split_sizes, NVTETensor data,
+                                  cudaStream_t stream) {
+  NVTE_API_CALL(nvte_zero_rows_beyond_splits);
+  using namespace transformer_engine;
+  namespace s2o = transformer_engine::splits_to_offsets;
+
+  const auto *split_sizes_tensor = convertNVTETensorCheck(split_sizes);
+  const auto split_sizes_dtype = split_sizes_tensor->dtype();
+  const size_t num_splits = split_sizes_tensor->numel();
+  NVTE_CHECK(num_splits > 0 && split_sizes_tensor->dim() == 1,
+             "split_sizes must be a non-empty 1D tensor, but got shape=",
+             split_sizes_tensor->shape(), ".");
+  NVTE_CHECK(split_sizes_dtype == DType::kInt32 || split_sizes_dtype == DType::kInt64,
+             "split_sizes must be an int32/int64 tensor, but got dtype=", split_sizes_dtype, ".");
+
+  const auto *data_tensor = convertNVTETensorCheck(data);
+  const size_t numel = data_tensor->numel();
+  if (numel == 0) return;
+  NVTE_CHECK(data_tensor->dim() >= 1, "data must have at least one dimension.");
+  const size_t num_rows = data_tensor->flat_first_dim();
+  const size_t row_bits = (numel / num_rows) * typeToNumBits(data_tensor->dtype());
+  NVTE_CHECK(row_bits % 8 == 0, "data rows must span whole bytes.");
+  const size_t row_bytes = row_bits / 8;
+  char *ptr = static_cast<char *>(data_tensor->data.dptr);
+  const bool vectorized = reinterpret_cast<uintptr_t>(ptr) % 16 == 0 && row_bytes % 16 == 0;
+
+  constexpr size_t kThreads = s2o::kThreadsPerBlock;
+  const size_t units = vectorized ? num_rows * row_bytes / 16 : num_rows * row_bytes;
+  const size_t max_blocks = static_cast<size_t>(cuda::sm_count()) * 2;
+  const size_t blocks = std::max<size_t>(1, std::min(max_blocks, (units + kThreads - 1) / kThreads));
+  s2o::zero_rows_beyond_splits_kernel<kThreads><<<blocks, kThreads, 0, stream>>>(
+      split_sizes_tensor->data.dptr, split_sizes_dtype, num_splits, ptr, num_rows, row_bytes,
+      vectorized);
+  NVTE_CHECK_CUDA(cudaGetLastError());
 }

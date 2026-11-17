@@ -103,6 +103,21 @@ std::tuple<at::Tensor, std::vector<at::Tensor>> splits_to_offsets_multi(
   return {split_sizes_out, std::move(outputs)};
 }
 
+void zero_rows_beyond_splits(at::Tensor data, const at::Tensor &split_sizes) {
+  NVTE_CHECK(data.is_cuda() && split_sizes.is_cuda(), "data and split_sizes must be CUDA tensors.");
+  NVTE_CHECK(data.is_contiguous(), "data must be contiguous.");
+  NVTE_CHECK(data.device() == split_sizes.device(), "data and split_sizes must be on one device.");
+  if (data.numel() == 0) {
+    return;
+  }
+  auto data_nvte = makeTransformerEngineTensor(data);
+  auto split_sizes_nvte = makeTransformerEngineTensor(split_sizes);
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_zero_rows_beyond_splits(split_sizes_nvte.data(), data_nvte.data(),
+                                 at::cuda::getCurrentCUDAStream());
+  });
+}
+
 at::Tensor copy_data_ptrs_to_device(const std::vector<at::Tensor> &tensors,
                                     const c10::Device &device) {
   // Collect data pointers

@@ -609,6 +609,8 @@ std::tuple<at::Tensor, std::vector<at::Tensor>> splits_to_offsets_multi(
     const std::vector<bool> &include_leading_zero, const std::vector<at::ScalarType> &dtypes,
     bool bulk_allocate_outputs, size_t split_alignment);
 
+void zero_rows_beyond_splits(at::Tensor data, const at::Tensor &split_sizes);
+
 at::Tensor copy_data_ptrs_to_device(const std::vector<at::Tensor> &tensors,
                                     const c10::Device &device);
 

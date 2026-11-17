@@ -1636,6 +1636,62 @@ def test_grouped_gemm_grouped_tensor_mxfp8(
         torch.testing.assert_close(o, o_ref, **tols)
 
 
+@pytest.mark.parametrize("quant_type", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+def test_grouped_gemm_grouped_tensor_ignores_stale_output(quant_type, layout) -> None:
+    """With accumulate=False the output is passed to cuBLASLt as C too (C aliases D, beta = 0 on the
+    device). A stale NaN in the output buffer must not reach the result (0 x NaN): the result must
+    be bitwise the one computed into a zeroed buffer. gpt-oss expert shapes, empty groups included."""
+    if tex.get_cublasLt_version() < 130300:
+        pytest.skip("Grouped GEMM requires cuBLAS 13.3+.")
+    if torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("Grouped GEMM requires Blackwell (SM100) or newer.")
+    if quant_type == "mxfp8" and not mxfp8_available:
+        pytest.skip(reason_for_no_mxfp8)
+    torch.manual_seed(0)
+    dtype, device = torch.bfloat16, torch.device("cuda")
+    z, n, k = 8, 2880, 2880
+    m_sizes = [256 * (i % 4) for i in range(z)]
+    m = sum(m_sizes)
+    transa, transb = layout[0] == "T", layout[1] == "T"
+    if layout == "NT":
+        A = [torch.randn(ms, k, dtype=dtype, device=device) for ms in m_sizes]
+        B = [torch.randn(ms, n, dtype=dtype, device=device) for ms in m_sizes]
+    else:
+        A = [torch.randn(n, k, dtype=dtype, device=device) * 0.05 for _ in range(z)]
+        B = [torch.randn(ms, k if layout == "TN" else n, dtype=dtype, device=device) for ms in m_sizes]
+    a_is_weight = layout != "NT"
+    if quant_type == "mxfp8":
+        grouped_A = _make_grouped_tensor_quantized_mxfp8(
+            A, rowwise=transa, columnwise=not transa, device=device, is_weight=a_is_weight
+        )
+        grouped_B = _make_grouped_tensor_quantized_mxfp8(
+            B, rowwise=not transb, columnwise=transb, device=device
+        )
+    else:
+        if a_is_weight:
+            grouped_A = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+        else:
+            grouped_A = _make_grouped_tensor_from_splits(m_sizes, k, device, dtype)
+        _pack_grouped_tensor(grouped_A, A)
+        grouped_B = _make_grouped_tensor_from_splits(m_sizes, B[0].shape[1], device, dtype)
+        _pack_grouped_tensor(grouped_B, B)
+
+    def run(fill):
+        if layout == "NT":
+            out = _make_grouped_tensor_uniform(z, n, k, device, dtype)
+        else:
+            out = _make_grouped_tensor_from_splits(m_sizes, n if layout == "TN" else k, device, dtype)
+        out.rowwise_data.fill_(fill)
+        general_grouped_gemm_for_grouped_tensor(grouped_A, grouped_B, out, layout=layout)
+        return out.rowwise_data
+
+    ref = run(0.0)
+    res = run(float("nan"))
+    assert torch.isfinite(res).all(), f"{int((~torch.isfinite(res)).sum())} non-finite outputs"
+    assert torch.equal(res.view(torch.int16), ref.view(torch.int16))
+
+
 def _fp8bs_grouped_gemm_available() -> bool:
     """Whether grouped-tensor GEMM supports FP8 block scaling on this system."""
     cc = torch.cuda.get_device_capability()

@@ -353,6 +353,20 @@ def _group_quantize_for_grouped_mlp(
     )
 
 
+def _zero_rows_beyond_splits(out: torch.Tensor, split_sizes: torch.Tensor) -> None:
+    """Zero the rows of a grouped-MLP output that belong to no group.
+
+    The grouped GEMMs (cuBLASLt and cuDNN) write only rows [0, sum(split_sizes)). A caller may pass
+    more rows than that: a fixed-size, CUDA-graph-safe token buffer whose tail holds the router's
+    dummy rows. Those output rows are never written and keep allocator contents, which can be NaN
+    bit patterns (e.g. FP4 / E4M3 bytes left by an earlier kernel); a consumer that scales them by a
+    zero routing probability then produces NaN (0 x NaN). Zeroing them on the device makes the op's
+    output fully defined. Cost is one small graph-safe kernel whose work is proportional to the
+    unassigned rows; rows that belong to a group are not touched.
+    """
+    tex.zero_rows_beyond_splits(out, split_sizes)
+
+
 def _group_quantize_with_amax_for_grouped_mlp(
     tensor: torch.Tensor,
     quantizer: Quantizer,
@@ -2314,6 +2328,10 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 fc2_quant_kernel(**fc2_quant_kwargs)
                 fc2_out = fc2_out_buf
 
+        # Rows past the last group are written by no GEMM (see _zero_rows_beyond_splits).
+        if not use_dense_single_group:
+            _zero_rows_beyond_splits(fc2_out, split_sizes)
+
         # Save state for backward pass
         if requires_grad:
             saved_fc1_x = grouped_fc1_x
@@ -3275,6 +3293,10 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 fc1_dgrad_kernel(**fc1_dgrad_kwargs)
                 grad_input = grad_input_buffer
 
+            # Rows past the last group are written by no GEMM (see _zero_rows_beyond_splits).
+            if not use_dense_single_group:
+                _zero_rows_beyond_splits(grad_input, split_sizes)
+
         # FC1 wgrad GEMM
         fc1_grad_params = _compute_grad_params(
             fc_op=fc1_op,
@@ -4131,6 +4153,8 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                 current_stream=current_stream,
                 **_bf16_fprop_weight_kwargs(fc2_op, num_groups, device, fc2_weights),
             )
+        # Rows past the last group are written by no GEMM (see _zero_rows_beyond_splits).
+        _zero_rows_beyond_splits(fc2_out, split_sizes)
 
         if requires_grad:
             saved_fc1_x = fc1_x if fc1_weight_requires_grad else None
@@ -4366,6 +4390,8 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                     current_stream=current_stream,
                     **_bf16_dgrad_weight_kwargs(fc1_op, num_groups, device, fc1_weights),
                 )
+            # Rows past the last group are written by no GEMM (see _zero_rows_beyond_splits).
+            _zero_rows_beyond_splits(grad_input, split_sizes)
 
         # FC1 wgrad.
         fc1_grad_params = _compute_grad_params(

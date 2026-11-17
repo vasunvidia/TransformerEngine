@@ -2967,6 +2967,92 @@ class TestGroupedMLPFusedOp:
         torch.testing.assert_close(y, y_ref, rtol=0, atol=0)
         torch.testing.assert_close(dgrad_buf, dx_ref, rtol=0, atol=0)
 
+    @pytest.mark.parametrize(
+        "quantization,group_size,hidden_size",
+        (
+            ("mxfp8", 4, 256),
+            ("nvfp4_rht", 4, 256),
+            ("mxfp8", 32, 2880),  # gpt-oss expert shapes
+            ("nvfp4_rht", 32, 2944),  # gpt-oss, expert width padded to a multiple of 128
+        ),
+    )
+    def test_grouped_mlp_rows_beyond_splits(
+        self,
+        quantization: str,
+        group_size: int,
+        hidden_size: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = "cuda",
+        split_alignment: int = 256,
+        tail_rows: int = 3 * 256,
+    ) -> None:
+        """Token buffers longer than sum(split_sizes) (fixed-size, graph-safe MoE buffers): the rows
+        past the last group belong to no GEMM. The output and grad-input rows there must be zero, not
+        stale memory, and the other rows must not depend on what the buffers held. The buffers are
+        pre-filled with NaN to stand in for allocator contents."""
+        if quantization == "mxfp8" and not mxfp8_available:
+            pytest.skip(reason_for_no_mxfp8)
+        if quantization in nvfp4_variant_names and not nvfp4_available:
+            pytest.skip(reason_for_no_nvfp4)
+        if not te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported():
+            pytest.skip("Fused grouped MLP is not supported on this system")
+
+        # Empty groups too, as routed batches have.
+        split_sizes = torch.tensor(
+            [split_alignment * (i % 4) for i in range(group_size)], dtype=torch.int64, device=device
+        )
+        active = int(split_sizes.sum())
+        num_tokens = active + tail_rows
+        recipe = make_recipe(quantization)
+        torch.manual_seed(1234)
+        x_base = torch.empty((num_tokens, hidden_size), device=device, dtype=dtype).uniform_(-1, 1)
+        x_base[active:] = 0  # the router's dummy rows
+        probs_base = torch.rand((num_tokens,), device=device, dtype=dtype)
+        probs_base[active:] = 0
+        dy_base = torch.empty((num_tokens, hidden_size), device=device, dtype=dtype).uniform_(-1, 1)
+        linear_kwargs = dict(bias=False, device=device, dtype=dtype, split_alignment=split_alignment)
+        module = te.ops.Sequential(
+            te.ops.GroupedLinear(group_size, hidden_size, 2 * hidden_size, **linear_kwargs),
+            te.ops.ScaledSwiGLU(glu_interleave_size=32),
+            te.ops.GroupedLinear(group_size, hidden_size, hidden_size, **linear_kwargs),
+        )
+        with torch.no_grad():
+            for fc in (module[0], module[2]):
+                for i in range(group_size):
+                    getattr(fc, f"weight{i}").normal_(std=0.02)
+
+        def run(fill):
+            x = x_base.detach().clone().requires_grad_(True)
+            out_buf = torch.full((num_tokens, hidden_size), fill, dtype=dtype, device=device)
+            dgrad_buf = torch.full((num_tokens, hidden_size), fill, dtype=dtype, device=device)
+            op_kwargs = {
+                module[0]: {GRAD_INPUT_BUFFER_KEY: dgrad_buf},
+                module[2]: {OUTPUT_BUFFER_KEY: out_buf},
+            }
+            torch.manual_seed(7)  # stochastic rounding of NVFP4 gradients
+            with te.autocast(enabled=True, recipe=recipe):
+                y = module(x, split_sizes, probs_base, split_sizes, op_kwargs=op_kwargs)
+            y.backward(dy_base)
+            assert y.data_ptr() == out_buf.data_ptr()
+            return y.detach(), dgrad_buf
+
+        y_ref, dx_ref = run(0.0)
+        assert isinstance(
+            module._module_groups[0]._forward_ops[0][0], te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        )
+        y, dx = run(float("nan"))
+        for name, value, ref in (("y", y, y_ref), ("dx", dx, dx_ref)):
+            tail = value[active:]
+            assert torch.equal(tail, torch.zeros_like(tail)), (
+                f"{name}: {int((tail != 0).sum())} of {tail.numel()} values in the rows past"
+                f" sum(split_sizes) are not zero ({int(tail.isnan().sum())} NaN)"
+            )
+            assert torch.isfinite(value).all(), f"{name} is not finite"
+            assert torch.equal(value.view(torch.int16), ref.view(torch.int16)), (
+                f"{name} depends on the prior contents of the buffer"
+            )
+
     @pytest.mark.parametrize("single_grouped_weight", (False, True))
     @pytest.mark.parametrize("delay_wgrad_compute", (False, True))
     @pytest.mark.parametrize("zero_out_wgrad", (False, True))
@@ -5008,6 +5094,37 @@ class TestGroupedMLPBf16FusedOp:
             assert len(fused) == 1 and isinstance(fused[0], fused_cls)
         else:
             self._assert_declined(fused, ops, fused_cls)
+
+    def test_rows_beyond_splits_are_zeroed(self) -> None:
+        """Rows past sum(split_sizes) belong to no group; output and grad-input rows there are zero
+        even when the caller's buffers held NaN, and the other rows do not depend on them."""
+        self._skip_unless_bf16_fusion()
+        torch.manual_seed(0)
+        num_groups, tail_rows = 4, 256
+        ops = _bf16_mlp_ops(num_groups=num_groups)
+        split_sizes, x0, probs0 = _bf16_mlp_inputs(ops, num_groups)
+        active = x0.shape[0]
+        x0 = torch.cat([x0, torch.zeros(tail_rows, x0.shape[1], dtype=x0.dtype, device="cuda")])
+        probs0 = torch.cat([probs0, torch.zeros(tail_rows, dtype=probs0.dtype, device="cuda")])
+        dy = torch.randn(x0.shape[0], ops[2].out_features, dtype=torch.bfloat16, device="cuda")
+        model = te.ops.Sequential(*ops)
+
+        def run(fill):
+            x = x0.clone().requires_grad_(True)
+            out_buf = torch.full((x0.shape[0], ops[2].out_features), fill, dtype=x0.dtype, device="cuda")
+            dgrad_buf = torch.full_like(x0, fill)
+            op_kwargs = {ops[0]: {GRAD_INPUT_BUFFER_KEY: dgrad_buf}, ops[2]: {OUTPUT_BUFFER_KEY: out_buf}}
+            y = model(x, split_sizes, probs0, split_sizes, op_kwargs=op_kwargs)
+            y.backward(dy)
+            return y.detach(), dgrad_buf
+
+        y_ref, dx_ref = run(0.0)
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLUBf16
+        assert isinstance(model._module_groups[0]._forward_ops[0][0], fused_cls)
+        y, dx = run(float("nan"))
+        for name, value, ref in (("y", y, y_ref), ("dx", dx, dx_ref)):
+            assert torch.equal(value[active:], torch.zeros_like(value[active:])), name
+            assert torch.equal(value.view(torch.int16), ref.view(torch.int16)), name
 
     def test_scale_bias_separate_scales(self) -> None:
         """FC2 scale_bias with scales distinct from the activation's probs.

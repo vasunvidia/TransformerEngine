@@ -559,6 +559,22 @@ void nvte_splits_to_offsets_multi_v2(NVTETensor split_sizes, size_t split_alignm
                                      const int *include_leading_zero, size_t num_outputs,
                                      cudaStream_t stream);
 
+/*! \brief Zero the rows of a grouped output that belong to no group.
+ *
+ * Grouped kernels write only the rows [0, sum(split_sizes)) of their row-partitioned outputs. When
+ * the buffer has more rows (a fixed-size, CUDA-graph-safe buffer sized for the worst case), the
+ * rows past the last group keep whatever the allocator left there, possibly NaN bit patterns that
+ * a consumer scaling those rows by 0 turns into NaN. This zeroes exactly those rows. The total is
+ * read on the device: no host synchronization, safe under CUDA graph capture; the work is
+ * proportional to the number of rows zeroed.
+ *
+ * \param[in]     split_sizes  Device int32/int64 group sizes in rows, shape [N].
+ * \param[in,out] data         Row-major buffer; rows are the flattened leading dimensions.
+ * \param[in]     stream       CUDA stream to use for the operation.
+ */
+void nvte_zero_rows_beyond_splits(const NVTETensor split_sizes, NVTETensor data,
+                                  cudaStream_t stream);
+
 /*! \brief TE Grouped Tensor type
  *
  * NVTEGroupedTensor is a collection of tensors with potentially different shapes
