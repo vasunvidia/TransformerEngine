@@ -69,6 +69,10 @@
  *     This lets the consumer of dx (e.g. the GEMMs of the preceding Linear) skip its own
  *     quantization pass over dx.
  *
+ *  Dynamic variant (NVTE_RMSNORM_BWD_DYN=1, not with dx_q): the same computation as a persistent
+ *  kernel that streams 8-row units through a TMA ring and schedules them with an atomic counter;
+ *  bitwise the cluster kernel's dx and dgamma. See rmsnorm_bwd_dyn_kernel.
+ *
  *  Origin: the single-sweep cluster kernel of the gpt-oss-20b "plus" workload
  *  (rmsnorm_bwd_cuda.cu, rmsnorm_bwd_single_sweep_kernel<8, HAS_RES, false, false>, NVIDIA
  *  first-party), without the MXFP8 gradient emission and dbias, dgamma written to the output
@@ -111,8 +115,11 @@ constexpr int kGroupMin = 16;         // minimum row blocks per level-1 group
 constexpr int kMaxGroups = 64;        // level-1 groups
 constexpr int kFan2 = 8;              // level-1 groups per level-2 group
 constexpr int kMaxGroups2 = (kMaxGroups + kFan2 - 1) / kFan2;
-// int32 per ticket slot: [final ticket | level-1 tickets | level-2 tickets]
-constexpr int kTicketSlot = 1 + kMaxGroups + kMaxGroups2;
+// int32 per ticket slot: [final ticket | level-1 tickets | level-2 tickets |
+//                        unit counter | exit counter (the two last only for the dynamic kernel)]
+constexpr int kCounterIdx = 1 + kMaxGroups + kMaxGroups2;
+constexpr int kDoneIdx = kCounterIdx + 1;
+constexpr int kTicketSlot = kDoneIdx + 1;
 constexpr int kTicketRing = 64;       // slots per device
 constexpr size_t kWorkspaceAlign = 128;
 
@@ -690,6 +697,420 @@ __global__ void __launch_bounds__(kThreads, 2) rmsnorm_bwd_single_sweep_kernel(c
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 }
 
+// ------------------------------------------------------------------------------- the dynamic kernel
+// Dynamically scheduled persistent variant (NVTE_RMSNORM_BWD_DYN=1, not with the MXFP8 copy of dx).
+//
+// The cluster kernel above is a launch-per-block kernel: a CTA's life is load -> barriers ->
+// store -> fence -> exit, so an SM's memory pipe is fed only part of the time. This kernel is
+// persistent: grid = min(M / 8, SM count), one CTA per SM, each streaming 8-row units through a
+// kDynSlots-deep shared-memory ring of kDynSub-row slots (dz, x [, dz2] [, add] and rsigma, filled
+// by TMA bulk copies). The units are taken from an atomic counter, so a CTA that cannot start
+// (its SM held by a resident kernel such as NCCL's reduce-scatter) costs only a unit of tail
+// imbalance: it starts once a first-wave CTA exits, finds the counter exhausted and leaves.
+// Consecutive fetches land in consecutive level-1 groups ("group-scattered"), so the CTAs do not
+// all take the same group's ticket at the same time. Three warp roles:
+//   - 12 compute warps: per slot, wait `full` -> row sums -> k -> dx (+ add) to global and the
+//     dgamma partial in registers -> arrive `empty`. Named barrier 1 only.
+//   - the producer warp (one lane): fetches the next unit one fetch ahead, waits for a slot's
+//     `empty` phase, writes the slot's metadata and issues the TMA copies; it never fences.
+//   - the ticket warp (one lane): follows the (warp, slot) releases of the compute warps and,
+//     when a unit's stores are done, fences and takes its level-1 group's ticket; the group's last
+//     arrival hands the level-1 reduce to the compute warps (run before their next slot).
+// Numerics are the cluster kernel's, bit for bit: the same per-row reduction tree and dx
+// arithmetic (dz = bf16(dz + dz2) and dx = bf16(bf16(dx) + add) as there), the dgamma partial of
+// each 8-row unit is the same in-thread sum over its 8 rows in order, written to part[unit]; the
+// level-1 reducer adds the 4 units of each 32-row block first (the cluster's rank order), then the
+// blocks in order, and levels 2 / 3 are the cluster kernel's. The unit counter and the exit counter
+// live in the ticket slot and are re-armed by the last CTA to exit (no memset; graph-replayable).
+// Port of rmsnorm_bwd_dyn_kernel<4, 2> ("dyn:4,2,101,1") of the gpt-oss-20b "plus" workload
+// (rmsnorm_bwd_cuda.cu, NVIDIA first-party), extended by dz2 and TE's residual-add rounding.
+constexpr int kDynSub = 4;                    // rows per slot
+constexpr int kDynSlots = 2;                  // ring depth
+constexpr int kDynUnitRows = 8;               // rows per scheduling unit (= the cluster kernel's CTA)
+constexpr int kDynUnitsPerBlock = kBlockRows / kDynUnitRows;  // 4
+constexpr int kDynService = 64;               // producer warp + ticket warp
+constexpr int kDynRQ = 16;                    // reduce-request ring
+constexpr int kDynLog = 8 * kDynSlots;        // issue-log depth (the ticket warp's maximum lag)
+
+__host__ __device__ constexpr int dyn_tensors(bool has_add, bool has_dz2) { return 2 + (has_add ? 1 : 0) + (has_dz2 ? 1 : 0); }
+__host__ __device__ constexpr size_t dyn_slot_bytes(int N, bool has_add, bool has_dz2) {
+  return static_cast<size_t>(kDynSub) * N * 2 * dyn_tensors(has_add, has_dz2) + 16 /*rsigma*/;
+}
+__host__ __device__ constexpr size_t dyn_misc_bytes() {
+  return 2 * 16 /*full, empty mbarriers*/ + kWarps * kDynSub * 4 /*warp row sums*/ +
+         kDynSub * 4 /*k*/ + kDynSlots * 16 /*slot metadata*/ + kDynRQ * 4 /*reduce requests*/ +
+         16 /*flags*/ + 2 * kDynLog * 4 /*issue log*/;
+}
+size_t dyn_smem_bytes(const int N, const bool has_add, const bool has_dz2) {
+  return kDynSlots * dyn_slot_bytes(N, has_add, has_dz2) + dyn_misc_bytes();
+}
+
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+
+__device__ __forceinline__ void mbar_arrive(uint64_t *bar) {
+  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(bar)) : "memory");
+}
+// Named barrier 1 of the kThreads compute threads (the service warps never join).
+__device__ __forceinline__ void bar_sync_compute() {
+  asm volatile("bar.sync 1, %0;" ::"n"(kThreads) : "memory");
+}
+__device__ __forceinline__ bool ticket_last_compute(int *counter, int target, int *s_flag) {
+  bar_sync_compute();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const int old = atomicAdd(counter, 1);
+    const int last = (old == target - 1) ? 1 : 0;
+    if (last) *counter = 0;
+    __threadfence();
+    *s_flag = last;
+  }
+  bar_sync_compute();
+  return *s_flag != 0;
+}
+// Level-1 group sum over the group's 8-row unit partials: per 32-row block the 4 units in order
+// (= the cluster kernel's block partial), then the blocks in order (= reduce_rows_f32).
+__device__ __forceinline__ void reduce_units_f32(const float *base, int nblocks, int N, float *dst) {
+  for (int i = threadIdx.x; i < (N >> 2); i += kThreads) {
+    const int c = i * 4;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int b = 0; b < nblocks; b += 4) {  // 16 loads in flight per thread
+      const int nb = min(4, nblocks - b);
+      float4 v[4][kDynUnitsPerBlock];
+#pragma unroll
+      for (int bb = 0; bb < 4; ++bb) {
+        if (bb < nb) {
+#pragma unroll
+          for (int q = 0; q < kDynUnitsPerBlock; ++q) {
+            v[bb][q] = ld_cg_f4(base + static_cast<size_t>((b + bb) * kDynUnitsPerBlock + q) * N + c);
+          }
+        }
+      }
+#pragma unroll
+      for (int bb = 0; bb < 4; ++bb) {
+        if (bb < nb) {
+          float4 t = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+          for (int q = 0; q < kDynUnitsPerBlock; ++q) {
+            t.x += v[bb][q].x; t.y += v[bb][q].y; t.z += v[bb][q].z; t.w += v[bb][q].w;  // NOLINT(*)
+          }
+          s.x += t.x; s.y += t.y; s.z += t.z; s.w += t.w;  // NOLINT(*)
+        }
+      }
+    }
+    *reinterpret_cast<float4 *>(dst + c) = s;
+  }
+}
+__device__ __forceinline__ void reduce_rows_f32_compute(const float *base, int nrows, int N, float *dst) {
+  reduce_rows_f32(base, nrows, N, dst);  // threads 0..kThreads-1 only (the strided loop uses kThreads)
+}
+// Levels 1 (this group), 2 and 3 for a level-1 group whose last ticket this CTA took.
+__device__ __forceinline__ void dyn_finish_group(const Params &p, int g1, int *s_flag) {
+  const int N = p.N;
+  const int gsize1 = min(p.group, p.nb32 - g1 * p.group);
+  reduce_units_f32(p.part + static_cast<size_t>(g1) * p.group * kDynUnitsPerBlock * N, gsize1, N,
+                   p.part2 + static_cast<size_t>(g1) * N);
+  const int g2 = g1 / kFan2;
+  const int gsize2 = min(kFan2, p.ngroups - g2 * kFan2);
+  if (!ticket_last_compute(p.tickets + 1 + kMaxGroups + g2, gsize2, s_flag)) return;
+  reduce_rows_f32_compute(p.part2 + static_cast<size_t>(g2) * kFan2 * N, gsize2, N,
+                          p.part3 + static_cast<size_t>(g2) * N);
+  const int ngroups2 = (p.ngroups + kFan2 - 1) / kFan2;
+  if (!ticket_last_compute(p.tickets, ngroups2, s_flag)) return;
+  for (int i = threadIdx.x; i < (N >> 2); i += kThreads) {
+    const int c = i * 4;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int gg = 0; gg < ngroups2; ++gg) {
+      const float4 v = ld_cg_f4(p.part3 + static_cast<size_t>(gg) * N + c);
+      sum.x += v.x; sum.y += v.y; sum.z += v.z; sum.w += v.w;  // NOLINT(*)
+    }
+    p.dgamma[c + 0] = f2bf(sum.x);
+    p.dgamma[c + 1] = f2bf(sum.y);
+    p.dgamma[c + 2] = f2bf(sum.z);
+    p.dgamma[c + 3] = f2bf(sum.w);
+  }
+}
+
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+
+template <bool kAdd, bool kDz2>
+__global__ void __launch_bounds__(kThreads + kDynService, 1)
+    rmsnorm_bwd_dyn_kernel(const Params p) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  constexpr int NTEN = dyn_tensors(kAdd, kDz2);
+  constexpr int SPU = kDynUnitRows / kDynSub;  // slots per unit
+  constexpr int F_UNIT_END = 1, F_FLUSH = 2, F_STOP = 4;
+  extern __shared__ __align__(128) uint8_t smem[];
+
+  const int N = p.N;
+  const int NV = N >> 3;
+  const int slot_elems = kDynSub * N;
+  const size_t slot_bytes = dyn_slot_bytes(N, kAdd, kDz2);
+  const uint32_t tx_bytes = static_cast<uint32_t>(NTEN * slot_elems * 2 + kDynSub * 4);
+  uint8_t *misc = smem + kDynSlots * slot_bytes;
+  uint64_t *full = reinterpret_cast<uint64_t *>(misc);
+  uint64_t *empty = reinterpret_cast<uint64_t *>(misc + 16);
+  float *s_red = reinterpret_cast<float *>(misc + 32);
+  float *s_k = s_red + kWarps * kDynSub;
+  int4 *s_meta = reinterpret_cast<int4 *>(s_k + kDynSub);  // per slot: unit (-1 = stop), sub-block, reduce requests
+  int *s_rq = reinterpret_cast<int *>(s_meta + kDynSlots);
+  int *s_flag = s_rq + kDynRQ;  // [0] reducers' ticket flag, [1] reduce requests published,
+                                // [2] sequence numbers retired by the ticket warp (-1: all done),
+                                // [3] (warp, slot) releases by the compute warps
+  int *s_lunit = s_flag + 4;    // issue log: unit and flags of sequence number q at q % kDynLog
+  int *s_lflag = s_lunit + kDynLog;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int U = p.M / kDynUnitRows;
+  const int GU = p.group * kDynUnitsPerBlock;  // units per full level-1 group
+
+  if (tid == 0) {
+#pragma unroll
+    for (int q = 0; q < kDynSlots; ++q) {
+      mbar_init(full + q, 1);
+      mbar_init(empty + q, kWarps);
+    }
+    fence_barrier_init();
+    s_flag[1] = 0;
+    s_flag[2] = 0;
+    s_flag[3] = 0;
+  }
+  __syncthreads();  // the only CTA-wide barrier
+
+  if (warp == kWarps) {  // ---------------------------------------------------- producer warp
+    if (lane == 0) {
+      int *counter = p.tickets + kCounterIdx;
+      volatile int *v_rq = s_flag + 1;
+      volatile int *v_ret = s_flag + 2;
+      int j = 0;  // slots issued (sequence number)
+      auto issue = [&](int u, int sr, int flags) {
+        const int sl = j % kDynSlots;
+        const int f = j / kDynSlots;
+        if (j >= kDynSlots) mbar_wait(empty + sl, static_cast<uint32_t>((f - 1) & 1));
+        if (j >= kDynLog) {
+          while (*v_ret < j - kDynLog + 1) __nanosleep(64);
+        }
+        const int rq = *v_rq;
+        __threadfence_block();
+        const int row0 = u * kDynUnitRows + sr * kDynSub;
+        uint8_t *base = smem + sl * slot_bytes;
+        s_lunit[j % kDynLog] = u;
+        s_lflag[j % kDynLog] = flags;
+        s_meta[sl] = make_int4(u, sr, rq, 0);
+        mbar_expect_tx(full + sl, tx_bytes);
+        const uint32_t tb = static_cast<uint32_t>(slot_elems * 2);
+        int t = 0;
+        bulk_g2s(base + static_cast<size_t>(t++) * tb, p.dz + static_cast<size_t>(row0) * N, tb, full + sl);
+        bulk_g2s(base + static_cast<size_t>(t++) * tb, p.x + static_cast<size_t>(row0) * N, tb, full + sl);
+        if (kDz2) bulk_g2s(base + static_cast<size_t>(t++) * tb, p.dz2 + static_cast<size_t>(row0) * N, tb, full + sl);
+        if (kAdd) bulk_g2s(base + static_cast<size_t>(t++) * tb, p.add + static_cast<size_t>(row0) * N, tb, full + sl);
+        bulk_g2s(base + static_cast<size_t>(NTEN) * tb, p.rsigma + row0, kDynSub * 4, full + sl);
+        ++j;
+      };
+      // group-scattered fetches: fetch c -> level-1 group c % ngroups, its unit c / ngroups
+      const int TC = p.ngroups * GU;
+      int next = atomicAdd(counter, 1);
+      while (next < TC) {
+        const int c = next;
+        next = atomicAdd(counter, 1);  // one fetch ahead
+        const int u = (c % p.ngroups) * GU + c / p.ngroups;
+        if (u < U && c / p.ngroups < GU) {
+          for (int sr = 0; sr < SPU; ++sr) {
+            issue(u, sr, sr == SPU - 1 ? (F_UNIT_END | F_FLUSH) : 0);
+          }
+        }
+      }
+      {  // the stop slot: after the ticket warp has retired everything and published every request
+        const int sl = j % kDynSlots;
+        if (j >= kDynLog) {
+          while (*v_ret < j - kDynLog + 1) __nanosleep(64);
+        }
+        s_lflag[j % kDynLog] = F_STOP;
+        __threadfence_block();
+        while (*reinterpret_cast<volatile int *>(s_flag + 3) < kWarps * j) __nanosleep(64);
+        atomicAdd(s_flag + 3, kWarps);
+        while (*v_ret != -1) __nanosleep(64);
+        __threadfence_block();
+        s_meta[sl] = make_int4(-1, 0, *v_rq, 0);
+        mbar_arrive(full + sl);
+      }
+    }
+    return;
+  }
+
+  if (warp == kWarps + 1) {  // ------------------------------------------------- ticket warp
+    if (lane == 0) {
+      int *done = p.tickets + kDoneIdx;
+      volatile int *v_rq = s_flag + 1;
+      volatile int *v_ret = s_flag + 2;
+      volatile int *v_rel = s_flag + 3;
+      int rq_w = 0;
+      for (int q = 0;; ++q) {
+        while (*v_rel < kWarps * (q + 1)) __nanosleep(32);
+        __threadfence_block();  // acquire: the log entry and the compute warps' stores of that slot
+        const int fl = s_lflag[q % kDynLog];
+        if (fl & F_STOP) break;
+        if (fl & F_UNIT_END) {  // the unit's partial row and dx are stored: its group's ticket
+          const int g = (s_lunit[q % kDynLog] / kDynUnitsPerBlock) / p.group;
+          const int gsize1 = min(p.group, p.nb32 - g * p.group);
+          __threadfence();  // release (cumulative): the unit's stores at GPU scope before the ticket
+          const int old = atomicAdd(p.tickets + 1 + g, 1);
+          if (old + 1 == gsize1 * kDynUnitsPerBlock) {
+            p.tickets[1 + g] = 0;  // re-arm
+            __threadfence();       // acquire: the other CTAs' partial rows
+            s_rq[rq_w % kDynRQ] = g;
+            ++rq_w;
+            __threadfence_block();
+            *v_rq = rq_w;
+          }
+        }
+        *v_ret = q + 1;
+      }
+      __threadfence_block();
+      *v_ret = -1;
+      __threadfence();
+      const int old = atomicAdd(done, 1);
+      if (old == static_cast<int>(gridDim.x) - 1) {  // the last CTA to exit: every fetch is done
+        __threadfence();
+        p.tickets[kCounterIdx] = 0;
+        *done = 0;
+      }
+    }
+    return;
+  }
+
+  // ------------------------------------------------------------------------------ compute warps
+  const int c0 = tid * 8;
+  const bool owner = tid < NV;
+  float g[8];
+  {
+    uint4 gv = make_uint4(0u, 0u, 0u, 0u);
+    if (owner) gv = __ldg(reinterpret_cast<const uint4 *>(p.gamma + c0));
+    const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
+    const float add = p.zero_centered ? 1.0f : 0.0f;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) g[c] = bf2f(gw[c >> 1], c & 1) + add;
+  }
+  float dg[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) dg[c] = 0.0f;
+  int rq_r = 0;
+
+  for (int j = 0;; ++j) {
+    const int sl = j % kDynSlots;
+    mbar_wait(full + sl, static_cast<uint32_t>((j / kDynSlots) & 1));
+    const int4 meta = s_meta[sl];
+    while (rq_r < meta.z) {  // level-1 reduces this CTA won (CTA-uniform)
+      if (tid == 0) __threadfence();
+      bar_sync_compute();
+      dyn_finish_group(p, s_rq[rq_r % kDynRQ], s_flag);
+      ++rq_r;
+    }
+    if (meta.x < 0) break;
+    const int unit = meta.x;
+    const int sr = meta.y;
+    const int row0 = unit * kDynUnitRows + sr * kDynSub;
+    const uint16_t *s_dz = reinterpret_cast<const uint16_t *>(smem + sl * slot_bytes);
+    const uint16_t *s_x = s_dz + slot_elems;
+    const uint16_t *s_dz2 = s_x + slot_elems;
+    const uint16_t *s_add = s_x + slot_elems * (kDz2 ? 2 : 1);
+    const float *s_rs = reinterpret_cast<const float *>(s_dz + NTEN * slot_elems);
+    auto load_dz = [&](int r) {
+      const uint4 a = *reinterpret_cast<const uint4 *>(s_dz + r * N + c0);
+      if constexpr (kDz2) {
+        return add_bf16x8(a, *reinterpret_cast<const uint4 *>(s_dz2 + r * N + c0));
+      } else {
+        return a;
+      }
+    };
+
+    // sweep 1: per-row sum of dz * g * x (the cluster kernel's tree)
+    {
+      float acc[kDynSub];
+#pragma unroll
+      for (int r = 0; r < kDynSub; ++r) {
+        acc[r] = 0.0f;
+        if (owner) {
+          const uint4 a = load_dz(r);
+          const uint4 b = *reinterpret_cast<const uint4 *>(s_x + r * N + c0);
+          const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+          const uint32_t bw[4] = {b.x, b.y, b.z, b.w};
+          float sum = 0.0f;
+#pragma unroll
+          for (int c = 0; c < 8; ++c) sum += bf2f(aw[c >> 1], c & 1) * g[c] * bf2f(bw[c >> 1], c & 1);
+          acc[r] = sum;
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kDynSub; ++r) {
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], o);
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < kDynSub; ++r) s_red[warp * kDynSub + r] = acc[r];
+      }
+      bar_sync_compute();
+      if (tid < kDynSub) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) sum += s_red[w * kDynSub + tid];
+        const float rs = s_rs[tid];
+        s_k[tid] = sum * (rs * rs * rs) / static_cast<float>(N);
+      }
+      bar_sync_compute();
+    }
+
+    // sweep 2: dx (+ add) -> global; dgamma over the unit's 8 rows in order, in registers
+    if (owner) {
+#pragma unroll
+      for (int r = 0; r < kDynSub; ++r) {
+        const uint4 a = load_dz(r);
+        const uint4 b = *reinterpret_cast<const uint4 *>(s_x + r * N + c0);
+        const uint32_t aw[4] = {a.x, a.y, a.z, a.w};
+        const uint32_t bw[4] = {b.x, b.y, b.z, b.w};
+        const float rs = s_rs[r];
+        const float k = s_k[r];
+        uint32_t ow[4];
+#pragma unroll
+        for (int c = 0; c < 8; c += 2) {
+          float v2[2];
+#pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            const float dzf = bf2f(aw[c >> 1], e);
+            const float xf = bf2f(bw[c >> 1], e);
+            v2[e] = rs * (dzf * g[c + e]) - xf * k;
+            dg[c + e] += dzf * xf * rs;
+          }
+          ow[c >> 1] = pack_bf16x2(v2[0], v2[1]);
+        }
+        uint4 o = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+        if constexpr (kAdd) o = add_bf16x8(o, *reinterpret_cast<const uint4 *>(s_add + r * N + c0));
+        *reinterpret_cast<uint4 *>(p.dx + static_cast<size_t>(row0 + r) * N + c0) = o;
+      }
+    }
+    if (sr == SPU - 1) {  // the unit is complete: its partial row
+      if (owner) {
+        float *pr = p.part + static_cast<size_t>(unit) * N + c0;
+        *reinterpret_cast<float4 *>(pr) = make_float4(dg[0], dg[1], dg[2], dg[3]);
+        *reinterpret_cast<float4 *>(pr + 4) = make_float4(dg[4], dg[5], dg[6], dg[7]);
+      }
+#pragma unroll
+      for (int c = 0; c < 8; ++c) dg[c] = 0.0f;
+    }
+    __syncwarp();
+    if (lane == 0) {
+      mbar_arrive(empty + sl);  // this warp's reads of the slot are done
+      __threadfence_block();    // this warp's stores are done (cumulative, CTA scope)
+      atomicAdd(s_flag + 3, 1);
+    }
+  }
+#else
+  NVTE_DEVICE_THREAD0_ERROR("Dynamic RMSNorm backward requires SM 9.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
 // ------------------------------------------------------------------------------- host helpers
 // Per-device facts checked once: the kernel's cluster launch is possible and fits.
 struct DeviceSupport {
@@ -757,15 +1178,32 @@ struct WorkspaceLayout {
   size_t part, part2, part3, tickets, total;
 };
 
-WorkspaceLayout workspace_layout(const size_t rows, const size_t cols) {
+// dyn: the dynamic kernel keeps one partial row per 8-row unit (4 per 32-row block).
+WorkspaceLayout workspace_layout(const size_t rows, const size_t cols, const bool dyn) {
   const Plan plan = make_plan(rows);
   WorkspaceLayout w;
   w.part = 0;
-  w.part2 = w.part + align_up(sizeof(float) * plan.nb32 * cols);
+  const size_t part_rows = static_cast<size_t>(plan.nb32) * (dyn ? kDynUnitsPerBlock : 1);
+  w.part2 = w.part + align_up(sizeof(float) * part_rows * cols);
   w.part3 = w.part2 + align_up(sizeof(float) * plan.ngroups * cols);
   w.tickets = w.part3 + align_up(sizeof(float) * plan.ngroups2 * cols);
   w.total = w.tickets + align_up(sizeof(int) * kTicketSlot);
   return w;
+}
+
+// NVTE_RMSNORM_BWD_DYN=1: the single-sweep backward runs the dynamic kernel where it can (read
+// at every call, like NVTE_RMSNORM_BWD_SINGLE_SWEEP; the workspace query and the launch of one
+// call see the same value).
+bool use_rmsnorm_bwd_dyn() { return transformer_engine::getenv<bool>("NVTE_RMSNORM_BWD_DYN"); }
+
+// Whether a launch can take the dynamic kernel (the single-sweep checks have passed).
+bool dyn_eligible(const Tensor &rsigma, const int cols, const bool has_add, const bool has_dz2,
+                  const Tensor *dx_q) {
+  if (dx_q != nullptr) return false;  // the MXFP8 copy of dx stays on the cluster kernel
+  if (!is_ptr_aligned(rsigma.data.dptr)) return false;  // 16-byte rsigma slices (TMA)
+  const int device_id = cuda::current_device();
+  return dyn_smem_bytes(cols, has_add, has_dz2) <=
+         static_cast<size_t>(cuda::max_shared_memory_per_block_optin(device_id));
 }
 
 }  // namespace
@@ -870,7 +1308,7 @@ bool is_supported_by_rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x,
 }
 
 size_t rmsnorm_bwd_single_sweep_workspace_bytes(const size_t rows, const size_t cols) {
-  return workspace_layout(rows, cols).total;
+  return workspace_layout(rows, cols, use_rmsnorm_bwd_dyn()).total;
 }
 
 void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &rsigma,
@@ -879,7 +1317,10 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
                               const Tensor *dz2, Tensor *dx_q) {
   const auto [rows, cols] = x.flat_2d_dims();
   const Plan plan = make_plan(rows);
-  const WorkspaceLayout layout = workspace_layout(rows, cols);
+  const bool dyn_ws = use_rmsnorm_bwd_dyn();  // the workspace was sized with this value
+  const bool dyn = dyn_ws && dyn_eligible(rsigma, static_cast<int>(cols), add != nullptr,
+                                          dz2 != nullptr, dx_q);
+  const WorkspaceLayout layout = workspace_layout(rows, cols, dyn_ws);
   NVTE_CHECK(is_ptr_aligned(workspace), "Workspace must be 16-byte aligned.");
   auto *ws = static_cast<uint8_t *>(workspace);
 
@@ -922,6 +1363,22 @@ void rmsnorm_bwd_single_sweep(const Tensor &dz, const Tensor &x, const Tensor &r
     // are zeroed by a (captured) memset.
     p.tickets = reinterpret_cast<int *>(ws + layout.tickets);
     NVTE_CHECK_CUDA(cudaMemsetAsync(p.tickets, 0, sizeof(int) * kTicketSlot, stream));
+  }
+
+  if (dyn) {
+    const bool has_add = p.add != nullptr, has_dz2 = p.dz2 != nullptr;
+    const size_t smem = dyn_smem_bytes(p.N, has_add, has_dz2);
+    auto kernel = has_add ? (has_dz2 ? rmsnorm_bwd_dyn_kernel<true, true>
+                                     : rmsnorm_bwd_dyn_kernel<true, false>)
+                          : (has_dz2 ? rmsnorm_bwd_dyn_kernel<false, true>
+                                     : rmsnorm_bwd_dyn_kernel<false, false>);
+    NVTE_CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(smem)));
+    const int units = p.M / kDynUnitRows;
+    const int grid = std::min(units, cuda::sm_count(cuda::current_device()));
+    kernel<<<grid, kThreads + kDynService, smem, stream>>>(p);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+    return;
   }
 
   const size_t smem = smem_bytes(p.N);

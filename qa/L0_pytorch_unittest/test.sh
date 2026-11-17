@@ -54,6 +54,7 @@ python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/test_grouped_tensor.xml $TE_
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_gqa.xml $TE_PATH/tests/pytorch/test_gqa.py || test_fail "test_gqa.py"
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_qk_norm.xml $TE_PATH/tests/pytorch/test_qk_norm.py || test_fail "test_qk_norm.py"
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_rmsnorm_bwd_single_sweep.xml $TE_PATH/tests/pytorch/test_rmsnorm_bwd_single_sweep.py || test_fail "test_rmsnorm_bwd_single_sweep.py"
+python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_rmsnorm_bwd_dyn.xml $TE_PATH/tests/pytorch/test_rmsnorm_bwd_dyn.py || test_fail "test_rmsnorm_bwd_dyn.py"
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_rmsnorm_bwd_fuse_residual.xml $TE_PATH/tests/pytorch/test_rmsnorm_bwd_fuse_residual.py || test_fail "test_rmsnorm_bwd_fuse_residual.py"
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_rmsnorm_bwd_fused.xml $TE_PATH/tests/pytorch/test_rmsnorm_bwd_fused.py || test_fail "test_rmsnorm_bwd_fused.py"
 python3 -m pytest --tb=auto --junitxml=$XML_LOG_DIR/pytest_test_fused_optimizer.xml $TE_PATH/tests/pytorch/test_fused_optimizer.py || test_fail "test_fused_optimizer.py"

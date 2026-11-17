@@ -514,6 +514,19 @@ LayerNorm/RMSNorm SM Margins
                  order differs, so they are not bitwise identical) and are deterministic; the
                  kernel can be captured in CUDA graphs. The variable is read at every call.
 
+.. envvar:: NVTE_RMSNORM_BWD_DYN
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: With :envvar:`NVTE_RMSNORM_BWD_SINGLE_SWEEP` (and for ``nvte_rmsnorm_bwd_fused``),
+                 run the single-sweep RMSNorm backward as a persistent kernel (one CTA per SM) that
+                 streams 8-row units through a TMA-filled shared-memory ring and takes them from an
+                 atomic counter, so a CTA whose SM is held by another resident kernel (e.g. an NCCL
+                 reduce-scatter) costs only a unit of tail imbalance. Results are bitwise those of
+                 the single-sweep kernel without this variable. Not used for the MXFP8 copy of
+                 ``dx`` or when ``rsigma`` is not 16-byte aligned (the single-sweep kernel runs).
+                 Needs a larger workspace (one fp32 partial row per 8 rows). Read at every call.
+
 GEMM Configuration
 ^^^^^^^^^^^^^^^^^^
 
