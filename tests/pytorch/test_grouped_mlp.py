@@ -3078,13 +3078,28 @@ class TestGroupedMLPFusedOp:
         """NVTE_GROUPED_MLP_ZERO_ROWS_BEYOND_SPLITS=0: the rows past sum(split_sizes) are not zeroed
         (they keep the buffer's prior contents, here NaN), and every row inside the groups, the
         weight gradients and the activation gradients are bitwise equal to the default (zeroing)
-        run. Split patterns: empty groups, every token in one group, no token in any group."""
+        run. Split patterns: empty groups, every token in one group, no token in any group.
+
+        The probability gradient is compared bitwise only with deterministic dprob requested:
+        cuDNN's dGLU accumulates each token's dprob over the N tiles of the FC2 dgrad with fp32
+        atomics in a dynamically scheduled order, so whenever the expert width spans more than one
+        N tile (2944 here, not 256) dprob differs in the last fp32 bits from run to run, with the
+        switch fixed. After the cast to BF16 that flips about one value in 12288 by one ulp in
+        roughly half of the runs (zero-fill on vs on as often as on vs off), which made an exact
+        comparison flaky. NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 makes TE request the front end's
+        deterministic dprob (one slot per N tile, reduced in a fixed order); every other tensor
+        compared here is deterministic either way."""
         if quantization == "mxfp8" and not mxfp8_available:
             pytest.skip(reason_for_no_mxfp8)
         if quantization in nvfp4_variant_names and not nvfp4_available:
             pytest.skip(reason_for_no_nvfp4)
         if not te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported():
             pytest.skip("Fused grouped MLP is not supported on this system")
+        deterministic_dprob = (
+            te.ops.fused.GroupedMLP_CuTeGEMMGLU.grouped_gemm_dactivation_is_deterministic()
+        )
+        if deterministic_dprob:
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
 
         if splits == "empty_groups":
             sizes = [split_alignment * (i % 4) for i in range(group_size)]
@@ -3152,12 +3167,18 @@ class TestGroupedMLPFusedOp:
                 value[:active].view(torch.int16), ref[:active].view(torch.int16)
             ), f"{name}: rows inside the groups differ"
             assert torch.isfinite(value[:active]).all(), f"{name} is not finite"
-        # Gradients of the probabilities (rows inside the groups) and of every weight.
-        assert torch.equal(dp[:active], dp_ref[:active])
-        assert torch.isfinite(dp[:active]).all()
+        # Gradients of every weight and of the probabilities (rows inside the groups).
         for i, (a, b) in enumerate(zip(wg, wg_ref)):
             assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"wgrad {i}"
             assert torch.isfinite(a).all(), f"wgrad {i}"
+        assert torch.isfinite(dp[:active]).all()
+        if deterministic_dprob:
+            assert torch.equal(
+                dp[:active].view(torch.int16), dp_ref[:active].view(torch.int16)
+            ), "probs.grad: rows inside the groups differ"
+        else:
+            # Atomic dprob: the run-to-run spread is one BF16 ulp (2^-7 relative at most).
+            torch.testing.assert_close(dp[:active], dp_ref[:active], rtol=2**-7, atol=0)
 
     @pytest.mark.parametrize("single_grouped_weight", (False, True))
     @pytest.mark.parametrize("delay_wgrad_compute", (False, True))
