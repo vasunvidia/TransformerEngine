@@ -1985,8 +1985,19 @@ NVFP4Quantizer::ShapeAlignment NVFP4Quantizer::gemm_swizzled_scales_alignment(
 
 bool NVFP4Quantizer::is_eligible_for_rht_cast_fusion(const std::vector<size_t>& shape,
                                                      bool for_grouped_kernel) {
-  return meets_alignment(shape, rht_cast_fusion_alignment(transformer_engine::cuda::sm_arch(),
-                                                          std::nullopt, for_grouped_kernel));
+  const int sm_arch = transformer_engine::cuda::sm_arch();
+  auto alignment = rht_cast_fusion_alignment(sm_arch, std::nullopt, for_grouped_kernel);
+  // The single-tensor SM100-family fused kernel (row_col_rht_gemm_ntt_w_sfc) only needs both
+  // dims to be multiples of 64: it tiles the columns by 128 and handles a trailing half tile.
+  // NVTE_NVFP4_RHT_FUSION_COLS64=1 lets tensors with 64- (not 128-) aligned columns, e.g. a
+  // hidden size of 2880, take it instead of the unfused amax + RHT + cast passes. Only the
+  // fusion eligibility changes: GEMM-swizzled scale emission keeps its 128-column requirement
+  // (gemm_swizzled_scales_alignment), so such tensors get compact scales from the fused kernel.
+  if (alignment && !for_grouped_kernel && sm_arch >= 100 && sm_arch <= 110 &&
+      transformer_engine::getenv<bool>("NVTE_NVFP4_RHT_FUSION_COLS64")) {
+    alignment->second = 64;
+  }
+  return meets_alignment(shape, alignment);
 }
 
 bool NVFP4Quantizer::is_eligible_for_2d_swizzle_fusion(const std::vector<size_t>& shape) {

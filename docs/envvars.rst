@@ -396,6 +396,12 @@ Kernel Configuration
    :Default: ``0``
    :Description: Emit a warning when falling back from CUTLASS to cuBLAS for grouped GEMM operations.
 
+.. envvar:: NVTE_NVFP4_RHT_FUSION_COLS64
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Let NVFP4 quantization with random Hadamard transform use the fused RHT + cast kernel (one pass for the rowwise cast, the columnwise RHT + cast and the transpose) for single tensors whose last dimension is a multiple of 64 instead of 128, on SM100-family GPUs. Tensors with 64- but not 128-aligned columns (e.g. a hidden size of 2880) otherwise take the unfused path (separate RHT + amax and cast kernels). The output equals the fused kernel's on a 128-aligned tensor; with :envvar:`NVTE_USE_FAST_MATH` and stochastic rounding off it is bitwise identical to the unfused path. Such tensors get compact (non-GEMM-swizzled) scale factors. The grouped kernels keep the 128 requirement.
+
 .. envvar:: NVTE_NVFP4_ROW_SCALED_ACTIVATION
 
    :Type: ``int`` (0 or 1)
