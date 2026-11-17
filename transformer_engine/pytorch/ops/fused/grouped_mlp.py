@@ -34,6 +34,7 @@ from ...module.base import _2X_ACC_WGRAD
 from ...quantization import Recipe, get_fp8_torch_dtype
 from ...tensor import NVFP4Quantizer, NVFP4Tensor, NVFP4TensorStorage, Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
+from ...tensor import nvfp4_group_amax
 from ...tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 from ...tensor.storage.grouped_tensor_storage import GroupedTensorStorage
 from ...triton.grouped_dbias_dscales import compute_grouped_dbias, compute_grouped_dbias_dscales
@@ -333,7 +334,8 @@ def _group_quantize_for_grouped_mlp(
     """Quantize into grouped storage."""
 
     if not use_dense_single_group:
-        return tex.group_quantize(
+        # Uses NVFP4 amaxes precomputed by the tensor's producer, if any (nvfp4_group_amax).
+        return nvfp4_group_amax.group_quantize(
             tensor,
             quantizer,
             num_groups,

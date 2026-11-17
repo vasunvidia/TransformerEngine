@@ -77,6 +77,7 @@ from ..tensor import (
     IdentityQuantizer,
     MXFP8Quantizer,
 )
+from ..tensor import nvfp4_group_amax
 from ..quantized_tensor import (
     QuantizedTensorStorage,
     Quantizer,
@@ -900,7 +901,8 @@ def _grouped_linear_graph_safe_forward(args: GroupedLinearFwdArgs) -> Tuple[Any,
             columnwise=(is_grad_enabled and weight_requires_grad and not save_original_input),
         )
         input_quantizer.optimize_for_gemm = True
-        grouped_x = tex.group_quantize(
+        # Uses NVFP4 amaxes precomputed by the input's producer, if any (nvfp4_group_amax).
+        grouped_x = nvfp4_group_amax.group_quantize(
             x,
             input_quantizer,
             num_gemms,
@@ -1150,7 +1152,8 @@ def _grouped_linear_graph_safe_backward(
                 tensor_offsets=output_tensor_offsets,
             )
         else:
-            grouped_dy = tex.group_quantize(
+            # Uses NVFP4 amaxes precomputed by the gradient's producer, if any (nvfp4_group_amax).
+            grouped_dy = nvfp4_group_amax.group_quantize(
                 dy_2d,
                 grad_output_quantizer,
                 N,
