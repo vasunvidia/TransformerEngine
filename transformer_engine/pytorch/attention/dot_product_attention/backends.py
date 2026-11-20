@@ -85,6 +85,7 @@ from transformer_engine.pytorch.cpu_offload_v1 import is_current_layer_offloaded
 
 # Import attention utils
 import transformer_engine.pytorch.attention.dot_product_attention.utils as dpa_utils
+from transformer_engine.pytorch.attention.dot_product_attention import cutedsl_attn_bwd
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils as fa_utils,
     combine_and_quantize,
@@ -2160,6 +2161,16 @@ def _fused_attn_setup_ctx(
     )
 
 
+def _fused_attn_bwd_fp8(*args):
+    """``fused_attn_bwd`` for the FP8 path: the opt-in CuTe DSL kernel (NVTE_CUTEDSL_FUSED_ATTN_BWD=1) when it serves the call.
+
+    ``fused_attn_bwd`` is resolved at call time, so rebinding it on this module still takes effect."""
+    out = cutedsl_attn_bwd.try_fused_attn_bwd(*args)
+    if out is not None:
+        return out
+    return fused_attn_bwd(*args)
+
+
 def _fused_attn_backward_impl(
     args: FusedAttnBwdArgs,
 ) -> Tuple[Optional[torch.Tensor], ...]:
@@ -2285,7 +2296,7 @@ def _fused_attn_backward_impl(
                 if args.qkv_type == "mxfp8":
                     out_ = out
                     aux_ctx_tensors.append(d_out)
-                dq_, dk_, dv_, *rest = fused_attn_bwd(
+                dq_, dk_, dv_, *rest = _fused_attn_bwd_fp8(
                     args.max_seqlen_q,
                     args.max_seqlen_kv,
                     cu_seqlens_q,
