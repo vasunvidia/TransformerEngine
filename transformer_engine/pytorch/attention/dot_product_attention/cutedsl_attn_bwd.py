@@ -14,6 +14,7 @@ compiled before CUDA graph capture (a warm-up iteration does that).
 """
 
 import os
+import sys
 import warnings
 from typing import Optional
 
@@ -21,7 +22,7 @@ import torch
 
 _ENV = "NVTE_CUTEDSL_FUSED_ATTN_BWD"
 _E4M3, _E5M2 = 7, 8  # tex.DType codes
-_STATE = {"fn": None, "failed": False, "routed": 0}
+_STATE = {"fn": None, "failed": False, "routed": 0, "logged": False}
 
 
 def enabled() -> bool:
@@ -116,4 +117,13 @@ def try_fused_attn_bwd(max_seqlen_q, max_seqlen_kv, cu_seqlens_q, cu_seqlens_kv,
     if getattr(dp_quantizer, "amax", None) is not None:
         dp_quantizer.amax.view(-1)[0:1].copy_(amax_dp.view(-1)[0:1])
     _STATE["routed"] += 1
+    if not _STATE["logged"]:
+        # One line per process (rank 0 only): the switch is on and the kernel serves this call.
+        _STATE["logged"] = True
+        if int(os.getenv("RANK", os.getenv("SLURM_PROCID", "0"))) == 0:
+            sys.__stdout__.write(
+                f"NVTE_CUTEDSL_FUSED_ATTN_BWD: CuTe DSL FP8 attention backward in use (q {tuple(q.shape)}, kv "
+                f"{tuple(k.shape)}, window {tuple(window_size)}, softmax {softmax_type})\n"
+            )
+            sys.__stdout__.flush()
     return dq, dk, dv, torch.empty(0, device=q.device), d_softmax_offset
