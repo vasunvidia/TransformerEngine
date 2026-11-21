@@ -2018,6 +2018,41 @@ void split_quantize_nvfp4_impl_with_rht_helper(const TensorWrapper &input,
   }
 }
 
+// Whether the grouped 2D NVFP4 kernel (nvte_group_nvfp4_quantize_with_amax with 2D scaling) can
+// quantize these splits: BF16 input, round-to-nearest, compact scales, every split a multiple of
+// 64 rows (the grouped amax kernel's requirement) and the same usages on every output.
+bool split_quantize_nvfp4_2d_grouped_supported(const TensorWrapper &input,
+                                               const std::vector<TensorWrapper> &output_list,
+                                               const std::vector<size_t> &split_sections,
+                                               const NVFP4Quantizer &quantizer) {
+  if (input.dtype() != DType::kBFloat16 || quantizer.stochastic_rounding ||
+      quantizer.with_rht || quantizer.row_scaled_nvfp4 ||
+      quantizer.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled || quantizer.with_amax_reduction ||
+      quantizer.disable_second_level_scale) {
+    return false;
+  }
+  const auto input_shape = input.shape();
+  if (input_shape.ndim == 0 || input_shape.data[input_shape.ndim - 1] % 128 != 0) {
+    return false;
+  }
+  for (size_t i = 0; i < output_list.size(); ++i) {
+    if (split_sections[i] % 64 != 0) {
+      return false;
+    }
+    if (split_sections[i] == 0) {
+      continue;
+    }
+    if (output_list[i].get_with_gemm_swizzled_scales()) {
+      return false;
+    }
+    if ((output_list[i].get_rowwise_data().data_ptr == nullptr) != !quantizer.rowwise_usage ||
+        (output_list[i].get_columnwise_data().data_ptr == nullptr) != !quantizer.columnwise_usage) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void split_quantize_nvfp4_impl_helper(const TensorWrapper &input,
                                       const std::vector<TensorWrapper> &input_list,
                                       std::vector<TensorWrapper> &output_list,
@@ -2063,6 +2098,7 @@ void split_quantize_nvfp4_impl_helper(const TensorWrapper &input,
 
   for (auto &config : quant_config_list) {
     config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
+    config.set_nvfp4_2d_quantization(quantizer.with_2d_quantization);
   }
 
   // NVFP4 4over6 candidate error math is controlled separately by
@@ -2103,6 +2139,17 @@ void split_quantize_nvfp4_impl_helper(const TensorWrapper &input,
     for (size_t i = 0; i < num_tensors; i++) {
       output_list[i].set_amax(orig_amax_ptr_list[i], DType::kFloat32, std::vector<size_t>{1});
     }
+  }
+
+  // 2D (16x16 block) scaling: the row-wise and transposed outputs of all tensors in one launch
+  // (split_quantize_nvfp4_2d_grouped_supported). The amax of every tensor is computed above.
+  if (quantizer.with_2d_quantization && split_quantize_nvfp4_2d_grouped_supported(
+                                            input, output_list, split_sections, quantizer)) {
+    nvte_group_nvfp4_quantize_with_amax(input.data(),
+                                        reinterpret_cast<NVTETensor *>(nvte_tensor_output_list.data()),
+                                        split_sections.data(), num_tensors, quant_config_list[0],
+                                        stream);
+    return;
   }
 
   // Quantize tensors individually
@@ -2150,8 +2197,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 
   // Assume all quantizers have identical config
   const auto &quantizer = *quantizers.front();
-  NVTE_CHECK(!quantizer.with_2d_quantization,
-             "NVFP4 split-quantize does not support 2D quantization");
+  NVTE_CHECK(!(quantizer.with_2d_quantization && quantizer.with_rht),
+             "NVFP4 split-quantize does not support 2D quantization with RHT");
   NVTE_CHECK(!quantizer.with_amax_reduction,
              "NVFP4 split-quantize does not support amax reduction");
   if (quantizer.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled) {
@@ -2205,7 +2252,8 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
 std::vector<py::object> split_quantize(const at::Tensor &tensor,
                                        const std::vector<size_t> &split_sections,
                                        std::vector<py::handle> quantizer_list,
-                                       bool disable_bulk_allocation) {
+                                       bool disable_bulk_allocation,
+                                       std::optional<std::vector<py::object>> output_list) {
   init_extension();
 
   // Check number of tensors
@@ -2287,6 +2335,29 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
     }
   }
 
+  // Quantize into the caller's tensors instead of allocating new ones: the grouped 2D NVFP4 kernel
+  // takes one pointer set per output, so the tensors need no common allocation. Other methods
+  // quantize every output on its own.
+  if (output_list.has_value()) {
+    NVTE_CHECK(output_list->size() == num_splits, "Expected ", num_splits, " output tensors, but got ",
+               output_list->size());
+    allocation_method = AllocationMethod::UNFUSED;
+    quantization_method = QuantizationMethod::UNFUSED;
+    const bool all_nvfp4_2d =
+        std::all_of(quantizer_list.begin(), quantizer_list.end(),
+                    [](const py::handle &quantizer) -> bool {
+                      return detail::IsNVFP4Quantizers(quantizer.ptr());
+                    }) &&
+        std::all_of(quantizer_cpp_list.begin(), quantizer_cpp_list.end(),
+                    [](const std::unique_ptr<Quantizer> &quantizer) {
+                      const auto *q = static_cast<NVFP4Quantizer *>(quantizer.get());
+                      return q->with_2d_quantization && !q->with_rht && !q->row_scaled_nvfp4;
+                    });
+    if (all_nvfp4_2d && !input_shape.empty() && input_shape.back() % 128 == 0) {
+      quantization_method = QuantizationMethod::FUSED_NVFP4;
+    }
+  }
+
   // Allocate output tensors
   std::vector<TensorWrapper> output_cpp_list;
   std::vector<py::object> output_py_list;
@@ -2338,10 +2409,12 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
       break;
     }
     default: {
-      // Allocate output tensors individually
+      // Allocate output tensors individually (or take the caller's)
       for (size_t i = 0; i < num_splits; ++i) {
         auto [output_cpp, output_py] =
-            quantizer_cpp_list[i]->create_tensor(split_shapes[i], input_dtype);
+            output_list.has_value()
+                ? quantizer_cpp_list[i]->convert_and_update_tensor((*output_list)[i])
+                : quantizer_cpp_list[i]->create_tensor(split_shapes[i], input_dtype);
         output_cpp_list.emplace_back(std::move(output_cpp));
         output_py_list.emplace_back(std::move(output_py));
       }

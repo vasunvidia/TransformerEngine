@@ -27,6 +27,7 @@
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/group_scaled_swiglu_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
+#include "../nvfp4/group_quantize_2d_nvfp4.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
@@ -487,10 +488,17 @@ void group_quantize_fwd_host_aware_helper(const NVTETensor input, NVTETensor *ou
               typeToMax(scale_dtype), ", found ", output_tensor->get_nvfp4_scale_max(), ").");
         }
       }
-      NVTE_CHECK(!quant_config_cpp.nvfp4_2d_quantization,
-                 "2D quantization is not supported for group quantize.");
       NVTE_CHECK(!nvfp4_use_4over6,
                  "NVFP4 4over6 quantization is not supported for group quantize.");
+
+      // 2D (16x16 block) scaling: one launch for the row-wise and transposed outputs of all tensors
+      if (quant_config_cpp.nvfp4_2d_quantization) {
+        NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                   "Stochastic rounding is not supported for 2D group quantize.");
+        nvfp4::group_quantize_2d(*input_tensor, noop_tensor, output_tensors, split_sections,
+                                 num_tensors, stream);
+        break;
+      }
 
       // Launch NVFP4 group quantize kernel
       nvfp4::group_quantize_transpose</*use_2d_quantization*/ false>(

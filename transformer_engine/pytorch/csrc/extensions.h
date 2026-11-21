@@ -454,10 +454,10 @@ py::object group_requantize_inplace(py::handle grouped_x, py::handle quantizer,
 std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &tensor_list,
                                               std::vector<py::handle> quantizer_list);
 
-std::vector<py::object> split_quantize(const at::Tensor &tensor,
-                                       const std::vector<size_t> &split_sections,
-                                       std::vector<py::handle> quantizer_list,
-                                       bool disable_bulk_allocation = false);
+std::vector<py::object> split_quantize(
+    const at::Tensor &tensor, const std::vector<size_t> &split_sections,
+    std::vector<py::handle> quantizer_list, bool disable_bulk_allocation = false,
+    std::optional<std::vector<py::object>> output_list = std::nullopt);
 
 /***************************************************************************************************
  * Bias gradient fusions
