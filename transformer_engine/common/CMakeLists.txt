@@ -369,6 +369,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      hadamard_transform/group_hadamard_transform.cu
      hadamard_transform/graph_safe_group_hadamard_transform.cu
      hadamard_transform/hadamard_transform.cu
+     hadamard_transform/dswiglu_hadamard_transform_amax.cu
      hadamard_transform/hadamard_transform_cast_fusion.cu
      hadamard_transform/row_cast_col_hadamard_transform_cast_fusion.cu
      hadamard_transform/group_hadamard_transform_cast_fusion.cu
@@ -799,6 +800,12 @@ if (NVTE_BUILD_ACTIVATION_WITH_FAST_MATH)
                                           activation/swiglu_grouped.cu
                                           activation/swiglu_grouped_bwd.cu
                                           activation/swiglu_grouped_dbias.cu)
+  # Its SwiGLU backward mirrors the fast-math activation kernels and is used only with them
+  set_property(
+    SOURCE hadamard_transform/dswiglu_hadamard_transform_amax.cu
+    APPEND
+    PROPERTY
+    COMPILE_DEFINITIONS NVTE_ACTIVATION_WITH_FAST_MATH)
 endif()
 
 foreach(cuda_source IN LISTS nvte_sources_with_fast_math)

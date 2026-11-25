@@ -5,6 +5,7 @@
  ************************************************************************/
 #include "../extensions.h"
 #include "common.h"
+#include "common/util/system.h"
 #include "pybind.h"
 
 namespace transformer_engine {
@@ -332,7 +333,63 @@ py::object swiglu(const at::Tensor& input, py::handle quantizer) {
 }
 
 py::object dswiglu(const at::Tensor& grad, const at::Tensor& input, py::handle quantizer) {
+  init_extension();
+  if (transformer_engine::getenv<bool>("NVTE_NVFP4_FUSE_DSWIGLU_RHT_AMAX") &&
+      detail::IsNVFP4Quantizers(quantizer.ptr()) && input.scalar_type() == at::kBFloat16 &&
+      input.numel() > 0) {
+    auto quantizer_cpp = convert_quantizer(quantizer);
+    auto* nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer*>(quantizer_cpp.get());
+    if (nvfp4_quantizer_cpp->with_rht && nvfp4_quantizer_cpp->with_post_rht_amax &&
+        !nvfp4_quantizer_cpp->disable_second_level_scale) {
+      // Compute the SwiGLU backward and the amaxes of NVFP4 quantization with RHT in one pass,
+      // then quantize with these amaxes
+      auto grad_output_tensor = grad.contiguous();
+      auto input_tensor = input.contiguous();
+      const TensorWrapper& grad_output_nvte = makeTransformerEngineTensor(grad_output_tensor);
+      const TensorWrapper& input_nvte = makeTransformerEngineTensor(input_tensor);
+      const auto input_shape = getTensorShape(input_tensor);
+      const auto fake_dtype = GetTransformerEngineDType(input_tensor.scalar_type());
+      auto [grad_input_nvte, grad_input_py] =
+          nvfp4_quantizer_cpp->create_tensor(input_shape, fake_dtype);
+      auto [temp_nvte, _] = NoneQuantizer(py::none()).create_tensor(input_shape, fake_dtype);
+      auto stream = at::cuda::getCurrentCUDAStream();
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_dswiglu_hadamard_transform_amax(
+            grad_output_nvte.data(), input_nvte.data(), temp_nvte.data(), grad_input_nvte.data(), 0,
+            nvfp4_quantizer_cpp->rht_matrix_random_sign_mask_t, stream);
+      });
+      nvfp4_quantizer_cpp->quantize_impl(temp_nvte, grad_input_nvte, std::nullopt,
+                                         /*compute_amax=*/false);
+      return grad_input_py;
+    }
+  }
   return dactivation_helper<nvte_dswiglu, nullptr>(grad, input, quantizer);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> dswiglu_hadamard_transform_amax(
+    const at::Tensor& grad, const at::Tensor& input, int random_sign_mask_t) {
+  init_extension();
+  auto grad_output_tensor = grad.contiguous();
+  auto input_tensor = input.contiguous();
+  const TensorWrapper& grad_output_nvte = makeTransformerEngineTensor(grad_output_tensor);
+  const TensorWrapper& input_nvte = makeTransformerEngineTensor(input_tensor);
+
+  auto grad_input = at::empty_like(input_tensor);
+  const TensorWrapper& grad_input_nvte = makeTransformerEngineTensor(grad_input);
+  const auto amax_opts = at::TensorOptions().dtype(at::kFloat).device(input_tensor.device());
+  auto pre_rht_amax = at::empty({1}, amax_opts);
+  auto post_rht_amax = at::empty({1}, amax_opts);
+  TensorWrapper amax_nvte;
+  amax_nvte.set_amax(pre_rht_amax.data_ptr(), DType::kFloat32, std::vector<size_t>{1});
+  amax_nvte.set_columnwise_amax(post_rht_amax.data_ptr(), DType::kFloat32, std::vector<size_t>{1});
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_dswiglu_hadamard_transform_amax(grad_output_nvte.data(), input_nvte.data(),
+                                         grad_input_nvte.data(), amax_nvte.data(), 0,
+                                         random_sign_mask_t, stream);
+  });
+  return {grad_input, pre_rht_amax, post_rht_amax};
 }
 
 py::object situglu(const at::Tensor& input, py::handle quantizer, float beta1, float beta2) {

@@ -395,6 +395,12 @@ Kernel Configuration
    :Default: ``0``
    :Description: Use the faster NVFP4 4over6 candidate error path that compares candidates in the E4M3-scaled domain after the E2M1 x E4M3 product is rounded to FP16. Error differences and accumulation remain FP32. By default, 4over6 error comparison uses the original input-domain path; ``NVTE_USE_FAST_MATH`` does not control this error-comparison path.
 
+.. envvar:: NVTE_NVFP4_FUSE_DSWIGLU_RHT_AMAX
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: When the SwiGLU backward quantizes its output to NVFP4 with random Hadamard transform and post-RHT amax, compute the SwiGLU backward and both amaxes of that quantization in one kernel, then cast with these amaxes. Results are bitwise identical to the unfused path. The fused kernel is compiled only when Transformer Engine is built with ``NVTE_BUILD_ACTIVATION_WITH_FAST_MATH=1`` (a build option that is off by default), and runs only on compute capability 10.0 or newer for BF16 tensors whose dimensions are multiples of 64. Otherwise the unfused path runs, with the same results and no speedup.
+
 Torch Compilation and Fusion
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

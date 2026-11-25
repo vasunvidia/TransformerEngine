@@ -46,6 +46,30 @@ void nvte_hadamard_transform(const NVTETensor input, NVTETensor output, int rand
 void nvte_hadamard_transform_amax(const NVTETensor input, NVTETensor output, int random_sign_mask,
                                   int random_sign_mask_t, cudaStream_t stream);
 
+/*! \brief Compute the SwiGLU backward and the RHT amaxes of its result in one pass.
+ *  This function is experimental and the API is not stable.
+ *  Equivalent to nvte_dswiglu(grad, input, output) followed by
+ *  nvte_hadamard_transform_amax(output, amax_output), bitwise. This is the amax
+ *  pass of NVFP4 quantization with RHT applied to the SwiGLU backward output. A
+ *  fused kernel is used when it reproduces the unfused results exactly (BF16
+ *  tensors, both dimensions of grad multiples of 64, activation kernels built
+ *  with NVTE_BUILD_ACTIVATION_WITH_FAST_MATH, compute capability 10.0 or newer);
+ *  otherwise the two functions run in sequence.
+ *  \param[in]      grad               Incoming gradient of shape [N, H].
+ *  \param[in]      input              Forward input of shape [N, H * 2].
+ *  \param[in,out]  output             SwiGLU backward output of shape [N, H * 2].
+ *  \param[in,out]  amax_output        Tensor whose row-wise amax receives the amax of
+ *                                     output and whose column-wise amax receives the
+ *                                     amax of the RHT of the transposed output.
+ *  \param[in]      random_sign_mask   16-bit sign mask.
+ *  \param[in]      random_sign_mask_t 16-bit sign mask.
+ *  \param[in]      stream             CUDA stream used for the operation.
+ */
+void nvte_dswiglu_hadamard_transform_amax(const NVTETensor grad, const NVTETensor input,
+                                          NVTETensor output, NVTETensor amax_output,
+                                          int random_sign_mask, int random_sign_mask_t,
+                                          cudaStream_t stream);
+
 /*! \brief Perform the columnwise hadamard transform cast fusion.
  *
  *  \deprecated This function has been deprecated in favor of nvte_quantize_with_hadamard_transform.

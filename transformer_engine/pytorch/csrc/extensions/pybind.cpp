@@ -321,6 +321,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("fwd_input"), py::arg("quantizer"));
   m.def("dswiglu", transformer_engine::pytorch::dswiglu, "Backward of SwiGLU", py::arg("grad"),
         py::arg("fwd_input"), py::arg("quantizer"));
+  m.def("dswiglu_hadamard_transform_amax",
+        transformer_engine::pytorch::dswiglu_hadamard_transform_amax,
+        "Backward of SwiGLU and the (pre-RHT, post-RHT) NVFP4 amaxes of its result",
+        py::arg("grad"), py::arg("fwd_input"), py::arg("random_sign_mask_t"));
   m.def("dsituglu", transformer_engine::pytorch::dsituglu, "Backward of SiTU-GLU", py::arg("grad"),
         py::arg("fwd_input"), py::arg("quantizer"), py::arg("beta1") = 4.0f,
         py::arg("beta2") = 25.0f);

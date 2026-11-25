@@ -301,6 +301,14 @@ py::object swiglu(const at::Tensor &input, py::handle quantizer);
 
 py::object dswiglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
+/*! @brief SwiGLU backward and the amaxes of NVFP4 quantization with RHT of its result
+ *
+ *  Returns (grad_input, pre-RHT amax, post-RHT amax), the amaxes as nvte_hadamard_transform_amax
+ *  computes them for the RHT recipe. Lets a caller cast grad_input with precomputed amaxes.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> dswiglu_hadamard_transform_amax(
+    const at::Tensor &grad, const at::Tensor &input, int random_sign_mask_t);
+
 py::object situglu(const at::Tensor &input, py::handle quantizer, float beta1, float beta2);
 
 py::object dsituglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer,

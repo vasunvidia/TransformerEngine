@@ -9,6 +9,7 @@
 # Due to the structure of NVFP4Quantizer, we need to test the RHT functionality
 # together with the quantization functionality.
 
+import functools
 import os
 
 import transformer_engine.pytorch as te
@@ -303,3 +304,271 @@ def test_nvfp4_quantization_noncontiguous_inputs(
         use_cpp_allocator=use_cpp_allocator,
         with_random_sign_mask=with_random_sign_mask,
     )
+
+
+def _bits(x: torch.Tensor) -> torch.Tensor:
+    """Bit pattern of a tensor, for bitwise comparisons that also cover NaN."""
+    return x.view({2: torch.int16, 4: torch.int32}.get(x.element_size(), torch.uint8))
+
+
+def _assert_bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> None:
+    assert a.shape == b.shape
+    assert torch.equal(_bits(a), _bits(b))
+
+
+def _make_swiglu_backward_inputs(M: int, N: int, kind: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """SwiGLU forward input [M, 2N] and incoming gradient [M, N]."""
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(M + N)
+
+    def random_bits(*shape):
+        return (
+            torch.randint(-(2**15), 2**15, shape, device="cuda", generator=gen, dtype=torch.int32)
+            .to(torch.int16)
+            .view(torch.bfloat16)
+        )
+
+    if kind == "normal":
+        x = torch.randn(M, 2 * N, device="cuda", generator=gen) * 1.5
+        dy = torch.randn(M, N, device="cuda", generator=gen) * 3e-6
+    elif kind == "wide_range":
+        x = torch.randn(M, 2 * N, device="cuda", generator=gen) * torch.exp2(
+            torch.randint(-20, 8, (M, 2 * N), device="cuda", generator=gen).float()
+        )
+        dy = torch.randn(M, N, device="cuda", generator=gen) * torch.exp2(
+            torch.randint(-40, 0, (M, N), device="cuda", generator=gen).float()
+        )
+    elif kind in ("all_gate_values", "all_gate_values_random_bits"):
+        # Every BF16 bit pattern appears in the gate half
+        gate = torch.arange(M * N, device="cuda") % 2**16
+        gate = gate[torch.randperm(M * N, device="cuda", generator=gen)]
+        gate = gate.to(torch.int32).to(torch.int16).view(torch.bfloat16).view(M, N)
+        if kind == "all_gate_values":
+            linear = torch.randn(M, N, device="cuda", generator=gen) * 2
+            dy = torch.randn(M, N, device="cuda", generator=gen) * 1e-5
+        else:
+            linear = random_bits(M, N)
+            dy = random_bits(M, N)
+        x = torch.cat([gate, linear.to(torch.bfloat16)], dim=1)
+    else:
+        raise ValueError(f"Invalid input kind: {kind}")
+    return x.to(torch.bfloat16).contiguous(), dy.to(torch.bfloat16).contiguous()
+
+
+def _make_rht_quantizer(stochastic_rounding: bool, swizzled_scale: bool) -> NVFP4Quantizer:
+    quantizer = NVFP4Quantizer(
+        fp4_dtype=tex.DType.kFloat4E2M1,
+        rowwise=True,
+        columnwise=True,
+        with_rht=True,
+        with_post_rht_amax=True,
+        stochastic_rounding=stochastic_rounding,
+    )
+    quantizer.optimize_for_gemm = swizzled_scale
+    return quantizer
+
+
+# Kernel of nvte_dswiglu_hadamard_transform_amax, and the RHT amax kernel of its unfused path
+_FUSED_DSWIGLU_RHT_AMAX_KERNEL = "dswiglu_hadamard_transform_amax_kernel"
+_UNFUSED_RHT_AMAX_KERNEL = "HadamardAmaxTmaKernel"
+
+
+def _run_and_list_cuda_kernels(fn):
+    """Run fn under the PyTorch profiler; return its result and the CUDA kernels it launched."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        result = fn()
+        torch.cuda.synchronize()
+    names = [evt.name for evt in prof.events() if evt.device_type == torch.autograd.DeviceType.CUDA]
+    assert names, "The profiler recorded no CUDA kernels"
+    return result, names
+
+
+def _ran(kernel: str, kernel_names: list[str]) -> bool:
+    return any(kernel in name for name in kernel_names)
+
+
+@functools.lru_cache(maxsize=None)
+def _fused_dswiglu_rht_amax_built() -> bool:
+    """Whether this build compiles the fused dSwiGLU + RHT amax kernel.
+
+    The kernel is compiled only with NVTE_BUILD_ACTIVATION_WITH_FAST_MATH=1, a build option that
+    is off by default. When that variable is set while the tests run, it states the build mode
+    and the tests require the matching kernel. Otherwise the build mode is inferred from the
+    kernel that a supported shape runs.
+    """
+    build_flag = os.getenv("NVTE_BUILD_ACTIVATION_WITH_FAST_MATH")
+    if build_flag is not None:
+        return bool(int(build_flag))
+    x, dy = _make_swiglu_backward_inputs(64, 64, "normal")
+    _, kernel_names = _run_and_list_cuda_kernels(
+        lambda: tex.dswiglu_hadamard_transform_amax(dy, x, 0)
+    )
+    return _ran(_FUSED_DSWIGLU_RHT_AMAX_KERNEL, kernel_names)
+
+
+def _fused_dswiglu_rht_amax_supported(M: int, N: int) -> bool:
+    """Whether the fused kernel handles a [M, 2N] SwiGLU input on this device, in any build."""
+    return M % 64 == 0 and N % 64 == 0 and torch.cuda.get_device_capability() >= (10, 0)
+
+
+def _expect_fused_dswiglu_rht_amax(M: int, N: int) -> bool:
+    return _fused_dswiglu_rht_amax_supported(M, N) and _fused_dswiglu_rht_amax_built()
+
+
+def _assert_dswiglu_rht_amax_kernels(kernel_names: list[str], M: int, N: int) -> None:
+    """The fused kernel ran when this build and device support the shape, the unfused one if not."""
+    fused_ran = _ran(_FUSED_DSWIGLU_RHT_AMAX_KERNEL, kernel_names)
+    unfused_ran = _ran(_UNFUSED_RHT_AMAX_KERNEL, kernel_names)
+    if _expect_fused_dswiglu_rht_amax(M, N):
+        assert fused_ran and not unfused_ran, f"Expected the fused kernel, ran {kernel_names}"
+    else:
+        assert unfused_ran and not fused_ran, f"Expected the unfused path, ran {kernel_names}"
+
+
+def _skip_if_fused_dswiglu_rht_amax_not_built(M: int, N: int) -> None:
+    """Report a case meant for the fused kernel as skipped when only the fallback could run."""
+    if _fused_dswiglu_rht_amax_supported(M, N) and not _fused_dswiglu_rht_amax_built():
+        pytest.skip(
+            "Fused dSwiGLU + RHT amax kernel not built: Transformer Engine was built without"
+            " NVTE_BUILD_ACTIVATION_WITH_FAST_MATH=1, so only the unfused fallback was checked"
+        )
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize(
+    "M, N",
+    [
+        # Llama 3.1 8B FC1 (16384 tokens, FFN hidden size 14336)
+        (16384, 14336),
+        # Fused kernel: multiples of 64
+        (64, 64),
+        (128, 192),
+        (192, 320),
+        (4096, 2048),
+        # Unfused fallback
+        (48, 64),
+        (128, 80),
+    ],
+)
+@pytest.mark.parametrize(
+    "kind", ["normal", "wide_range", "all_gate_values", "all_gate_values_random_bits"]
+)
+def test_dswiglu_hadamard_transform_amax(M: int, N: int, kind: str) -> None:
+    """Fused SwiGLU backward + RHT amaxes equals dswiglu followed by the quantizer's amaxes."""
+    if kind.startswith("all_gate_values") and M * N < 2**16:
+        pytest.skip("Too few elements for every gate value")
+    x, dy = _make_swiglu_backward_inputs(M, N, kind)
+    quantizer = _make_rht_quantizer(stochastic_rounding=False, swizzled_scale=False)
+
+    (dx, pre_rht_amax, post_rht_amax), kernel_names = _run_and_list_cuda_kernels(
+        lambda: tex.dswiglu_hadamard_transform_amax(dy, x, quantizer.rht_matrix_random_sign_mask_t)
+    )
+    _assert_dswiglu_rht_amax_kernels(kernel_names, M, N)
+    dx_ref = tex.dswiglu(dy, x, None)
+    _assert_bitwise_equal(dx, dx_ref)
+
+    if kind != "all_gate_values_random_bits":
+        # With NaN and Inf everywhere only the SwiGLU backward is compared
+        dx_ref_nvfp4 = quantizer(dx_ref)
+        _assert_bitwise_equal(pre_rht_amax, dx_ref_nvfp4._amax_rowwise)
+        _assert_bitwise_equal(post_rht_amax, dx_ref_nvfp4._amax_columnwise)
+    _skip_if_fused_dswiglu_rht_amax_not_built(M, N)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("M, N", [(16384, 14336), (256, 128), (384, 256), (1024, 384), (48, 64)])
+@pytest.mark.parametrize("kind", ["normal", "wide_range"])
+@pytest.mark.parametrize("stochastic_rounding", [False, True], ids=["rn", "sr"])
+@pytest.mark.parametrize("swizzled_scale", [False, True], ids=["compact", "swizzled"])
+def test_dswiglu_nvfp4_rht_fused_amax(
+    M: int,
+    N: int,
+    kind: str,
+    stochastic_rounding: bool,
+    swizzled_scale: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NVTE_NVFP4_FUSE_DSWIGLU_RHT_AMAX=1 leaves the NVFP4 SwiGLU backward bitwise unchanged."""
+    x, dy = _make_swiglu_backward_inputs(M, N, kind)
+    quantizer = _make_rht_quantizer(stochastic_rounding, swizzled_scale)
+
+    def swiglu_backward(fused: bool):
+        monkeypatch.setenv("NVTE_NVFP4_FUSE_DSWIGLU_RHT_AMAX", "1" if fused else "0")
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed(1234)
+        out, kernel_names = _run_and_list_cuda_kernels(lambda: tex.dswiglu(dy, x, quantizer))
+        rng_state = torch.cuda.get_rng_state()
+        return out, rng_state, kernel_names
+
+    ref, ref_rng_state, ref_kernel_names = swiglu_backward(fused=False)
+    out, out_rng_state, out_kernel_names = swiglu_backward(fused=True)
+    assert not _ran(_FUSED_DSWIGLU_RHT_AMAX_KERNEL, ref_kernel_names)
+    _assert_dswiglu_rht_amax_kernels(out_kernel_names, M, N)
+    assert torch.equal(out_rng_state, ref_rng_state)
+    assert out._with_gemm_swizzled_scales == ref._with_gemm_swizzled_scales
+    for name in ("_rowwise_data", "_columnwise_data", "_amax_rowwise", "_amax_columnwise"):
+        _assert_bitwise_equal(getattr(out, name), getattr(ref, name))
+    if swizzled_scale:
+        _assert_bitwise_equal(out._rowwise_scale_inv, ref._rowwise_scale_inv)
+        _assert_bitwise_equal(out._columnwise_scale_inv, ref._columnwise_scale_inv)
+    else:
+        # Compact scales are padded and the padding is not written
+        _assert_bitwise_equal(
+            out._rowwise_scale_inv[:M, : 2 * N // 16], ref._rowwise_scale_inv[:M, : 2 * N // 16]
+        )
+        _assert_bitwise_equal(
+            out._columnwise_scale_inv[: 2 * N, : (M + 15) // 16],
+            ref._columnwise_scale_inv[: 2 * N, : (M + 15) // 16],
+        )
+    _skip_if_fused_dswiglu_rht_amax_not_built(M, N)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+def test_swiglu_op_nvfp4_rht_fused_amax(monkeypatch: pytest.MonkeyPatch) -> None:
+    """te.ops MLP with the NVFP4 recipe: identical gradients with and without the fused amax."""
+    from transformer_engine.pytorch.ops.basic import swiglu as swiglu_op
+
+    tokens, hidden, ffn_hidden = 256, 256, 512
+    torch.manual_seed(0)
+    model = te.ops.Sequential(
+        te.ops.BasicLinear(hidden, 2 * ffn_hidden, device="cuda", dtype=torch.bfloat16),
+        te.ops.SwiGLU(),
+        te.ops.BasicLinear(ffn_hidden, hidden, device="cuda", dtype=torch.bfloat16),
+    )
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+
+    dswiglu_quantizers = []
+    dswiglu = tex.dswiglu
+
+    def recording_dswiglu(grad, fwd_input, quantizer):
+        dswiglu_quantizers.append(quantizer)
+        return dswiglu(grad, fwd_input, quantizer)
+
+    monkeypatch.setattr(swiglu_op.tex, "dswiglu", recording_dswiglu)
+
+    def grads(fused: bool):
+        monkeypatch.setenv("NVTE_NVFP4_FUSE_DSWIGLU_RHT_AMAX", "1" if fused else "0")
+        torch.manual_seed(1)
+        torch.cuda.manual_seed(1)
+        x_ = x.detach().clone().requires_grad_()
+        for param in model.parameters():
+            param.grad = None
+        with te.autocast(enabled=True, recipe=NVFP4BlockScaling()):
+            y = model(x_)
+        _, kernel_names = _run_and_list_cuda_kernels(lambda: y.backward(dy))
+        return [x_.grad] + [param.grad for param in model.parameters()], kernel_names
+
+    ref, ref_kernel_names = grads(fused=False)
+    out, out_kernel_names = grads(fused=True)
+    assert not _ran(_FUSED_DSWIGLU_RHT_AMAX_KERNEL, ref_kernel_names)
+    assert _ran(_FUSED_DSWIGLU_RHT_AMAX_KERNEL, out_kernel_names) == _expect_fused_dswiglu_rht_amax(
+        tokens, ffn_hidden
+    )
+    assert any(
+        isinstance(q, NVFP4Quantizer) and q.with_rht and q.with_post_rht_amax
+        for q in dswiglu_quantizers
+    ), "SwiGLU backward did not quantize with an NVFP4 RHT quantizer"
+    for a, b in zip(out, ref):
+        _assert_bitwise_equal(a, b)
+    _skip_if_fused_dswiglu_rht_amax_not_built(tokens, ffn_hidden)
