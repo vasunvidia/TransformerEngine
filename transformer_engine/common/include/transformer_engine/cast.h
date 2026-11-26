@@ -126,6 +126,41 @@ void nvte_quantize_noop(const NVTETensor input, NVTETensor output, NVTETensor no
 void nvte_quantize_v2(const NVTETensor input, NVTETensor output,
                       const NVTEQuantizationConfig quant_config, cudaStream_t stream);
 
+/*! \brief Computes the per-tensor amax of a BF16 tensor and casts it to NVFP4 with 2D
+ *         (16x16) block scaling.
+ *
+ *  The result is bitwise identical to nvte_compute_amax_with_config followed by
+ *  nvte_quantize_v2 with 2D quantization: rowwise data, optional columnwise data, compact or
+ *  GEMM-swizzled scales, and the rowwise and (if allocated) columnwise amax. It uses two
+ *  persistent kernels and is faster for large tensors such as weights. Use
+ *  nvte_nvfp4_2d_amax_quantize_supported to check that an input/output combination is
+ *  supported.
+ *
+ *  Calling this function with the workspace being an empty tensor will not perform the
+ *  operation, but instead set the shape and type of the workspace tensor to the required values.
+ *
+ *  \param[in]     input            Input BF16 tensor to be cast.
+ *  \param[in,out] output           Output NVFP4 tensor.
+ *  \param[out]    workspace        Workspace tensor.
+ *  \param[in]     quant_config     Quantization configuration. Only the noop tensor is used;
+ *                                  stochastic rounding and 4over6 are not supported.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_nvfp4_2d_amax_quantize(const NVTETensor input, NVTETensor output, NVTETensor workspace,
+                                 const NVTEQuantizationConfig quant_config, cudaStream_t stream);
+
+/*! \brief Whether nvte_nvfp4_2d_amax_quantize supports the given input and output tensors.
+ *
+ *  Requires compute capability 10.x, a BF16 input whose flattened dimensions are multiples of
+ *  128, rowwise output data, E4M3 scales with the default scale bound, and a per-tensor amax.
+ *
+ *  \param[in]     input            Input tensor.
+ *  \param[in]     output           Output NVFP4 tensor.
+ *
+ *  \return 1 if supported, 0 otherwise.
+ */
+int nvte_nvfp4_2d_amax_quantize_supported(const NVTETensor input, const NVTETensor output);
+
 /*! \brief Casts input tensor to MXFP8. Additionally, reduces the input along columns.
  *         If the scaling mode of the output tensor is set to NVTE_MXFP8_1D_SCALING,
  *         the block quantization (MXFP8) of the specified shape of the block will be used.

@@ -364,6 +364,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      cast/cast_grouped.cu
      cast/cast_grouped_dbias.cu
      cast/mxfp8/requantize_mxfp8.cu
+     cast/nvfp4/amax_quantize_2d_nvfp4.cu
      fused_rope/fused_mla_kv_rope_mxfp8.cu
      gemm/cutlass_grouped_gemm.cu
      hadamard_transform/group_hadamard_transform.cu

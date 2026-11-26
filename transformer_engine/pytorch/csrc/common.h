@@ -433,6 +433,14 @@ class NVFP4Quantizer : public Quantizer {
                                                        std::optional<bool> disable_rht_cast_fusion);
 
  private:
+  /*! @brief Compute the amax and quantize in one call to nvte_nvfp4_2d_amax_quantize
+   *
+   * Used for 2D-quantized tensors (weights) when NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION=1
+   * and the quantizer and tensors are supported. Returns whether the tensor was quantized.
+   */
+  bool quantize_2d_with_fused_amax(const TensorWrapper& input, TensorWrapper& out,
+                                   const std::optional<TensorWrapper>& noop_flag);
+
   static ShapeAlignment rht_cast_fusion_alignment(int sm_arch,
                                                   std::optional<bool> disable_rht_cast_fusion,
                                                   bool for_grouped_kernel = false);

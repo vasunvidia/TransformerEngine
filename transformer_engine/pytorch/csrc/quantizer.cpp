@@ -2567,9 +2567,44 @@ void NVFP4Quantizer::quantize_with_rht_unfused_helper(
   }
 }
 
+bool NVFP4Quantizer::quantize_2d_with_fused_amax(const TensorWrapper& input, TensorWrapper& out,
+                                                 const std::optional<TensorWrapper>& noop_flag) {
+  if (!this->with_2d_quantization || this->with_rht || this->stochastic_rounding ||
+      this->with_amax_reduction || this->row_scaled_nvfp4 || this->disable_second_level_scale ||
+      this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled ||
+      this->scale_dtype != DType::kFloat8E4M3) {
+    return false;
+  }
+  if (!transformer_engine::getenv<bool>("NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION")) {
+    return false;
+  }
+  if (!nvte_nvfp4_2d_amax_quantize_supported(input.data(), out.data())) {
+    return false;
+  }
+  QuantizationConfigWrapper quant_config;
+  if (noop_flag) {
+    quant_config.set_noop_tensor(noop_flag->data());
+  }
+  quant_config.set_nvfp4_2d_quantization(true);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  // Query the workspace size, then run.
+  TensorWrapper workspace;
+  nvte_nvfp4_2d_amax_quantize(input.data(), out.data(), workspace.data(), quant_config, stream);
+  at::Tensor workspace_torch = allocateSpace(workspace.shape(), workspace.dtype());
+  workspace =
+      makeTransformerEngineTensor(workspace_torch.data_ptr(), workspace.shape(), workspace.dtype());
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_2d_amax_quantize(input.data(), out.data(), workspace.data(), quant_config, stream);
+  });
+  return true;
+}
+
 void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                                    const std::optional<TensorWrapper>& noop_flag,
                                    bool compute_amax) {
+  if (compute_amax && this->quantize_2d_with_fused_amax(input, out, noop_flag)) {
+    return;
+  }
   at::Tensor rowwise_scales, columnwise_scales;
   std::optional<TensorWrapper> compact_out;
   std::vector<TensorWrapper> scale_inputs;

@@ -401,6 +401,12 @@ Kernel Configuration
    :Default: ``0``
    :Description: When the SwiGLU backward quantizes its output to NVFP4 with random Hadamard transform and post-RHT amax, compute the SwiGLU backward and both amaxes of that quantization in one kernel, then cast with these amaxes. Results are bitwise identical to the unfused path. The fused kernel is compiled only when Transformer Engine is built with ``NVTE_BUILD_ACTIVATION_WITH_FAST_MATH=1`` (a build option that is off by default), and runs only on compute capability 10.0 or newer for BF16 tensors whose dimensions are multiples of 64. Otherwise the unfused path runs, with the same results and no speedup.
 
+.. envvar:: NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Use a faster path for NVFP4 2D (16x16 block) quantization, which the ``NVFP4BlockScaling`` recipe applies to weights. The per-tensor amax and the quantization (rowwise and columnwise data, scales and amax) are computed by two persistent kernels instead of separate amax, quantize and scale-swizzle kernels, with bitwise identical results. It applies to BF16 tensors whose flattened dimensions are multiples of 128, without amax reduction, on compute capability 10.x; other tensors use the default path. In addition, ``te.ops.BasicLinear`` (and the fused operations built on it) quantize NVFP4 weights with GEMM-swizzled scales, as ``te.Linear`` already does, so that the GEMMs do not swizzle them again.
+
 Torch Compilation and Fusion
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

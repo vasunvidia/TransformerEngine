@@ -9,6 +9,7 @@ from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 import math
+import os
 from typing import Any, Optional
 
 import torch
@@ -30,12 +31,14 @@ from ...module.base import (
 from ...module._common import set_quantizer_amax_reduction_group
 from ...tensor import Quantizer
 from ...tensor.float8_tensor import Float8Quantizer
+from ...tensor.nvfp4_tensor import NVFP4Quantizer
 from ...tensor.storage.float8_tensor_storage import Float8TensorStorage
 from ...utils import (
     canonicalize_device,
     canonicalize_dtype,
     clear_tensor_data,
     devices_match,
+    get_device_compute_capability,
 )
 from ..op import BasicOperation
 from .._common import (
@@ -478,6 +481,10 @@ class BasicLinear(BasicOperation):
                 or getattr(self, "_with_quantized_weight", False)
                 or is_quantized_tensor(weight)
             )
+            if weight_quantizer.internal and self._enable_nvfp4_weight_preswizzle(
+                weight_quantizer, weight
+            ):
+                weight_quantizer.optimize_for_gemm = True
 
         # Recipe-specific configuration
         # Note: This function may be called in base class constructor,
@@ -502,6 +509,31 @@ class BasicLinear(BasicOperation):
                     columnwise=weight._quantizer.columnwise_usage,
                 )
             weight.update_quantizer(weight_quantizer.copy())
+
+    @staticmethod
+    def _enable_nvfp4_weight_preswizzle(
+        quantizer: Quantizer, weight: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether NVFP4 weight quantization should emit GEMM-swizzled scales.
+
+        Enabled by NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION=1, under the same
+        conditions as the weight preswizzling of te.Linear: 2D quantization
+        without RHT, flattened dims that are multiples of 128, compute
+        capability 10.0 or newer. The scales are then swizzled once per weight
+        quantization instead of in every GEMM that consumes the weight.
+        """
+        if not int(os.getenv("NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION", "0")):
+            return False
+        if not isinstance(quantizer, NVFP4Quantizer):
+            return False
+        if weight is None or is_quantized_tensor(weight) or weight.dim() < 2:
+            return False
+        if not quantizer.with_2d_quantization or quantizer.with_rht:
+            return False
+        if quantizer.row_scaled_nvfp4 or quantizer.nvfp4_use_4over6:
+            return False
+        rows, cols = weight.numel() // weight.shape[-1], weight.shape[-1]
+        return rows % 128 == 0 and cols % 128 == 0 and get_device_compute_capability() >= (10, 0)
 
     @staticmethod
     def _functional_forward(
