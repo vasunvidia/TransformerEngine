@@ -290,6 +290,12 @@ FP8 Configuration
    :Default: ``1``
    :Description: For Float8CurrentScaling in DotProductAttention, use FP16/BF16 for the output tensor in the backward pass. ``1`` = use F16/BF16 output in backward, ``0`` = use FP8 output in backward.
 
+.. envvar:: NVTE_DPA_FP8_BWD_CUDNN_FE
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Run the FP8 backward of FusedAttention with cuDNN frontend's CuTe DSL kernels (``cudnn.sdpa.bwd.sdpa_fp8_backward``, SM107 only) instead of cuDNN's FP8 attention backward graph. Applies to Float8CurrentScaling with :envvar:`NVTE_DPA_FP8CS_O_in_F16` ``= 1``, BF16 gradients, causal mask, head dimension 128, SBHD or BSHD layout, equal query and key/value sequence lengths that are a multiple of 256, no dropout, bias, padding or sliding window, and non-deterministic mode (dQ is accumulated with unordered FP32 reductions); other calls use cuDNN's graph. The kernels use the same FP8 quantization points and scales as cuDNN's graph but are not bitwise equal to it. Requires a cuDNN frontend Python package that provides ``cudnn.sdpa.bwd.sdpa_fp8_backward``.
+
 .. envvar:: NVTE_DPA_FP8_RECIPE
 
    :Type: ``str``

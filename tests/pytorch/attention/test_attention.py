@@ -32,6 +32,7 @@ from transformer_engine.pytorch import (
 from transformer_engine.pytorch.attention.dot_product_attention import (
     _attention_backends,
 )
+from transformer_engine.pytorch.attention.dot_product_attention import backends as dpa_backends
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     AttentionParams,
     FlashAttentionUtils,
@@ -3597,6 +3598,116 @@ def _run_dpa_fp8_vs_f16(dtype, config, fp8_dpa, qkv_layout, is_training, fp8_rec
     if is_training:
         return out, (inp[0].grad, inp[1].grad, inp[2].grad, d_softmax_offset)
     return out, (None, None, None, d_softmax_offset)
+
+
+def _require_cudnn_fe_fp8_bwd():
+    """Skip unless NVTE_DPA_FP8_BWD_CUDNN_FE can serve a backward on this device."""
+    if get_device_compute_capability() != (10, 7):
+        pytest.skip("cuDNN frontend's FP8 attention backward kernels run on SM107 only")
+    try:
+        from cudnn.sdpa.bwd import sdpa_fp8_backward  # pylint: disable=unused-import
+    except (ImportError, AttributeError):
+        pytest.skip("cuDNN frontend without cudnn.sdpa.bwd.sdpa_fp8_backward")
+
+
+@pytest.fixture
+def cudnn_fe_fp8_bwd_dispatch(monkeypatch):
+    """Reselect FusedAttention; record per backward whether the cuDNN FE kernels served it."""
+    for key, value in {
+        "NVTE_FLASH_ATTN": "0",
+        "NVTE_FUSED_ATTN": "1",
+        "NVTE_UNFUSED_ATTN": "0",
+        "NVTE_FP8_DPA_BWD": "1",
+        "NVTE_UnfusedDPA_Emulate_FP8": "0",
+        "NVTE_DPA_FP8CS_O_in_F16": "1",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    for key, value in _attention_backends.items():
+        monkeypatch.setitem(_attention_backends, key, value)
+    _attention_backends["backend_selection_requires_update"] = True
+    served = []
+    helper = dpa_backends._cudnn_fe_fp8_bwd
+
+    def spy(*args, **kwargs):
+        out = helper(*args, **kwargs)
+        served.append(out is not None)
+        return out
+
+    monkeypatch.setattr(dpa_backends, "_cudnn_fe_fp8_bwd", spy)
+    return served
+
+
+def _run_dpa_fp8cs_grads(s, b, h, hg, d, mask, qkv_format="sbhd", steps=3):
+    """Q/K/V gradients of FP8 current-scaling DotProductAttention after ``steps`` iterations."""
+    _attention_backends["backend_selection_requires_update"] = True
+    dpa = DotProductAttention(h, d, num_gqa_groups=hg, attn_mask_type=mask, qkv_format=qkv_format)
+    fp8_recipe = recipe.Float8CurrentScaling(fp8_format=recipe.Format.HYBRID, fp8_dpa=True)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    shape = (s, b) if qkv_format == "sbhd" else (b, s)
+    q = torch.randn(*shape, h, d, device="cuda", generator=gen).bfloat16()
+    k = torch.randn(*shape, hg, d, device="cuda", generator=gen).bfloat16()
+    v = torch.randn(*shape, hg, d, device="cuda", generator=gen).bfloat16()
+    out_grad = (torch.randn(*shape, h * d, device="cuda", generator=gen) * 1e-3).bfloat16()
+    grads = None
+    for _ in range(steps):  # later steps quantize dS with the amax recorded by earlier ones
+        qq, kk, vv = [t.clone().requires_grad_() for t in (q, k, v)]
+        with autocast(enabled=True, recipe=fp8_recipe):
+            out = dpa(qq, kk, vv)
+        out.backward(out_grad)
+        grads = (qq.grad, kk.grad, vv.grad)
+    torch.cuda.synchronize()
+    return grads
+
+
+@pytest.mark.skipif(not fp8_attn_available, reason=reason_for_no_fp8_attn)
+@pytest.mark.parametrize(
+    "s,b,h,hg,qkv_format",
+    [
+        pytest.param(8192, 2, 32, 8, "sbhd", id="llama3_8b-sbhd"),
+        pytest.param(2048, 2, 16, 4, "sbhd", id="gqa-sbhd"),
+        pytest.param(1024, 2, 8, 8, "bshd", id="mha-bshd"),
+    ],
+)
+def test_dpa_fp8_bwd_cudnn_fe(monkeypatch, cudnn_fe_fp8_bwd_dispatch, s, b, h, hg, qkv_format):
+    """NVTE_DPA_FP8_BWD_CUDNN_FE=1 serves every supported backward, close to cuDNN's FP8 graph."""
+    _require_cudnn_fe_fp8_bwd()
+    monkeypatch.delenv("NVTE_DPA_FP8_BWD_CUDNN_FE", raising=False)
+    ref = _run_dpa_fp8cs_grads(s, b, h, hg, 128, "causal", qkv_format)
+    assert not cudnn_fe_fp8_bwd_dispatch
+    monkeypatch.setenv("NVTE_DPA_FP8_BWD_CUDNN_FE", "1")
+    test = _run_dpa_fp8cs_grads(s, b, h, hg, 128, "causal", qkv_format)
+    assert cudnn_fe_fp8_bwd_dispatch and all(cudnn_fe_fp8_bwd_dispatch)
+    for name, x, r in zip(("dq", "dk", "dv"), test, ref):
+        assert x.dtype == r.dtype and x.shape == r.shape and x.stride() == r.stride(), name
+        assert torch.isfinite(x).all(), name
+        rel_l2 = float((x.float() - r.float()).norm() / r.float().norm())
+        # Same FP8 quantization of P and dS; the FP32 accumulation order differs.
+        assert rel_l2 < 2e-2, f"{name}: relative L2 distance to cuDNN {rel_l2:.3e}"
+
+
+@pytest.mark.skipif(not fp8_attn_available, reason=reason_for_no_fp8_attn)
+@pytest.mark.parametrize(
+    "d,mask,deterministic",
+    [
+        pytest.param(128, "no_mask", False, id="no_mask"),
+        pytest.param(64, "causal", False, id="head_dim_64"),
+        pytest.param(128, "causal", True, id="deterministic"),
+    ],
+)
+def test_dpa_fp8_bwd_cudnn_fe_fallback(
+    monkeypatch, cudnn_fe_fp8_bwd_dispatch, d, mask, deterministic
+):
+    """Outside its configuration NVTE_DPA_FP8_BWD_CUDNN_FE=1 leaves the cuDNN graph in place."""
+    if deterministic:
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.delenv("NVTE_DPA_FP8_BWD_CUDNN_FE", raising=False)
+    ref = _run_dpa_fp8cs_grads(512, 2, 8, 2, d, mask, steps=1)
+    monkeypatch.setenv("NVTE_DPA_FP8_BWD_CUDNN_FE", "1")
+    test = _run_dpa_fp8cs_grads(512, 2, 8, 2, d, mask, steps=1)
+    assert cudnn_fe_fp8_bwd_dispatch and not any(cudnn_fe_fp8_bwd_dispatch)
+    for x, r in zip(test, ref):
+        torch.testing.assert_close(x, r, rtol=0, atol=0)
 
 
 model_configs_fp8 = {

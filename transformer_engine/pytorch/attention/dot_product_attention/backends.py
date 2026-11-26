@@ -19,6 +19,8 @@ from packaging.version import Version as PkgVersion
 import torch
 import torch.nn.functional as F
 
+import transformer_engine_torch as tex
+
 from transformer_engine.pytorch.device import te_device_type
 from transformer_engine.pytorch.utils import (
     get_device_compute_capability,
@@ -318,6 +320,100 @@ def _qkv_quantizer_type(qkv_quantizer):
     if isinstance(qkv_quantizer, MXFP8Quantizer):
         return "mxfp8"
     raise TypeError(f"Unsupported FP8 attention QKV quantizer: {type(qkv_quantizer).__name__}")
+
+
+_cudnn_fe_fp8_bwd_unavailable_warned = False
+
+
+def _cudnn_fe_fp8_bwd(args, q_fp8, k_fp8, v_fp8, out_, d_out_fp8, do_format, aux_ctx_tensors):
+    """FP8 fused-attention backward through cuDNN frontend's CuTe DSL kernels (SM107).
+
+    Opt-in with ``NVTE_DPA_FP8_BWD_CUDNN_FE=1``. Serves Float8CurrentScaling with O in F16
+    (``NVTE_DPA_FP8CS_O_in_F16=1``): E4M3 Q/K/V, E5M2 dO, BF16 O and dQ/dK/dV, causal mask,
+    head_dim 128, SBHD or BSHD, equal Q and KV sequence lengths (a multiple of 256), no dropout,
+    bias, padding or sliding window, ``deterministic=False`` (dQ is accumulated with unordered
+    FP32 reductions). Follows the quantization points and scales of cuDNN's FP8 backward graph
+    but is not bitwise equal to it. Returns ``(dq, dk, dv)`` in ``args.qkv_layout``, or None
+    when the call is outside that configuration, so the caller runs ``fused_attn_bwd``.
+    """
+    global _cudnn_fe_fp8_bwd_unavailable_warned
+    layout = args.qkv_layout
+    fmt = layout.split("_")[0]
+    s_quantizer, dp_quantizer = args.S_quantizer, args.dP_quantizer
+    if not (
+        args.qkv_type == "current"
+        and not args.deterministic
+        and args.nominal_dtype == torch.bfloat16
+        and layout in ("sbhd_sbhd_sbhd", "bshd_bshd_bshd")
+        and args.o_format == fmt
+        and do_format == fmt
+        and args.dqkv_layout == layout
+        and args.qkv_scale_inv_format is None
+        and args.attn_mask_type == "causal"
+        and not args.bottom_right_diagonal
+        and (args.window_size is None or tuple(args.window_size) in ((-1, 0), (-1, -1)))
+        and args.dropout_p == 0.0
+        and args.attn_bias_type == "no_bias"
+        and args.softmax_type == "vanilla"
+        and args.max_seqlen_q == args.max_seqlen_kv
+        and args.cu_seqlens_q_padded is None
+        and args.cu_seqlens_kv_padded is None
+        and all(isinstance(t, Float8Tensor) for t in (q_fp8, k_fp8, v_fp8, d_out_fp8))
+        and all(t._data is not None for t in (q_fp8, k_fp8, v_fp8, d_out_fp8))
+        and all(t._fp8_dtype == tex.DType.kFloat8E4M3 for t in (q_fp8, k_fp8, v_fp8))
+        and d_out_fp8._fp8_dtype == tex.DType.kFloat8E5M2
+        and isinstance(out_, torch.Tensor)
+        and not isinstance(out_, QuantizedTensorStorage)
+        and out_.dtype == torch.bfloat16
+        and isinstance(s_quantizer, (Float8Quantizer, Float8CurrentScalingQuantizer))
+        and isinstance(dp_quantizer, (Float8Quantizer, Float8CurrentScalingQuantizer))
+        and s_quantizer.dtype == tex.DType.kFloat8E4M3
+        and dp_quantizer.dtype == tex.DType.kFloat8E5M2
+    ):
+        return None
+    try:
+        from cudnn.sdpa.bwd import sdpa_fp8_backward, sdpa_fp8_backward_support_error
+    except (ImportError, AttributeError) as exc:
+        if not _cudnn_fe_fp8_bwd_unavailable_warned:
+            _cudnn_fe_fp8_bwd_unavailable_warned = True
+            warnings.warn(
+                "NVTE_DPA_FP8_BWD_CUDNN_FE=1 needs a cuDNN frontend that provides "
+                f"cudnn.sdpa.bwd.sdpa_fp8_backward ({exc}); using the cuDNN graph instead."
+            )
+        return None
+    # (b, s, h, d) views of the FP8 payloads and O; SBHD storage stays in place.
+    perm = (1, 0, 2, 3) if fmt == "sbhd" else (0, 1, 2, 3)
+    q, k, v, d_o = (
+        t._data.view(
+            torch.float8_e4m3fn if t._fp8_dtype == tex.DType.kFloat8E4M3 else torch.float8_e5m2
+        ).permute(*perm)
+        for t in (q_fp8, k_fp8, v_fp8, d_out_fp8)
+    )
+    o = out_.permute(*perm)
+    stats = aux_ctx_tensors[0]
+    if q.shape[1] != args.max_seqlen_q or sdpa_fp8_backward_support_error(
+        q, k, v, o, d_o, stats, is_causal=True
+    ):
+        return None
+    attn_scale = args.attn_scale if args.attn_scale is not None else q.shape[-1] ** -0.5
+    dq, dk, dv = sdpa_fp8_backward(
+        q,
+        k,
+        v,
+        o,
+        d_o,
+        stats,
+        q_fp8._scale_inv,
+        k_fp8._scale_inv,
+        v_fp8._scale_inv,
+        d_out_fp8._scale_inv,
+        s_quantizer.scale,
+        dp_quantizer.scale,
+        dp_quantizer.amax.view(-1)[:1],
+        attn_scale=attn_scale,
+        is_causal=True,
+    )
+    return tuple(t.permute(*perm) for t in (dq, dk, dv))
 
 
 class FP8EmulationFunc(torch.autograd.Function):
@@ -2282,41 +2378,49 @@ def _fused_attn_backward_impl(
                 if args.qkv_type == "mxfp8":
                     out_ = out
                     aux_ctx_tensors.append(d_out)
-                dq_, dk_, dv_, *rest = fused_attn_bwd(
-                    args.max_seqlen_q,
-                    args.max_seqlen_kv,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    out_,
-                    d_out_fp8,
-                    dqkv_nominal_dtype,
-                    aux_ctx_tensors,
-                    args.fused_attention_backend,
-                    cu_seqlens_q_padded,
-                    cu_seqlens_kv_padded,
-                    args.S_quantizer,
-                    args.dP_quantizer,
-                    args.dQKV_quantizer,
-                    args.attn_scale,
-                    args.dropout_p,
-                    args.fast_zero_fill,
-                    args.qkv_layout,
-                    args.o_format,
-                    do_format,
-                    args.dqkv_layout,
-                    args.qkv_scale_inv_format,
-                    do_scale_inv_format,
-                    args.attn_bias_type,
-                    args.attn_mask_type,
-                    args.softmax_type,
-                    args.window_size,
-                    args.bottom_right_diagonal,
-                    args.deterministic,
-                    is_graph_capturing(),
-                )
+                dqkv_ = None
+                if os.getenv("NVTE_DPA_FP8_BWD_CUDNN_FE", "0") == "1":
+                    dqkv_ = _cudnn_fe_fp8_bwd(
+                        args, q_fp8, k_fp8, v_fp8, out_, d_out_fp8, do_format, aux_ctx_tensors
+                    )
+                if dqkv_ is not None:
+                    (dq_, dk_, dv_), rest = dqkv_, [None, None]
+                else:
+                    dq_, dk_, dv_, *rest = fused_attn_bwd(
+                        args.max_seqlen_q,
+                        args.max_seqlen_kv,
+                        cu_seqlens_q,
+                        cu_seqlens_kv,
+                        q_fp8,
+                        k_fp8,
+                        v_fp8,
+                        out_,
+                        d_out_fp8,
+                        dqkv_nominal_dtype,
+                        aux_ctx_tensors,
+                        args.fused_attention_backend,
+                        cu_seqlens_q_padded,
+                        cu_seqlens_kv_padded,
+                        args.S_quantizer,
+                        args.dP_quantizer,
+                        args.dQKV_quantizer,
+                        args.attn_scale,
+                        args.dropout_p,
+                        args.fast_zero_fill,
+                        args.qkv_layout,
+                        args.o_format,
+                        do_format,
+                        args.dqkv_layout,
+                        args.qkv_scale_inv_format,
+                        do_scale_inv_format,
+                        args.attn_bias_type,
+                        args.attn_mask_type,
+                        args.softmax_type,
+                        args.window_size,
+                        args.bottom_right_diagonal,
+                        args.deterministic,
+                        is_graph_capturing(),
+                    )
                 # dq, dk, dv:             torch.Tensor; dtype = torch.float16 or torch.bfloat16
                 dq, dk, dv = dq_, dk_, dv_
                 is_quantized_tensor = isinstance(dq_, QuantizedTensorStorage)
