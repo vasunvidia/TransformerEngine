@@ -372,6 +372,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      hadamard_transform/graph_safe_group_hadamard_transform.cu
      hadamard_transform/hadamard_transform.cu
      hadamard_transform/dswiglu_hadamard_transform_amax.cu
+     hadamard_transform/hadamard_transform_amax_producers.cu
      hadamard_transform/hadamard_transform_cast_fusion.cu
      hadamard_transform/row_cast_col_hadamard_transform_cast_fusion.cu
      hadamard_transform/group_hadamard_transform_cast_fusion.cu

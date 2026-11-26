@@ -27,6 +27,7 @@ from ..utils import (
 from .storage.nvfp4_tensor_storage import NVFP4TensorStorage, _FromNVFP4Func
 from ..quantized_tensor import QuantizedTensor, Quantizer
 from ..dynamo import register_value_opaque_quantizer
+from ..precomputed_rht_amax import take_rht_amax
 from ._quantization_helpers import _IdentityFunc, safe_quantized_repr
 
 aten = torch.ops.aten
@@ -277,6 +278,10 @@ class NVFP4Quantizer(Quantizer):
 
     def quantize_impl(self, tensor: torch.Tensor) -> QuantizedTensor:
         """Quantize tensor implementation"""
+        # Amaxes that the producer of the tensor computed (see precomputed_rht_amax)
+        amax = take_rht_amax(tensor, self)
+        if amax is not None:
+            return tex.nvfp4_quantize_with_amax(tensor, self, *amax)
         return tex.quantize(tensor, self)
 
     def is_requantization_safe(self) -> bool:

@@ -440,6 +440,12 @@ Torch Compilation and Fusion
    :Default: ``0``
    :Description: Enable ``transformer_engine.pytorch.fused_add_rmsnorm.fused_add_rmsnorm_nvfp4``, which computes a residual add together with the RMSNorm and NVFP4 random Hadamard transform amaxes of the following ``LayerNormLinear``, ``LayerNormMLP`` or ``ops.RMSNorm``, so that the RMSNorm only casts. Outputs are bitwise equal to the unfused computation. Supports BF16, hidden size 4096 and devices of compute capability 10.0 or newer that allow about 193 KiB of shared memory per block; the function also falls back when ``NVTE_NORM_FWD_USE_CUDNN`` selects cuDNN for the RMSNorm forward. When set to ``0``, the function returns ``None`` and callers compute the add themselves.
 
+.. envvar:: NVTE_FUSED_ADD_RMSNORM_NVFP4_GRAD_RHT_AMAX
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: With ``NVTE_FUSED_ADD_RMSNORM_NVFP4=1``, give ``fused_add_rmsnorm_nvfp4`` a separate output for the residual consumer (the next ``fused_add_rmsnorm_nvfp4`` takes it), so that its backward adds the two gradients of the sum itself, with ``transformer_engine.pytorch.precomputed_rht_amax.add_with_rht_amax``: the same BF16 sum, plus its NVFP4 random Hadamard transform amaxes, which the NVFP4 cast of that gradient then uses instead of computing them. Gradients and casts are bitwise unchanged.
+
 LayerNorm/RMSNorm SM Margins
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
