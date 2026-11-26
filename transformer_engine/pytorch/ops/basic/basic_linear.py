@@ -39,6 +39,8 @@ from ...utils import (
     clear_tensor_data,
     devices_match,
     get_device_compute_capability,
+    get_main_grad_scale,
+    mark_main_grad_scaled,
 )
 from ..op import BasicOperation
 from .._common import (
@@ -97,6 +99,10 @@ class BasicLinearBwdArgs:
     accumulate_into_grad_weight: bool
     # Original parameter for eager-only main_grad flags and dummy wgrad.
     weight_param: Optional[torch.Tensor] = None
+    # Megatron-LM DDP gradient pre-scaling folded into the wgrad GEMM that writes main_grad,
+    # and the parameter that owns that main_grad.
+    main_grad_scale: float = 1.0
+    main_grad_param: Optional[torch.Tensor] = None
 
 
 def _save_quantized_input(args: BasicLinearFwdArgs) -> bool:
@@ -1254,9 +1260,11 @@ class BasicLinear(BasicOperation):
         ctx = basic_op_ctxs[0]
         grad_weight = None
         accumulate_into_grad_weight = False
+        main_grad_scale = 1.0
         if ctx.weight_requires_grad and self._accumulate_into_main_grad:
             grad_weight = get_main_grad_from_param(self.weight, op_label="BasicLinear").detach()
             accumulate_into_grad_weight = get_accumulate_flag_in_param(self.weight)
+            main_grad_scale = get_main_grad_scale(self.weight)
         return BasicLinearBwdArgs(
             grad_output=grad_output,
             input_=ctx.saved_tensors[0],
@@ -1276,6 +1284,8 @@ class BasicLinear(BasicOperation):
             grad_weight=grad_weight,
             accumulate_into_grad_weight=accumulate_into_grad_weight,
             weight_param=self.weight if accumulate_into_grad_weight else None,
+            main_grad_scale=main_grad_scale,
+            main_grad_param=self.weight if main_grad_scale != 1.0 else None,
         )
 
     @classmethod
@@ -1297,7 +1307,10 @@ class BasicLinear(BasicOperation):
             sequence_parallel=args.sequence_parallel,
             grad_weight=args.grad_weight,
             accumulate_into_grad_weight=args.accumulate_into_grad_weight,
+            grad_weight_alpha=args.main_grad_scale if args.main_grad_scale != 1.0 else None,
         )
+        if args.main_grad_param is not None:
+            mark_main_grad_scaled(args.main_grad_param)
         if not in_custom_op:
             clear_tensor_data(args.input_)
             if args.accumulate_into_grad_weight:

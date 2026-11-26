@@ -44,6 +44,7 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
+import transformer_engine.pytorch.ops as te_ops
 from transformer_engine.pytorch.distributed import (
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
@@ -2825,3 +2826,84 @@ def test_noncontiguous():
     out = _run_module(g2, b)
 
     assert_allclose(out, outT, 1e-7)
+
+
+@pytest.mark.parametrize("module_type", ["linear", "layernorm_linear", "ops_linear"])
+@pytest.mark.parametrize("quantization", [None, "nvfp4"])
+@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("overwrite_main_grad", all_boolean)
+def test_main_grad_scale_folded_into_wgrad(
+    module_type, quantization, main_grad_dtype, overwrite_main_grad
+):
+    """A wgrad GEMM writing ``weight.main_grad`` applies ``weight.main_grad_scale`` as its alpha.
+
+    Megatron-LM's DDP sets ``main_grad_scale`` (a power of two) when it leaves its gradient
+    pre-scaling to the producer of ``main_grad``. The result must have the bits of the unscaled
+    ``main_grad`` multiplied by the scale, the input gradient must not change, and the weight
+    must be marked with ``main_grad_scale_applied``.
+    """
+    if quantization == "nvfp4" and not nvfp4_available:
+        pytest.skip("NVFP4 is not available on this device")
+    dtype = torch.bfloat16
+    in_features, out_features, tokens = 256, 512, 256
+    scale = 0.125
+    quant_recipe = nvfp4_rht_and_2d_quantization() if quantization == "nvfp4" else None
+
+    def make_module():
+        torch.manual_seed(1234)
+        if module_type == "linear":
+            return Linear(
+                in_features,
+                out_features,
+                bias=False,
+                params_dtype=dtype,
+                device="cuda",
+                fuse_wgrad_accumulation=True,
+            )
+        if module_type == "layernorm_linear":
+            return LayerNormLinear(
+                in_features,
+                out_features,
+                bias=False,
+                normalization="RMSNorm",
+                params_dtype=dtype,
+                device="cuda",
+                fuse_wgrad_accumulation=True,
+            )
+        return te_ops.BasicLinear(
+            in_features, out_features, device="cuda", dtype=dtype, accumulate_into_main_grad=True
+        )
+
+    torch.manual_seed(0)
+    x = torch.randn(tokens, in_features, device="cuda", dtype=dtype)
+    dy = torch.randn(tokens, out_features, device="cuda", dtype=dtype)
+    initial_main_grad = torch.randn(out_features, in_features, device="cuda").to(main_grad_dtype)
+
+    results = []
+    for main_grad_scale in (None, scale):
+        module = make_module()
+        weight = module.weight
+        if main_grad_scale is None:
+            weight.main_grad = initial_main_grad.clone()
+        else:
+            # Gradients already in main_grad carry the scale too.
+            weight.main_grad = (initial_main_grad.float() * scale).to(main_grad_dtype)
+            weight.main_grad_scale = main_grad_scale
+            weight.main_grad_scale_applied = False
+        weight.grad_added_to_main_grad = False
+        weight.overwrite_main_grad = overwrite_main_grad
+        x_test = x.clone().requires_grad_()
+        torch.manual_seed(42)
+        with autocast(enabled=quant_recipe is not None, recipe=quant_recipe):
+            y = module(x_test)
+        y.backward(dy)
+        torch.cuda.synchronize()
+        results.append((weight.main_grad.clone(), x_test.grad.clone(), weight))
+
+    (ref_main_grad, ref_dx, ref_weight), (main_grad, dx, weight) = results
+    assert not hasattr(ref_weight, "main_grad_scale_applied")
+    assert weight.main_grad_scale_applied
+    torch.testing.assert_close(dx, ref_dx, rtol=0, atol=0)
+    expected = (ref_main_grad.float() * scale).to(main_grad_dtype)
+    assert torch.count_nonzero(expected) > 0
+    torch.testing.assert_close(main_grad, expected, rtol=0, atol=0)

@@ -51,6 +51,8 @@ from ..utils import (
     warn_compile_eager_fallback,
     warn_if_compile_disabled,
     check_gemm_dims,
+    get_main_grad_scale,
+    mark_main_grad_scaled,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -1620,6 +1622,19 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 "bulk_overlap": bwd_args.ub_bulk_wgrad,
             }
 
+            # Megatron-LM DDP may leave its gradient pre-scaling (main_grad_scale) to the
+            # producer of main_grad: fold it into the GEMM's alpha.
+            main_grad_scale = 1.0
+            if bwd_args.fuse_wgrad_accumulation and not is_dist_weight:
+                main_grad_scale = get_main_grad_scale(origin_weight_python_object)
+            if main_grad_scale != 1.0:
+                if wgrad_gemm_kwargs["bias"] is not None:
+                    raise NotImplementedError(
+                        "main_grad_scale is not supported with the bias gradient fused into the"
+                        " wgrad GEMM"
+                    )
+                wgrad_gemm_kwargs["alpha"] = main_grad_scale
+
             def wgrad_gemm(
                 x: torch.Tensor,
                 dy: torch.Tensor,
@@ -1634,6 +1649,8 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 """
                 nvtx_range_push(f"{nvtx_label}.wgrad_gemm")
                 dw, db, *_ = general_gemm(x, dy, **wgrad_gemm_kwargs)
+                if main_grad_scale != 1.0:
+                    mark_main_grad_scaled(origin_weight_python_object)
                 nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                 return dw, db
 
