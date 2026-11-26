@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import math
 import warnings
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 import functools
 
 import torch
@@ -112,6 +112,45 @@ def get_random_sign_mask_for_rht(with_random_sign_mask: bool, device: int) -> in
     if with_random_sign_mask:
         return get_sign_from_vector(get_wgrad_sign_vector(device=device))
     return 0
+
+
+# Callables that may provide the NVFP4 tensor of a high-precision tensor instead of quantizing
+# it, e.g. from a precomputed amax or from NVFP4 data gathered across data-parallel ranks.
+_NVFP4_TENSOR_PRODUCERS: list = []
+
+
+def register_nvfp4_tensor_producer(producer: Callable) -> None:
+    """Register a producer consulted by :class:`NVFP4Quantizer` before it quantizes a tensor.
+
+    ``producer(quantizer, tensor, output, noop_flag)`` returns the NVFP4 tensor of ``tensor``
+    (written into ``output`` if it is not None) or None to leave ``tensor`` to the next producer
+    and finally to the default quantization. A producer must give the same result as quantizing
+    ``tensor`` with ``quantizer``; it is used for tensors it recognizes, typically weights, e.g.
+    with :func:`transformer_engine_torch.nvfp4_2d_quantize_with_amax` or
+    :func:`transformer_engine_torch.nvfp4_2d_shard_unpack`. Producers are not consulted for
+    quantizers with amax reduction.
+    """
+    if producer not in _NVFP4_TENSOR_PRODUCERS:
+        _NVFP4_TENSOR_PRODUCERS.append(producer)
+
+
+def unregister_nvfp4_tensor_producer(producer: Callable) -> None:
+    """Remove a producer added with :func:`register_nvfp4_tensor_producer`."""
+    if producer in _NVFP4_TENSOR_PRODUCERS:
+        _NVFP4_TENSOR_PRODUCERS.remove(producer)
+
+
+def _produce_nvfp4_tensor(
+    quantizer: NVFP4Quantizer,
+    tensor: torch.Tensor,
+    output: Optional[NVFP4Tensor],
+    noop_flag: Optional[torch.Tensor],
+) -> Optional[NVFP4Tensor]:
+    for producer in _NVFP4_TENSOR_PRODUCERS:
+        out = producer(quantizer, tensor, output, noop_flag)
+        if out is not None:
+            return out
+    return None
 
 
 class NVFP4Quantizer(Quantizer):
@@ -243,6 +282,11 @@ class NVFP4Quantizer(Quantizer):
             quantizer.with_amax_reduction = True
             quantizer.amax_reduction_group = group
 
+        if _NVFP4_TENSOR_PRODUCERS and group is None:
+            out = _produce_nvfp4_tensor(quantizer, src, dst, noop_flag)
+            if out is not None:
+                return out
+
         # Launch cast kernel
         tex.quantize(src, quantizer, dst, noop_flag)
 
@@ -277,6 +321,10 @@ class NVFP4Quantizer(Quantizer):
 
     def quantize_impl(self, tensor: torch.Tensor) -> QuantizedTensor:
         """Quantize tensor implementation"""
+        if _NVFP4_TENSOR_PRODUCERS and not self.with_amax_reduction:
+            out = _produce_nvfp4_tensor(self, tensor, None, None)
+            if out is not None:
+                return out
         return tex.quantize(tensor, self)
 
     def is_requantization_safe(self) -> bool:

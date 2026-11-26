@@ -2567,12 +2567,35 @@ void NVFP4Quantizer::quantize_with_rht_unfused_helper(
   }
 }
 
+bool NVFP4Quantizer::supports_fast_2d_quantization() const {
+  return this->with_2d_quantization && !this->with_rht && !this->stochastic_rounding &&
+         !this->with_amax_reduction && !this->row_scaled_nvfp4 &&
+         !this->disable_second_level_scale && this->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled &&
+         this->scale_dtype == DType::kFloat8E4M3;
+}
+
+bool NVFP4Quantizer::quantize_2d_with_amax(const TensorWrapper& input, const TensorWrapper& amax,
+                                           TensorWrapper& out,
+                                           const std::optional<TensorWrapper>& noop_flag) {
+  if (!this->supports_fast_2d_quantization() ||
+      !nvte_nvfp4_2d_amax_quantize_supported(input.data(), out.data())) {
+    return false;
+  }
+  QuantizationConfigWrapper quant_config;
+  if (noop_flag) {
+    quant_config.set_noop_tensor(noop_flag->data());
+  }
+  quant_config.set_nvfp4_2d_quantization(true);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_2d_quantize_with_amax(input.data(), amax.data(), out.data(), quant_config, stream);
+  });
+  return true;
+}
+
 bool NVFP4Quantizer::quantize_2d_with_fused_amax(const TensorWrapper& input, TensorWrapper& out,
                                                  const std::optional<TensorWrapper>& noop_flag) {
-  if (!this->with_2d_quantization || this->with_rht || this->stochastic_rounding ||
-      this->with_amax_reduction || this->row_scaled_nvfp4 || this->disable_second_level_scale ||
-      this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled ||
-      this->scale_dtype != DType::kFloat8E4M3) {
+  if (!this->supports_fast_2d_quantization()) {
     return false;
   }
   if (!transformer_engine::getenv<bool>("NVTE_NVFP4_FAST_2D_WEIGHT_QUANTIZATION")) {

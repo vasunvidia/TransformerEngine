@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdint>
 
 #include "../../common.h"
 #include "../../util/cuda_driver.h"
@@ -557,48 +558,17 @@ CUtensorMap make_tile_map(const Tensor &input, size_t rows, size_t cols) {
                                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return map;
 }
-#endif  // FP4_TYPE_SUPPORTED
 
-void amax_quantize(const Tensor &input, Tensor *output, Tensor *workspace, const Tensor *noop,
-                   cudaStream_t stream) {
-#if FP4_TYPE_SUPPORTED
-  NVTE_CHECK(is_supported(input, *output),
-             "nvte_nvfp4_2d_amax_quantize does not support this input/output combination; "
-             "check nvte_nvfp4_2d_amax_quantize_supported first.");
-  const size_t partials_count = num_partials(input);
-  if (workspace->data.dptr == nullptr) {
-    workspace->data.shape = {partials_count};
-    workspace->data.dtype = DType::kFloat32;
-    return;
-  }
-  NVTE_CHECK(workspace->data.dtype == DType::kFloat32 && workspace->numel() >= partials_count,
-             "Workspace must be a float32 tensor with at least ", partials_count, " elements.");
-
+// Kernel 2: quantize, with the per-tensor amax the max of partials[0, num_partials).
+void launch_quantize(const Tensor &input, Tensor *output, const float *partials, int num_partials,
+                     const float *noop, cudaStream_t stream) {
   const auto [rows, cols] = input.flat_2d_dims();
-  const float *noop_ptr = (noop != nullptr && noop->data.dptr != nullptr)
-                              ? reinterpret_cast<const float *>(noop->data.dptr)
-                              : nullptr;
-  float *partials = reinterpret_cast<float *>(workspace->data.dptr);
   const bool do_col = output->has_columnwise_data();
-  const int sms = cuda::sm_count();
-
-  // Kernel 1: amax partials.
-  const int num_chunks = static_cast<int>(input.numel() * 2 / kStageBytes);
-  const int keep_chunks =
-      static_cast<int>(std::min<size_t>(num_chunks, kL2KeepBytes / kStageBytes));
-  NVTE_CHECK_CUDA(
-      cudaFuncSetAttribute(amax_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-  amax_kernel<<<static_cast<unsigned>(partials_count), kAmaxThreads, kSmemBytes, stream>>>(
-      reinterpret_cast<const uint8_t *>(input.data.dptr), num_chunks, num_chunks - keep_chunks,
-      partials, noop_ptr);
-  NVTE_CHECK_CUDA(cudaGetLastError());
-
-  // Kernel 2: quantize.
   QuantizeParams p;
   p.rows = static_cast<int>(rows);
   p.cols = static_cast<int>(cols);
   p.partials = partials;
-  p.num_partials = static_cast<int>(partials_count);
+  p.num_partials = num_partials;
   p.row_data = reinterpret_cast<uint8_t *>(output->data.dptr);
   p.row_scale = reinterpret_cast<uint8_t *>(output->scale_inv.dptr);
   p.row_amax = reinterpret_cast<float *>(output->amax.dptr);
@@ -608,13 +578,13 @@ void amax_quantize(const Tensor &input, Tensor *output, Tensor *workspace, const
   p.col_amax = reinterpret_cast<float *>(output->columnwise_amax.dptr);
   p.row_scale_stride = static_cast<int>(output->scale_inv.shape[1]);
   p.col_scale_stride = do_col ? static_cast<int>(output->columnwise_scale_inv.shape[1]) : 0;
-  p.noop = noop_ptr;
+  p.noop = noop;
   p.tiles_x = static_cast<int>(cols / kTile);
   p.num_tiles = static_cast<int>((rows / kTile) * (cols / kTile));
 
   checkCuDriverContext(stream);
   const CUtensorMap tensor_map = make_tile_map(input, rows, cols);
-  const unsigned grid = static_cast<unsigned>(std::min(p.num_tiles, sms));
+  const unsigned grid = static_cast<unsigned>(std::min(p.num_tiles, cuda::sm_count()));
   auto launch = [&](auto kernel) {
     NVTE_CHECK_CUDA(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kQuantSmemBytes));
@@ -632,6 +602,402 @@ void amax_quantize(const Tensor &input, Tensor *output, Tensor *workspace, const
       launch(quantize_kernel<false, true>);
     } else {
       launch(quantize_kernel<false, false>);
+    }
+  }
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
+const float *noop_ptr(const Tensor *noop) {
+  return (noop != nullptr && noop->data.dptr != nullptr)
+             ? reinterpret_cast<const float *>(noop->data.dptr)
+             : nullptr;
+}
+#endif  // FP4_TYPE_SUPPORTED
+
+void amax_quantize(const Tensor &input, Tensor *output, Tensor *workspace, const Tensor *noop,
+                   cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  NVTE_CHECK(is_supported(input, *output),
+             "nvte_nvfp4_2d_amax_quantize does not support this input/output combination; "
+             "check nvte_nvfp4_2d_amax_quantize_supported first.");
+  const size_t partials_count = num_partials(input);
+  if (workspace->data.dptr == nullptr) {
+    workspace->data.shape = {partials_count};
+    workspace->data.dtype = DType::kFloat32;
+    return;
+  }
+  NVTE_CHECK(workspace->data.dtype == DType::kFloat32 && workspace->numel() >= partials_count,
+             "Workspace must be a float32 tensor with at least ", partials_count, " elements.");
+  float *partials = reinterpret_cast<float *>(workspace->data.dptr);
+
+  // Kernel 1: amax partials.
+  const int num_chunks = static_cast<int>(input.numel() * 2 / kStageBytes);
+  const int keep_chunks =
+      static_cast<int>(std::min<size_t>(num_chunks, kL2KeepBytes / kStageBytes));
+  NVTE_CHECK_CUDA(
+      cudaFuncSetAttribute(amax_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  amax_kernel<<<static_cast<unsigned>(partials_count), kAmaxThreads, kSmemBytes, stream>>>(
+      reinterpret_cast<const uint8_t *>(input.data.dptr), num_chunks, num_chunks - keep_chunks,
+      partials, noop_ptr(noop));
+  NVTE_CHECK_CUDA(cudaGetLastError());
+
+  launch_quantize(input, output, partials, static_cast<int>(partials_count), noop_ptr(noop),
+                  stream);
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+void quantize_with_amax(const Tensor &input, const Tensor &amax, Tensor *output, const Tensor *noop,
+                        cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  NVTE_CHECK(is_supported(input, *output),
+             "nvte_nvfp4_2d_quantize_with_amax does not support this input/output combination; "
+             "check nvte_nvfp4_2d_amax_quantize_supported first.");
+  NVTE_CHECK(amax.data.dptr != nullptr && amax.dtype() == DType::kFloat32 && amax.numel() == 1,
+             "nvte_nvfp4_2d_quantize_with_amax expects a float32 amax with one element.");
+  // The amax is the quantize kernel's single partial.
+  launch_quantize(input, output, reinterpret_cast<const float *>(amax.data.dptr), 1, noop_ptr(noop),
+                  stream);
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+// Sharded 2D quantization (nvte_nvfp4_2d_shard_*): each data-parallel rank quantizes the weight
+// elements of its shard into its chunk of a gathered buffer, and the gathered chunks are expanded
+// into NVFP4 tensors. The arithmetic is quantize_kernel's.
+constexpr int kMaxShardRanks = 64;
+constexpr int kShardPackThreads = 128;  // Eight half-warps, one 16x128 unit each
+constexpr int kShardPackCtasPerSm = 8;
+constexpr int kShardUnpackThreads = 128;
+constexpr int kShardUnpackCtasPerSm = 32;
+
+struct ShardUnpackParams {
+  const uint8_t *gathered;
+  int64_t chunk_bytes;
+  int64_t shard;
+  int64_t param_start;
+  int64_t scale_base[kMaxShardRanks];
+  const int32_t *amax;
+  int rows, cols;
+  uint8_t *row_data;
+  uint8_t *row_scale;
+  float *row_amax;
+  uint8_t *col_data;
+  uint8_t *col_scale;
+  float *col_amax;
+  int row_scale_stride, col_scale_stride;
+  const float *noop;
+  int tiles_x, num_tiles;
+};
+
+#if FP4_TYPE_SUPPORTED
+
+// One CTA per entry; thread t reduces the owned elements of 16x16 blocks t, t + blockDim.x, ...
+__global__ void shard_partial_amax_kernel(const NVTENVFP4ShardPartialEntry *__restrict__ entries,
+                                          int32_t *__restrict__ amax) {
+  const NVTENVFP4ShardPartialEntry e = entries[blockIdx.x];
+  const uint16_t *x = reinterpret_cast<const uint16_t *>(e.row_group);
+  for (int cb = threadIdx.x; cb < e.cols / 16; cb += blockDim.x) {
+    uint32_t m = 0;
+    for (int i = 0; i < 16; ++i) {
+      for (int j = 0; j < 16; ++j) {
+        const int64_t idx = static_cast<int64_t>(i) * e.cols + cb * 16 + j;
+        if (idx >= e.own_begin && idx < e.own_end)
+          m = max(m, static_cast<uint32_t>(x[idx] & 0x7fffu));
+      }
+    }
+    amax[e.slot + cb] = static_cast<int32_t>(m << 16);
+  }
+}
+
+// A half-warp quantizes one 16x128 unit (16 rows of a row group, 128 columns); lane c8 of the
+// half-warp one 16x8 half of a 16x16 block, as in quantize_kernel. Each half-warp takes a
+// contiguous range of units, and all threads run the same number of iterations (the block amax
+// shuffle is warp-wide).
+__global__ void __launch_bounds__(kShardPackThreads)
+    shard_pack_kernel(const NVTENVFP4ShardPackItem *__restrict__ items, int num_items,
+                      int64_t num_units, const int32_t *__restrict__ amax_buf) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  const int hw = threadIdx.x >> 4, c8 = threadIdx.x & 15;
+  const int hw_per_cta = blockDim.x >> 4;
+  const int64_t num_hw = static_cast<int64_t>(gridDim.x) * hw_per_cta;
+  const int64_t per_hw = (num_units + num_hw - 1) / num_hw;
+  const int64_t u_begin = (static_cast<int64_t>(blockIdx.x) * hw_per_cta + hw) * per_hw;
+  // Last item whose first unit is at or before u_begin.
+  int cur = 0;
+  {
+    int lo = 0, hi = num_items - 1;
+    const int64_t ub = u_begin < num_units ? u_begin : num_units - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (items[mid].first_unit <= ub) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    cur = lo;
+  }
+  NVTENVFP4ShardPackItem it = items[cur];
+  int64_t next_first = cur + 1 < num_items ? items[cur + 1].first_unit : INT64_MAX;
+  for (int64_t j = 0; j < per_hw; ++j) {
+    const bool valid = u_begin + j < num_units;
+    const int64_t u = valid ? u_begin + j : num_units - 1;
+    while (u >= next_first) {
+      ++cur;
+      it = items[cur];
+      next_first = cur + 1 < num_items ? items[cur + 1].first_unit : INT64_MAX;
+    }
+    const int units_per_row_group = it.cols / 128;
+    const int64_t local = u - it.first_unit;
+    const int rg = it.row_group_first + static_cast<int>(local / units_per_row_group);
+    const int strip = static_cast<int>(local % units_per_row_group);
+    const int64_t cols = it.cols;
+    const int64_t e0 = static_cast<int64_t>(rg) * 16 * cols + strip * 128 + c8 * 8;
+    const uint16_t *x = reinterpret_cast<const uint16_t *>(it.weight);
+    uint4 v[16];
+    bool own[16];
+    uint32_t acc = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const int64_t e = e0 + i * cols;
+      own[i] = valid && e >= it.own_begin && e < it.own_end;
+      v[i] = own[i] ? *reinterpret_cast<const uint4 *>(x + e) : make_uint4(0, 0, 0, 0);
+      acc = abs_max_bf16x8(acc, v[i]);
+    }
+    float block_amax = abs_max_bf16x2_to_float(acc);
+    block_amax = fmaxf(block_amax, __shfl_xor_sync(0xffffffffu, block_amax, 1));
+    // A row group cut by the shard's first or last boundary takes its block amaxes over the
+    // whole row group from the reduced partials.
+    int cut = -1;
+    if (rg == it.row_group_first && it.cut_begin_slot >= 0) cut = it.cut_begin_slot;
+    if (rg == it.row_group_last && it.cut_end_slot >= 0) cut = it.cut_end_slot;
+    if (cut >= 0) block_amax = __int_as_float(amax_buf[cut + strip * 8 + (c8 >> 1)]);
+    const float S_enc = global_encode_scale(__int_as_float(amax_buf[it.amax_slot]));
+    const float S_dec = 1.0 / S_enc;  // Division in double, as compute_decoding_scaling_factor
+    constexpr float fp4_max_inv = 1.0f / 6.0f;
+    const float dec = block_amax * (S_enc * fp4_max_inv);
+    const __nv_fp8_e4m3 s_fp8 = static_cast<__nv_fp8_e4m3>(fminf(dec, FLT_MAX));
+    const float inv = fminf(1.0f / (static_cast<float>(s_fp8) * S_dec), FLT_MAX);
+    uint8_t *chunk = reinterpret_cast<uint8_t *>(it.chunk);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      if (own[i]) {
+        const int64_t e = e0 + i * cols + it.data_offset;
+        *reinterpret_cast<uint32_t *>(chunk + e / 2) = mul_cvt_bf16x8_to_fp4x8(v[i], inv);
+      }
+    }
+    if (valid && (c8 & 1) == 0 && rg >= it.row_group_own_begin && rg < it.row_group_own_end) {
+      chunk[it.scale_offset + static_cast<int64_t>(rg - it.row_group_own_begin) * (cols / 16) +
+            strip * 8 + (c8 >> 1)] = s_fp8.__x;
+    }
+  }
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+}
+
+// One 128x128 tile per iteration; thread layout and output stores as in quantize_kernel.
+template <bool SWIZZLED, bool DO_COL>
+__global__ void __launch_bounds__(kShardUnpackThreads)
+    shard_unpack_kernel(const __grid_constant__ ShardUnpackParams p) {
+  if (p.noop != nullptr && p.noop[0] == 1.0f) return;
+  __shared__ __align__(16) uint8_t col_stage[kTile * kTile / 2];
+  __shared__ __align__(16) uint8_t sc[8][8];
+  __shared__ __align__(16) uint8_t scT[8][8];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int gt = threadIdx.x;
+  const int strip = (warp & 3) * 2 + (lane >> 4);
+  const int c8 = lane & 15;
+  const int64_t cols = p.cols;
+  const size_t rows_half = static_cast<size_t>(p.rows) / 2;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const float a = __int_as_float(p.amax[0]);
+    *p.row_amax = a;
+    if (p.col_amax != nullptr) *p.col_amax = a;
+  }
+  for (int t = blockIdx.x; t < p.num_tiles; t += gridDim.x) {
+    const int row0 = (t / p.tiles_x) * kTile, col0 = (t % p.tiles_x) * kTile;
+    __syncthreads();  // The previous tile's shared-memory readers are done
+    uint32_t r[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const int64_t e =
+          p.param_start + static_cast<int64_t>(row0 + strip * 16 + i) * cols + col0 + c8 * 8;
+      const int64_t k = e / p.shard;
+      r[i] = *reinterpret_cast<const uint32_t *>(p.gathered + k * p.chunk_bytes +
+                                                 (e - k * p.shard) / 2);
+    }
+    const int rg = row0 / 16 + strip;
+    const int64_t k = (p.param_start + static_cast<int64_t>(rg) * 16 * cols) / p.shard;
+    const uint8_t bits = p.gathered[k * p.chunk_bytes + p.scale_base[k] +
+                                    static_cast<int64_t>(rg) * (cols / 16) + col0 / 16 + (c8 >> 1)];
+    {
+      uint32_t *dst = reinterpret_cast<uint32_t *>(p.row_data + (row0 + strip * 16) * (cols / 2) +
+                                                   (col0 + c8 * 8) / 2);
+#pragma unroll
+      for (int i = 0; i < 16; ++i) dst[i * (cols / 8)] = r[i];
+    }
+    if ((c8 & 1) == 0) {
+      sc[strip][c8 >> 1] = bits;
+      scT[c8 >> 1][strip] = bits;
+    }
+    if constexpr (DO_COL) {
+      transpose_8x8_nibbles(r);
+      transpose_8x8_nibbles(r + 8);
+      __syncthreads();
+      const int hw = lane >> 4;
+      const int slot = strip ^ (c8 & 7);
+#pragma unroll
+      for (int cc = 0; cc < 8; ++cc) {
+        const uint32_t lo = hw ? r[cc ^ 1] : r[cc];
+        const uint32_t hi = hw ? r[8 + (cc ^ 1)] : r[8 + cc];
+        *reinterpret_cast<uint2 *>(col_stage + (c8 * 8 + (cc ^ hw)) * 64 + slot * 8) =
+            make_uint2(lo, hi);
+      }
+      __syncthreads();
+#pragma unroll
+      for (int q4 = 0; q4 < 4; ++q4) {
+        const int idx = q4 * 128 + gt;
+        const int c = idx >> 2, q = idx & 3, kx = (c >> 3) & 7;
+        uint4 w = *reinterpret_cast<const uint4 *>(col_stage + c * 64 + ((q ^ (kx >> 1)) << 4));
+        if (kx & 1) w = make_uint4(w.z, w.w, w.x, w.y);
+        *reinterpret_cast<uint4 *>(p.col_data + (col0 + c) * rows_half + row0 / 2 + q * 16) = w;
+      }
+    } else {
+      __syncthreads();
+    }
+    if constexpr (SWIZZLED) {
+      const int u = gt & 63;
+      const int gg = u >> 5, d3 = u & 31, hb = d3 >> 4;
+      if (gt < 64) {
+        const size_t cbg_cnt = (cols / 16 + 3) / 4;
+        uint4 w;
+        w.x = *reinterpret_cast<const uint32_t *>(&sc[0 + hb][4 * gg]);
+        w.y = *reinterpret_cast<const uint32_t *>(&sc[2 + hb][4 * gg]);
+        w.z = *reinterpret_cast<const uint32_t *>(&sc[4 + hb][4 * gg]);
+        w.w = *reinterpret_cast<const uint32_t *>(&sc[6 + hb][4 * gg]);
+        *reinterpret_cast<uint4 *>(
+            p.row_scale + swizzled_chunk_offset(row0 / 128, col0 / 64 + gg, cbg_cnt, d3)) = w;
+      } else if (DO_COL) {
+        const size_t cbg_cnt = (static_cast<size_t>(p.rows) / 16 + 3) / 4;
+        uint4 w;
+        w.x = *reinterpret_cast<const uint32_t *>(&scT[0 + hb][4 * gg]);
+        w.y = *reinterpret_cast<const uint32_t *>(&scT[2 + hb][4 * gg]);
+        w.z = *reinterpret_cast<const uint32_t *>(&scT[4 + hb][4 * gg]);
+        w.w = *reinterpret_cast<const uint32_t *>(&scT[6 + hb][4 * gg]);
+        *reinterpret_cast<uint4 *>(
+            p.col_scale + swizzled_chunk_offset(col0 / 128, row0 / 64 + gg, cbg_cnt, d3)) = w;
+      }
+    } else {
+      *reinterpret_cast<uint64_t *>(
+          p.row_scale + static_cast<size_t>(row0 + gt) * p.row_scale_stride + col0 / 16) =
+          *reinterpret_cast<const uint64_t *>(&sc[gt >> 4][0]);
+      if constexpr (DO_COL) {
+        *reinterpret_cast<uint64_t *>(
+            p.col_scale + static_cast<size_t>(col0 + gt) * p.col_scale_stride + row0 / 16) =
+            *reinterpret_cast<const uint64_t *>(&scT[gt >> 4][0]);
+      }
+    }
+  }
+}
+
+#endif  // FP4_TYPE_SUPPORTED
+
+void shard_partial_amax(const NVTENVFP4ShardPartialEntry *entries, size_t num_entries,
+                        int32_t *amax, cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  if (num_entries == 0) return;
+  NVTE_CHECK(entries != nullptr && amax != nullptr, "Entries and amax must be device pointers.");
+  shard_partial_amax_kernel<<<static_cast<unsigned>(num_entries), 128, 0, stream>>>(entries, amax);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+void shard_pack(const NVTENVFP4ShardPackItem *items, size_t num_items, int64_t num_units,
+                const int32_t *amax, cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  if (num_items == 0 || num_units == 0) return;
+  NVTE_CHECK(items != nullptr && amax != nullptr, "Items and amax must be device pointers.");
+  NVTE_CHECK(num_items < (size_t{1} << 31), "Too many items.");
+  const int64_t ctas = std::min<int64_t>(
+      (num_units + 15) / 16, static_cast<int64_t>(cuda::sm_count()) * kShardPackCtasPerSm);
+  shard_pack_kernel<<<static_cast<unsigned>(ctas), kShardPackThreads, 0, stream>>>(
+      items, static_cast<int>(num_items), num_units, amax);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+void shard_unpack(const uint8_t *gathered, int64_t chunk_bytes, int64_t shard, int64_t param_start,
+                  const int64_t *scale_base, size_t num_ranks, const int32_t *amax, size_t rows,
+                  size_t cols, Tensor *output, const Tensor *noop, cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  NVTE_CHECK(num_ranks >= 1 && num_ranks <= static_cast<size_t>(kMaxShardRanks),
+             "nvte_nvfp4_2d_shard_unpack supports 1 to ", kMaxShardRanks, " ranks.");
+  NVTE_CHECK(gathered != nullptr && amax != nullptr && scale_base != nullptr,
+             "Gathered buffer, amax and scale offsets must be given.");
+  NVTE_CHECK(chunk_bytes > 0 && shard > 0 && shard % 16 == 0 && param_start >= 0,
+             "Invalid shard layout.");
+  NVTE_CHECK(rows % kTile == 0 && cols % kTile == 0 && rows < (size_t{1} << 31) &&
+                 cols < (size_t{1} << 31),
+             "Rows and columns must be multiples of ", kTile, ".");
+  NVTE_CHECK(output->scaling_mode == NVTE_NVFP4_1D_SCALING && !output->row_scaled_nvfp4,
+             "Output must be an NVFP4 tensor.");
+  NVTE_CHECK(output->has_data() && output->data.dtype == DType::kFloat4E2M1 &&
+                 output->data.numel() == rows * cols && output->scale_inv.dptr != nullptr &&
+                 output->scale_inv.dtype == DType::kFloat8E4M3 &&
+                 shape_is(output->scale_inv, rows, cols / 16),
+             "Output rowwise data and scales do not match a [", rows, ", ", cols, "] weight.");
+  const bool do_col = output->has_columnwise_data();
+  NVTE_CHECK(!do_col || (output->columnwise_data.dtype == DType::kFloat4E2M1 &&
+                         output->columnwise_data.numel() == rows * cols &&
+                         output->columnwise_scale_inv.dptr != nullptr &&
+                         output->columnwise_scale_inv.dtype == DType::kFloat8E4M3 &&
+                         shape_is(output->columnwise_scale_inv, cols, rows / 16)),
+             "Output columnwise data and scales do not match a [", rows, ", ", cols, "] weight.");
+  NVTE_CHECK(output->amax.dptr != nullptr && output->amax.numel() == 1 &&
+                 (output->columnwise_amax.dptr == nullptr || output->columnwise_amax.numel() == 1),
+             "Output must have a per-tensor amax.");
+  ShardUnpackParams p;
+  p.gathered = gathered;
+  p.chunk_bytes = chunk_bytes;
+  p.shard = shard;
+  p.param_start = param_start;
+  for (int i = 0; i < kMaxShardRanks; ++i) {
+    p.scale_base[i] = i < static_cast<int>(num_ranks) ? scale_base[i] : 0;
+  }
+  p.amax = amax;
+  p.rows = static_cast<int>(rows);
+  p.cols = static_cast<int>(cols);
+  p.row_data = reinterpret_cast<uint8_t *>(output->data.dptr);
+  p.row_scale = reinterpret_cast<uint8_t *>(output->scale_inv.dptr);
+  p.row_amax = reinterpret_cast<float *>(output->amax.dptr);
+  p.col_data = do_col ? reinterpret_cast<uint8_t *>(output->columnwise_data.dptr) : nullptr;
+  p.col_scale = do_col ? reinterpret_cast<uint8_t *>(output->columnwise_scale_inv.dptr) : nullptr;
+  p.col_amax = reinterpret_cast<float *>(output->columnwise_amax.dptr);
+  p.row_scale_stride = static_cast<int>(output->scale_inv.shape[1]);
+  p.col_scale_stride = do_col ? static_cast<int>(output->columnwise_scale_inv.shape[1]) : 0;
+  p.noop = noop_ptr(noop);
+  p.tiles_x = static_cast<int>(cols / kTile);
+  p.num_tiles = static_cast<int>((rows / kTile) * (cols / kTile));
+  const unsigned grid = static_cast<unsigned>(std::min<int64_t>(
+      p.num_tiles, static_cast<int64_t>(cuda::sm_count()) * kShardUnpackCtasPerSm));
+  auto launch = [&](auto kernel) { kernel<<<grid, kShardUnpackThreads, 0, stream>>>(p); };
+  if (output->with_gemm_swizzled_scales) {
+    if (do_col) {
+      launch(shard_unpack_kernel<true, true>);
+    } else {
+      launch(shard_unpack_kernel<true, false>);
+    }
+  } else {
+    if (do_col) {
+      launch(shard_unpack_kernel<false, true>);
+    } else {
+      launch(shard_unpack_kernel<false, false>);
     }
   }
   NVTE_CHECK_CUDA(cudaGetLastError());
@@ -672,4 +1038,53 @@ void nvte_nvfp4_2d_amax_quantize(const NVTETensor input, NVTETensor output, NVTE
   dispatch::nvfp4::amax_quantize_2d::amax_quantize(*convertNVTETensorCheck(input),
                                                    convertNVTETensorCheck(output),
                                                    convertNVTETensorCheck(workspace), noop, stream);
+}
+
+void nvte_nvfp4_2d_quantize_with_amax(const NVTETensor input, const NVTETensor amax,
+                                      NVTETensor output, const NVTEQuantizationConfig quant_config,
+                                      cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2d_quantize_with_amax);
+  using namespace transformer_engine;
+  const Tensor *noop = nullptr;
+  if (quant_config != nullptr) {
+    const auto &config = *reinterpret_cast<QuantizationConfig *>(quant_config);
+    NVTE_CHECK(!config.stochastic_rounding,
+               "nvte_nvfp4_2d_quantize_with_amax does not support stochastic rounding.");
+    NVTE_CHECK(config.nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
+               "nvte_nvfp4_2d_quantize_with_amax does not support 4over6 quantization.");
+    if (config.noop_tensor != nullptr) noop = convertNVTETensorCheck(config.noop_tensor);
+  }
+  dispatch::nvfp4::amax_quantize_2d::quantize_with_amax(
+      *convertNVTETensorCheck(input), *convertNVTETensorCheck(amax), convertNVTETensorCheck(output),
+      noop, stream);
+}
+
+void nvte_nvfp4_2d_shard_partial_amax(const NVTENVFP4ShardPartialEntry *entries, size_t num_entries,
+                                      int32_t *amax, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2d_shard_partial_amax);
+  transformer_engine::dispatch::nvfp4::amax_quantize_2d::shard_partial_amax(entries, num_entries,
+                                                                            amax, stream);
+}
+
+void nvte_nvfp4_2d_shard_pack(const NVTENVFP4ShardPackItem *items, size_t num_items,
+                              int64_t num_units, const int32_t *amax, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2d_shard_pack);
+  transformer_engine::dispatch::nvfp4::amax_quantize_2d::shard_pack(items, num_items, num_units,
+                                                                    amax, stream);
+}
+
+void nvte_nvfp4_2d_shard_unpack(const uint8_t *gathered, int64_t chunk_bytes, int64_t shard,
+                                int64_t param_start, const int64_t *scale_base, size_t num_ranks,
+                                const int32_t *amax, size_t rows, size_t cols, NVTETensor output,
+                                const NVTEQuantizationConfig quant_config, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2d_shard_unpack);
+  using namespace transformer_engine;
+  const Tensor *noop = nullptr;
+  if (quant_config != nullptr) {
+    const auto &config = *reinterpret_cast<QuantizationConfig *>(quant_config);
+    if (config.noop_tensor != nullptr) noop = convertNVTETensorCheck(config.noop_tensor);
+  }
+  dispatch::nvfp4::amax_quantize_2d::shard_unpack(gathered, chunk_bytes, shard, param_start,
+                                                  scale_base, num_ranks, amax, rows, cols,
+                                                  convertNVTETensorCheck(output), noop, stream);
 }

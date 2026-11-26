@@ -425,6 +425,17 @@ class NVFP4Quantizer : public Quantizer {
   static bool is_eligible_for_2d_swizzle_fusion(const std::vector<size_t>& shape);
   bool emits_gemm_swizzled_scales(const std::vector<size_t>& shape) const;
 
+  /*! @brief Quantize with 2D block scaling given the per-tensor amax (nvte_nvfp4_2d_quantize_with_amax)
+   *
+   * ``amax`` holds max|input| (one FP32 value). Returns false, without launching anything, if
+   * the quantizer or the tensors are not supported by the fast 2D quantization kernels.
+   */
+  bool quantize_2d_with_amax(const TensorWrapper& input, const TensorWrapper& amax,
+                             TensorWrapper& out, const std::optional<TensorWrapper>& noop_flag);
+
+  /*! @brief Whether the quantizer settings allow the fast 2D (16x16) quantization kernels. */
+  bool supports_fast_2d_quantization() const;
+
   // Flattened row/column alignment for directly emitted GEMM-swizzled scales, or no such path.
   static ShapeAlignment gemm_swizzled_scales_alignment(bool optimize_for_gemm, bool with_rht,
                                                        bool with_2d_quantization,

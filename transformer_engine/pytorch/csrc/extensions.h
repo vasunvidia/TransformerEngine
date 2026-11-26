@@ -412,6 +412,24 @@ py::object nvfp4_quantize_with_amax(const at::Tensor &tensor, py::handle quantiz
                                     const at::Tensor &rowwise_amax,
                                     const at::Tensor &columnwise_amax);
 
+py::object nvfp4_2d_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
+                                       const at::Tensor &amax, const py::object &output,
+                                       std::optional<at::Tensor> noop_flag);
+
+int64_t nvfp4_2d_shard_partial_entry_size();
+
+int64_t nvfp4_2d_shard_pack_item_size();
+
+void nvfp4_2d_shard_partial_amax(const at::Tensor &entries, at::Tensor amax);
+
+void nvfp4_2d_shard_pack(const at::Tensor &items, int64_t num_units, const at::Tensor &amax);
+
+py::object nvfp4_2d_shard_unpack(const at::Tensor &gathered, int64_t chunk_bytes, int64_t shard,
+                                 int64_t param_start, const std::vector<int64_t> &scale_base,
+                                 const at::Tensor &amax, int64_t rows, int64_t cols,
+                                 py::handle quantizer, const py::object &output,
+                                 std::optional<at::Tensor> noop_flag);
+
 py::object dequantize(const py::handle &input, DType otype);
 
 py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const size_t num_tensors,
