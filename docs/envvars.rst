@@ -428,6 +428,12 @@ Torch Compilation and Fusion
    :Default: ``1``
    :Description: Enable fusion of bias and dropout operations. When set to ``0``, bias and dropout are computed separately.
 
+.. envvar:: NVTE_FUSED_ADD_RMSNORM_NVFP4
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Enable ``transformer_engine.pytorch.fused_add_rmsnorm.fused_add_rmsnorm_nvfp4``, which computes a residual add together with the RMSNorm and NVFP4 random Hadamard transform amaxes of the following ``LayerNormLinear``, ``LayerNormMLP`` or ``ops.RMSNorm``, so that the RMSNorm only casts. Outputs are bitwise equal to the unfused computation. Supports BF16, hidden size 4096 and devices of compute capability 10.0 or newer that allow about 193 KiB of shared memory per block; the function also falls back when ``NVTE_NORM_FWD_USE_CUDNN`` selects cuDNN for the RMSNorm forward. When set to ``0``, the function returns ``None`` and callers compute the add themselves.
+
 LayerNorm/RMSNorm SM Margins
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

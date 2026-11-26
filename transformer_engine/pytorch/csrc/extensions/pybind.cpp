@@ -430,6 +430,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm_bwd", &transformer_engine::pytorch::rmsnorm_bwd, "Backward of RMSNorm");
   m.def("rmsnorm_bwd_add", &transformer_engine::pytorch::rmsnorm_bwd_add,
         "Fused backward of RMSNorm + add");
+  m.def("rmsnorm_fwd_add_rht_amax", &transformer_engine::pytorch::rmsnorm_fwd_add_rht_amax,
+        "Fused residual add + RMSNorm + NVFP4 random Hadamard transform amaxes", py::arg("x"),
+        py::arg("residual"), py::arg("weight"), py::arg("eps"), py::arg("random_sign_mask_t"),
+        py::arg("sm_margin"));
   m.def("multi_tensor_quantize", &transformer_engine::pytorch::multi_tensor_quantize,
         "Multi-tensor quantize", py::arg("tensor_list"), py::arg("quantizer_list"));
   m.def("split_quantize", &transformer_engine::pytorch::split_quantize,

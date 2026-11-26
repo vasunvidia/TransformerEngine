@@ -311,6 +311,7 @@ list(APPEND transformer_engine_cuda_sources
      normalization/layernorm/ln_fwd_cuda_kernel.cu
      normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu
      normalization/rmsnorm/rmsnorm_fwd_cuda_kernel.cu
+     normalization/rmsnorm/rmsnorm_fwd_add_rht_amax.cu
      permutation/permutation.cu
      util/utils.cu
      util/padding.cu

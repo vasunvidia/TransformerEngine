@@ -4,6 +4,10 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#include <map>
+#include <mutex>
+#include <utility>
+
 #include "../extensions.h"
 #include "common/util/system.h"
 #include "pybind.h"
@@ -502,6 +506,84 @@ std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &w
     }
   }
   return {out, py::none(), py::cast(rsigma_py)};
+}
+
+namespace {
+
+// Zero-filled workspace of nvte_rmsnorm_fwd_add_rht_amax, one per device and stream. The kernel
+// leaves it zero-filled, so launches on the same stream reuse it without a memset (and a CUDA
+// graph can capture the launch).
+at::Tensor &rmsnorm_fwd_add_rht_amax_workspace(const std::vector<size_t> &shape) {
+  static std::mutex mutex;
+  static std::map<std::pair<int, cudaStream_t>, at::Tensor> workspaces;
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const std::pair<int, cudaStream_t> key{stream.device_index(), stream.stream()};
+  const auto bytes = static_cast<int64_t>(product(shape));
+  std::lock_guard<std::mutex> lock(mutex);
+  auto &workspace = workspaces[key];
+  if (!workspace.defined() || workspace.numel() < bytes) {
+    workspace =
+        at::zeros({bytes}, at::TensorOptions().dtype(at::kByte).device(at::kCUDA, key.first));
+  }
+  return workspace;
+}
+
+}  // namespace
+
+std::vector<py::object> rmsnorm_fwd_add_rht_amax(const std::optional<at::Tensor> &x,
+                                                 const at::Tensor &residual,
+                                                 const at::Tensor &weight, float eps,
+                                                 int random_sign_mask_t, const int sm_margin) {
+  at::cuda::CUDAGuard device_guard(residual.device());
+  NVTE_CHECK(residual.is_contiguous() && weight.is_contiguous(),
+             "residual and weight must be contiguous.");
+  NVTE_CHECK(!x.has_value() || x->is_contiguous(), "x must be contiguous.");
+
+  const int64_t rows = residual.numel() / residual.size(-1);
+  at::Tensor sum;
+  if (x.has_value()) {
+    sum = at::empty_like(residual);
+  }
+  auto z = at::empty_like(residual);
+  auto rsigma = at::empty({rows}, residual.options().dtype(at::kFloat));
+  auto amax = at::empty({2}, residual.options().dtype(at::kFloat));
+
+  TensorWrapper x_cu;
+  TensorWrapper sum_cu;
+  if (x.has_value()) {
+    x_cu = makeTransformerEngineTensor(*x);
+    sum_cu = makeTransformerEngineTensor(sum);
+  }
+  auto residual_cu = makeTransformerEngineTensor(residual);
+  auto weight_cu = makeTransformerEngineTensor(weight);
+  auto z_cu = makeTransformerEngineTensor(z);
+  auto rsigma_cu = makeTransformerEngineTensor(rsigma);
+  auto amax_cu = makeTransformerEngineTensor(amax);
+  const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+
+  // Query workspace size
+  TensorWrapper workspace;
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_rmsnorm_fwd_add_rht_amax(x_cu.data(), residual_cu.data(), weight_cu.data(), eps,
+                                  sum_cu.data(), z_cu.data(), rsigma_cu.data(), amax_cu.data(),
+                                  workspace.data(), sm_count, random_sign_mask_t,
+                                  at::cuda::getCurrentCUDAStream());
+  });
+  const auto workspace_shape = convertShape(workspace.shape());
+  auto &workspace_data = rmsnorm_fwd_add_rht_amax_workspace(workspace_shape);
+  workspace =
+      makeTransformerEngineTensor(workspace_data.data_ptr(), workspace_shape, workspace.dtype());
+
+  // Launch kernel
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_rmsnorm_fwd_add_rht_amax(x_cu.data(), residual_cu.data(), weight_cu.data(), eps,
+                                  sum_cu.data(), z_cu.data(), rsigma_cu.data(), amax_cu.data(),
+                                  workspace.data(), sm_count, random_sign_mask_t,
+                                  at::cuda::getCurrentCUDAStream());
+  });
+
+  return {x.has_value() ? py::cast(sum) : py::none(), py::cast(z), py::cast(rsigma),
+          py::cast(amax)};
 }
 
 }  // namespace transformer_engine::pytorch

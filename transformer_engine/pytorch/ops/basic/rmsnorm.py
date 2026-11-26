@@ -16,6 +16,7 @@ from transformer_engine_torch import rmsnorm_bwd, rmsnorm_fwd
 from ...constants import TE_DType
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...export import is_in_onnx_export_mode
+from ...fused_add_rmsnorm import take_precomputed_rmsnorm
 from ...tensor import Quantizer
 from ...utils import (
     canonicalize_device,
@@ -186,16 +187,12 @@ class RMSNorm(BasicOperation):
 
         # Compute RMSNorm
         sm_margin = self._sm_margins["forward" if ctx.requires_grad else "inference"]
-        y, _, rstdevs = rmsnorm_fwd(
-            x,
-            w,
-            self.eps,
-            None,
-            next_op_input_quantizer,
-            TE_DType[dtype],
-            sm_margin,
-            self.zero_centered_gamma,
-        )
+        args = (x, w, self.eps, None, next_op_input_quantizer, TE_DType[dtype])
+        # Result precomputed by a fused residual add on this input (see fused_add_rmsnorm.py)
+        out = take_precomputed_rmsnorm(*args, self.zero_centered_gamma)
+        if out is None:
+            out = rmsnorm_fwd(*args, sm_margin, self.zero_centered_gamma)
+        y, _, rstdevs = out
 
         # Save state for backward pass
         if ctx.requires_grad:

@@ -14,6 +14,7 @@ from .. import cpp_extensions as tex
 from ..constants import TE_DType
 from ..distributed import in_fp8_activation_recompute_phase
 from ..export import is_in_onnx_export_mode
+from ..fused_add_rmsnorm import take_precomputed_rmsnorm
 from ..quantization import FP8GlobalStateManager
 from ..tensor.hybrid_tensor import HybridQuantizer
 from ..utils import get_default_init_method
@@ -104,6 +105,16 @@ def apply_normalization(
     zero_centered_gamma: bool,
 ):
     """Apply normalization to input."""
+    otype = TE_DType[output_dtype] if output_dtype in TE_DType else output_dtype
+
+    # Result precomputed by a fused residual add on this input (see fused_add_rmsnorm.py)
+    if normalization == "RMSNorm" and ln_bias is None:
+        out = take_precomputed_rmsnorm(
+            inputmat, ln_weight, eps, ln_out, output_quantizer, otype, zero_centered_gamma
+        )
+        if out is not None:
+            return out
+
     normalization_func = _get_normalization_func(normalization, True)
 
     inputs = (inputmat, ln_weight) if ln_bias is None else (inputmat, ln_weight, ln_bias)
@@ -113,7 +124,7 @@ def apply_normalization(
         eps,
         ln_out,
         output_quantizer,
-        TE_DType[output_dtype] if output_dtype in TE_DType else output_dtype,
+        otype,
         fwd_ln_sm_margin,
         zero_centered_gamma,
     )

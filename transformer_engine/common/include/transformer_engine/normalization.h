@@ -169,6 +169,49 @@ void nvte_rmsnorm_bwd_add(const NVTETensor dz, const NVTETensor x, const NVTETen
                           NVTETensor dgamma, NVTETensor workspace, const int multiprocessorCount,
                           const bool zero_centered_gamma, cudaStream_t stream);
 
+/*! \brief Compute a residual add, RMSNorm and the NVFP4 random Hadamard transform amaxes of
+ *  the RMSNorm output in one pass.
+ *
+ * The formulas used:
+ * @f[
+ * s = x + residual, \quad z = \frac{s}{RMS_\varepsilon(s)}\gamma
+ * @f]
+ * with @f$ s @f$ rounded to BF16 before the normalization. amax[0] is @f$ \max|z| @f$ and
+ * amax[1] is the maximum absolute value of the BF16 16-point random Hadamard transform of
+ * @f$ z^T @f$ along the rows, i.e. the rowwise and columnwise amaxes that an NVFP4 quantizer with
+ * RHT and post-RHT amax computes for z. Every output is bitwise equal to the one of the separate
+ * BF16 add, nvte_rmsnorm_fwd and nvte_hadamard_transform_amax calls, so z can be cast with the
+ * precomputed amaxes.
+ *
+ * Supports BF16 tensors with H = 4096 and N a multiple of 16 on devices of compute capability
+ * 10.0 or newer.
+ *
+ * Calling this function with workspace set to an empty tensor will not perform the operation,
+ * but instead set the shape and type of the workspace tensor to the required values. The
+ * workspace must be zero-filled before its first use; the operation leaves it zero-filled, so it
+ * can be reused by later calls on the same stream without a memset.
+ *
+ *  \param[in]     x                   Input tensor of shape [N, H], or an empty tensor to normalize
+ *                                     residual without an add (sum is then not written).
+ *  \param[in]     residual            Residual tensor of shape [N, H].
+ *  \param[in]     gamma               Gamma tensor of shape [H].
+ *  \param[in]     epsilon             Value added to denominator for numerical stability.
+ *  \param[out]    sum                 Sum x + residual of shape [N, H].
+ *  \param[out]    z                   RMSNorm output of shape [N, H].
+ *  \param[out]    rsigma              Reciprocal of the root mean square of s. Shape: [N].
+ *  \param[out]    amax                FP32 tensor with the 2 amaxes (rowwise, columnwise RHT).
+ *  \param[out]    workspace           Workspace tensor.
+ *  \param[in]     multiprocessorCount Number of SMs the operation may use.
+ *  \param[in]     random_sign_mask_t  16-bit sign mask of the columnwise random Hadamard
+ *                                     transform.
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_rmsnorm_fwd_add_rht_amax(const NVTETensor x, const NVTETensor residual,
+                                   const NVTETensor gamma, const float epsilon, NVTETensor sum,
+                                   NVTETensor z, NVTETensor rsigma, NVTETensor amax,
+                                   NVTETensor workspace, const int multiprocessorCount,
+                                   const int random_sign_mask_t, cudaStream_t stream);
+
 /*! \brief Set whether to enable cuDNN backend for normalization forward.
  *
  *  \param[in]  enable  Whether to enable cuDNN backend.

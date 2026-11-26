@@ -383,6 +383,11 @@ std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &w
                                     py::object ln_out, py::handle quantizer, DType otype,
                                     const int sm_margin, const bool zero_centered_gamma);
 
+std::vector<py::object> rmsnorm_fwd_add_rht_amax(const std::optional<at::Tensor> &x,
+                                                 const at::Tensor &residual,
+                                                 const at::Tensor &weight, float eps,
+                                                 int random_sign_mask_t, const int sm_margin);
+
 /***************************************************************************************************
  * Memory allocation
  **************************************************************************************************/
