@@ -504,6 +504,8 @@ py::object dropout_bwd(const at::Tensor &grad_output, const at::Tensor &mask,
                        const float dropout_probability,
                        std::optional<at::Tensor> grad_input = std::nullopt);
 
+at::Tensor philox_rng_state(int64_t rng_elts_per_thread);
+
 /***************************************************************************************************
  * Softmax
  **************************************************************************************************/

@@ -6,6 +6,10 @@ import random
 import pytest
 import torch
 from transformer_engine.pytorch import parallel_cross_entropy
+from transformer_engine.pytorch.triton.lm_head_fp8_backward import (
+    cross_entropy_fp8_grad,
+    lm_head_fp8_backward,
+)
 
 from utils import dtype_tols
 
@@ -523,3 +527,156 @@ def test_parallel_cross_entropy_return_argmax_nan():
             target = torch.zeros(logits.shape[:-1], dtype=torch.long, device="cuda")
             _, argmax = parallel_cross_entropy(logits, target, return_argmax=True)
             torch.testing.assert_close(argmax, torch.argmax(logits, dim=-1), rtol=0, atol=0)
+
+
+def _lm_head_fp8_inputs(batch, seq, hidden, vocab, n_ignored=5, seed=1234):
+    """Sequence-first LM-head inputs: [s * b, H] input, [V, H] weight, [b, s] targets."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    inp = torch.randn(seq * batch, hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    weight = (0.05 * torch.randn(vocab, hidden, generator=gen, device="cuda")).to(torch.bfloat16)
+    target = torch.randint(0, vocab, (batch, seq), generator=gen, device="cuda")
+    target[0, torch.randperm(seq, generator=gen, device="cuda")[:n_ignored]] = -100
+    return inp, weight, target
+
+
+def _reference_cross_entropy(logits, target, batch):
+    """Per-token loss [b, s] and the gradient of its mean over tokens, rows in [s, b] order."""
+    tgt = target.t().reshape(-1)
+    ref_logits = logits.float().requires_grad_()
+    loss = torch.nn.functional.cross_entropy(ref_logits, tgt, reduction="none")
+    n_tokens = (tgt != -100).sum()
+    (loss.sum() / n_tokens).backward()
+    return loss.detach().reshape(-1, batch).t(), ref_logits.grad, 1.0 / n_tokens.float()
+
+
+@pytest.mark.parametrize("vocab", [4000, 128256])
+def test_cross_entropy_fp8_grad(vocab):
+    """Loss as in float32 and an E4M3 row-scaled gradient within one E4M3 step of the exact one."""
+    batch, seq = 2, 64
+    inp, weight, target = _lm_head_fp8_inputs(batch, seq, 256, vocab)
+    logits = inp @ weight.t()
+    ref_loss, ref_grad, grad_scale = _reference_cross_entropy(logits, target, batch)
+
+    loss = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+    scale = grad_scale.reshape(1).cuda()
+    dlogits, row_scale = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+
+    assert dlogits.dtype == torch.float8_e4m3fn and row_scale.shape == (seq * batch,)
+    torch.testing.assert_close(loss, ref_loss, rtol=1e-5, atol=1e-5)
+    ignored = target.t().reshape(-1) == -100
+    assert torch.all(row_scale[ignored] == 0) and torch.all(dlogits[ignored].float() == 0)
+    grad = dlogits.float() * row_scale[:, None]
+    # Stochastic rounding picks one of the two neighbouring E4M3 values: the error is below one
+    # E4M3 step, 2^-3 relative for normal values and 2^-9 of the row scale for subnormal ones.
+    bound = torch.maximum(ref_grad.abs() / 8, row_scale[:, None] / 512) * (1 + 1e-5) + 1e-12
+    assert torch.all((grad - ref_grad).abs() <= bound)
+
+
+def test_cross_entropy_fp8_grad_stochastic_rounding():
+    """The rounding is reproducible from the generator state, fresh per call and unbiased."""
+    batch, seq = 1, 32
+    inp, weight, target = _lm_head_fp8_inputs(batch, seq, 256, 4000, n_ignored=0)
+    logits = inp @ weight.t()
+    _, ref_grad, grad_scale = _reference_cross_entropy(logits, target, batch)
+    loss = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+    scale = grad_scale.reshape(1).cuda()
+
+    torch.cuda.manual_seed(7)
+    first, row_scale = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+    second, _ = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+    torch.cuda.manual_seed(7)
+    repeat, _ = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+    assert torch.equal(first.view(torch.uint8), repeat.view(torch.uint8))
+    assert not torch.equal(first.view(torch.uint8), second.view(torch.uint8))
+
+    draws = 256
+    mean = torch.zeros_like(ref_grad)
+    for _ in range(draws):
+        dlogits, _ = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+        mean += dlogits.float() * row_scale[:, None]
+    mean /= draws
+    single = (first.float() * row_scale[:, None] - ref_grad).norm()
+    # Unbiased rounding: averaging N draws shrinks the error by about sqrt(N) = 16
+    assert (mean - ref_grad).norm() < single / 8
+
+
+@pytest.mark.parametrize("use_main_grad", [False, True], ids=["grad", "main_grad"])
+def test_lm_head_fp8_backward(use_main_grad):
+    """FP8 dgrad/wgrad against float32 GEMMs of the dequantized gradient."""
+    batch, seq, hidden, vocab = 2, 128, 512, 4000
+    inp, weight, target = _lm_head_fp8_inputs(batch, seq, hidden, vocab)
+    logits = inp @ weight.t()
+    _, _, grad_scale = _reference_cross_entropy(logits, target, batch)
+    loss = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+    dlogits, row_scale = cross_entropy_fp8_grad(
+        logits, target, loss, grad_scale.reshape(1).cuda(), batch
+    )
+    grad = dlogits.float() * row_scale[:, None]
+    dgrad_scale = torch.tensor([0.5], device="cuda")
+    ref_dgrad = (grad @ weight.float()) * 0.5
+    ref_wgrad = grad.t() @ inp.float()
+
+    main_grad = None
+    if use_main_grad:
+        main_grad = torch.randn(vocab, hidden, device="cuda")
+        initial = main_grad.clone()
+    dgrad, wgrad = lm_head_fp8_backward(
+        inp, weight, dlogits, row_scale, dgrad_scale, main_grad=main_grad
+    )
+    if use_main_grad:
+        assert wgrad is None
+        wgrad = main_grad - initial
+    else:
+        assert wgrad.dtype == weight.dtype
+    assert dgrad.dtype == inp.dtype
+
+    def rel_err(a, b):
+        return ((a.float() - b).norm() / b.norm()).item()
+
+    # Per-tensor E4M3 weight (dgrad) and stochastically rounded E4M3 input (wgrad)
+    assert rel_err(dgrad, ref_dgrad) < 0.05
+    assert rel_err(wgrad, ref_wgrad) < 0.05
+
+    if use_main_grad:
+        # Accumulate and overwrite from the same generator state
+        before = main_grad.clone()
+        torch.cuda.manual_seed(11)
+        lm_head_fp8_backward(inp, weight, dlogits, row_scale, dgrad_scale, main_grad, True)
+        accumulated = main_grad.clone()
+        torch.cuda.manual_seed(11)
+        lm_head_fp8_backward(inp, weight, dlogits, row_scale, dgrad_scale, main_grad, False)
+        torch.testing.assert_close(accumulated, before + main_grad, rtol=1e-6, atol=1e-6)
+
+
+def test_lm_head_fp8_backward_cuda_graph():
+    """A CUDA graph replay draws fresh rounding noise and equals eager execution from the same
+    generator state."""
+    batch, seq, hidden, vocab = 2, 64, 256, 4000
+    inp, weight, target = _lm_head_fp8_inputs(batch, seq, hidden, vocab)
+    logits = inp @ weight.t()
+    scale = torch.tensor([1.0 / (batch * seq)], device="cuda")
+    loss = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+
+    def step():
+        dlogits, row_scale = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+        return (dlogits,) + lm_head_fp8_backward(inp, weight, dlogits, row_scale)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = step()
+
+    torch.cuda.manual_seed(5)
+    graph.replay()
+    first = [t.clone() for t in static_out]
+    graph.replay()
+    assert not torch.equal(first[0].view(torch.uint8), static_out[0].view(torch.uint8))
+    assert not torch.equal(first[2], static_out[2])
+    torch.cuda.manual_seed(5)
+    eager = step()
+    for a, b in zip(first, eager):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
