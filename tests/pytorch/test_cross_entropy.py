@@ -648,6 +648,42 @@ def test_lm_head_fp8_backward(use_main_grad):
         torch.testing.assert_close(accumulated, before + main_grad, rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_lm_head_fp8_backward_wgrad_alpha(main_grad_dtype):
+    """A power-of-two wgrad_alpha (e.g. a data-parallel 1/dp folded into the GEMM) equals scaling
+    the written weight gradient afterwards, bitwise; the input gradient is unchanged."""
+    batch, seq, hidden, vocab = 2, 128, 512, 4000
+    inp, weight, target = _lm_head_fp8_inputs(batch, seq, hidden, vocab)
+    logits = inp @ weight.t()
+    loss = torch.empty((batch, seq), dtype=torch.float32, device="cuda")
+    scale = torch.tensor([1.0 / (batch * seq)], device="cuda")
+    dlogits, row_scale = cross_entropy_fp8_grad(logits, target, loss, scale, batch)
+    alpha = 2.0**-3
+
+    def run(wgrad_alpha, main_grad):
+        torch.cuda.manual_seed(13)
+        return lm_head_fp8_backward(
+            inp,
+            weight,
+            dlogits,
+            row_scale,
+            main_grad=main_grad,
+            accumulate=False,
+            wgrad_alpha=wgrad_alpha,
+        )
+
+    plain = torch.full((vocab, hidden), float("nan"), dtype=main_grad_dtype, device="cuda")
+    scaled = torch.full_like(plain, float("nan"))
+    dgrad_plain, _ = run(1.0, plain)
+    dgrad_scaled, _ = run(alpha, scaled)
+    assert torch.equal(dgrad_plain, dgrad_scaled)
+    assert torch.equal(scaled, plain * alpha)
+
+    _, wgrad_plain = run(1.0, None)
+    _, wgrad_scaled = run(alpha, None)
+    assert torch.equal(wgrad_scaled, wgrad_plain * alpha)
+
+
 def test_lm_head_fp8_backward_cuda_graph():
     """A CUDA graph replay draws fresh rounding noise and equals eager execution from the same
     generator state."""

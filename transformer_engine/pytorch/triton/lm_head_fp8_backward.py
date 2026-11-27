@@ -212,6 +212,7 @@ def lm_head_fp8_backward(
     dgrad_scale: Optional[torch.Tensor] = None,
     main_grad: Optional[torch.Tensor] = None,
     accumulate: bool = True,
+    wgrad_alpha: float = 1.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """FP8 dgrad and wgrad of ``logits = inp @ weight^T`` from the output of
     :func:`cross_entropy_fp8_grad`.
@@ -230,6 +231,11 @@ def lm_head_fp8_backward(
     main_grad : torch.Tensor, optional
         [V, H] buffer that receives the weight gradient (accumulated into it unless
         ``accumulate`` is False). Without it the weight gradient is returned in weight's dtype.
+    wgrad_alpha : float, optional
+        Factor the wgrad GEMM applies to its product in fp32 before rounding to the output dtype
+        (default 1), e.g. a data-parallel gradient scaling that the caller would otherwise apply
+        to ``main_grad`` afterwards. With a power of two it equals that later scaling bitwise
+        (barring underflow) when ``main_grad`` is overwritten.
 
     Returns
     -------
@@ -262,12 +268,18 @@ def lm_head_fp8_backward(
             dlogits_fp8,
             out_dtype=main_grad.dtype,
             layout="NT",
+            alpha=wgrad_alpha,
             out=main_grad,
             accumulate=accumulate,
             use_split_accumulator=True,
         )
         return grad_input, None
     grad_weight = general_gemm(
-        inp_fp8, dlogits_fp8, out_dtype=weight.dtype, layout="NT", use_split_accumulator=True
+        inp_fp8,
+        dlogits_fp8,
+        out_dtype=weight.dtype,
+        alpha=wgrad_alpha,
+        layout="NT",
+        use_split_accumulator=True,
     )[0]
     return grad_input, grad_weight
