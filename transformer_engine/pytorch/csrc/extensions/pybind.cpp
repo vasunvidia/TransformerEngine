@@ -344,6 +344,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         transformer_engine::pytorch::dswiglu_hadamard_transform_amax,
         "Backward of SwiGLU and the (pre-RHT, post-RHT) NVFP4 amaxes of its result",
         py::arg("grad"), py::arg("fwd_input"), py::arg("random_sign_mask_t"));
+  m.def("add_hadamard_transform_amax", transformer_engine::pytorch::add_hadamard_transform_amax,
+        "BF16 a + b and the (pre-RHT, post-RHT) NVFP4 amaxes of the sum", py::arg("a"),
+        py::arg("b"), py::arg("random_sign_mask_t"));
+  m.def("fused_qkv_rope_backward_hadamard_transform_amax",
+        transformer_engine::pytorch::fused_qkv_rope_backward_hadamard_transform_amax,
+        "Fused QKV RoPE backward and the (pre-RHT, post-RHT) NVFP4 amaxes of the result",
+        py::arg("grad_q"), py::arg("grad_k"), py::arg("grad_v"), py::arg("cos"), py::arg("sin"),
+        py::arg("random_sign_mask_t"));
+  m.def("nvfp4_quantize_rowwise_with_amax_hadamard_transform_amax",
+        transformer_engine::pytorch::nvfp4_quantize_rowwise_with_amax_hadamard_transform_amax,
+        "Row-wise NVFP4 cast with a given amax and the (pre-RHT, post-RHT) amaxes of the input",
+        py::arg("tensor"), py::arg("quantizer"), py::arg("rowwise_amax"));
   m.def("dsituglu", transformer_engine::pytorch::dsituglu, "Backward of SiTU-GLU", py::arg("grad"),
         py::arg("fwd_input"), py::arg("quantizer"), py::arg("beta1") = 4.0f,
         py::arg("beta2") = 25.0f);

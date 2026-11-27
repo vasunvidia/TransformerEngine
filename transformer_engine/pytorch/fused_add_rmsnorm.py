@@ -14,7 +14,15 @@ eligible NVFP4 quantizer, it takes the precomputed result and only runs the cast
 precomputed amaxes (``nvfp4_quantize_with_amax``). Every output is bitwise equal to the unfused
 computation. Any other consumer of ``s`` runs the unfused RMSNorm.
 
-Enabled with ``NVTE_FUSED_ADD_RMSNORM_NVFP4=1`` (default off). Supports BF16 inputs with hidden
+Enabled with ``NVTE_FUSED_ADD_RMSNORM_NVFP4=1`` (default off).
+
+With ``NVTE_FUSED_ADD_RMSNORM_NVFP4_GRAD_RHT_AMAX=1`` (default off) the gradient of ``s`` also
+comes with its NVFP4 RHT amaxes. ``s`` has two consumers, its RMSNorm and the next residual add,
+whose gradients autograd adds before they reach the linear layer that produced ``x`` (which casts
+that sum with RHT). The add then returns, besides ``s``, a second output sharing ``s``'s storage
+that the next :func:`fused_add_rmsnorm_nvfp4` takes as its residual; the backward receives the two
+gradients apart and adds them with :func:`.precomputed_rht_amax.add_with_rht_amax`, which also
+registers the amaxes of the sum for its cast. The sum is bitwise autograd's. Supports BF16 inputs with hidden
 size 4096 and a number of tokens divisible by 16 on devices of compute capability 10.0 or newer
 that allow about 193 KiB of shared memory per block, and only when the RMSNorm forward runs on
 Transformer Engine's kernels (``NVTE_NORM_FWD_USE_CUDNN`` unset or 0).
@@ -24,7 +32,7 @@ two calls must run on the same thread with no other fused add in between.
 
 import os
 import struct
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -72,6 +80,8 @@ class _Precomputed:
 
 
 _pending: Optional[_Precomputed] = None
+# (sum, residual output) of the last add with a separate output for the residual consumer
+_last_split: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 _sign_masks = {}
 _supported_devices = {}
 
@@ -79,6 +89,11 @@ _supported_devices = {}
 def is_fused_add_rmsnorm_nvfp4_enabled() -> bool:
     """Whether the fused residual add + RMSNorm + NVFP4 amax path is enabled."""
     return os.getenv("NVTE_FUSED_ADD_RMSNORM_NVFP4", "0") == "1"
+
+
+def is_fused_add_rmsnorm_nvfp4_grad_rht_amax_enabled() -> bool:
+    """Whether the fused residual add also emits the NVFP4 RHT amaxes of its gradient."""
+    return os.getenv("NVTE_FUSED_ADD_RMSNORM_NVFP4_GRAD_RHT_AMAX", "0") == "1"
 
 
 def _device_index(device: torch.device) -> int:
@@ -193,6 +208,36 @@ class _FusedAdd(torch.autograd.Function):
         return grad_sum, grad_sum, None, None, None
 
 
+class _FusedAddSplitResidual(torch.autograd.Function):
+    """:class:`_FusedAdd` with a second output, sharing the sum's storage, for the residual
+    consumer, so that the backward gets the two gradients of the sum apart and adds them with the
+    NVFP4 RHT amaxes of the result."""
+
+    @staticmethod
+    def forward(ctx, x, residual, weight, eps, sign_mask):
+        # pylint: disable=missing-function-docstring
+        sum_, z, rsigma, amax = tex.rmsnorm_fwd_add_rht_amax(x, residual, weight, eps, sign_mask, 0)
+        residual_out = torch.empty(0, dtype=sum_.dtype, device=sum_.device).set_(
+            sum_.untyped_storage(), sum_.storage_offset(), sum_.size(), sum_.stride()
+        )
+        ctx.mark_non_differentiable(z, rsigma, amax)
+        # A consumer that is not used gets None, not zeros
+        ctx.set_materialize_grads(False)
+        return sum_, residual_out, z, rsigma, amax
+
+    @staticmethod
+    def backward(ctx, grad_sum, grad_residual_out, *unused_grads):
+        # pylint: disable=missing-function-docstring
+        if grad_sum is None or grad_residual_out is None:
+            grad = grad_sum if grad_residual_out is None else grad_residual_out
+        else:
+            # pylint: disable=import-outside-toplevel
+            from .precomputed_rht_amax import add_with_rht_amax
+
+            grad = add_with_rht_amax(grad_sum, grad_residual_out)
+        return grad, grad, None, None, None
+
+
 def fused_add_rmsnorm_nvfp4(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -222,7 +267,7 @@ def fused_add_rmsnorm_nvfp4(
     eps : float
         RMSNorm epsilon of the consumer.
     """
-    global _pending
+    global _pending, _last_split
     if (
         not is_fused_add_rmsnorm_nvfp4_enabled()
         or _norm_fwd_uses_cudnn()
@@ -231,7 +276,17 @@ def fused_add_rmsnorm_nvfp4(
         return None
     weight = weight.detach()
     sign_mask = _rht_sign_mask(x.device)
-    sum_, z, rsigma, amax = _FusedAdd.apply(x, residual, weight, float(eps), sign_mask)
+    # The residual is the sum of the previous add: take its output for the residual consumer
+    last_split, _last_split = _last_split, None
+    if last_split is not None and residual is last_split[0]:
+        residual = last_split[1]
+    if is_fused_add_rmsnorm_nvfp4_grad_rht_amax_enabled() and torch.is_grad_enabled():
+        sum_, residual_out, z, rsigma, amax = _FusedAddSplitResidual.apply(
+            x, residual, weight, float(eps), sign_mask
+        )
+        _last_split = (sum_, residual_out)
+    else:
+        sum_, z, rsigma, amax = _FusedAdd.apply(x, residual, weight, float(eps), sign_mask)
     _pending = _Precomputed(sum_, weight, float(eps), sign_mask, z, rsigma, amax)
     return sum_
 

@@ -309,6 +309,24 @@ py::object dswiglu(const at::Tensor &grad, const at::Tensor &input, py::handle q
 std::tuple<at::Tensor, at::Tensor, at::Tensor> dswiglu_hadamard_transform_amax(
     const at::Tensor &grad, const at::Tensor &input, int random_sign_mask_t);
 
+/*! @brief BF16 a + b and the (pre-RHT, post-RHT) NVFP4 amaxes of the sum, as a 2-element tensor */
+std::tuple<at::Tensor, at::Tensor> add_hadamard_transform_amax(const at::Tensor &a,
+                                                               const at::Tensor &b,
+                                                               int random_sign_mask_t);
+
+/*! @brief RoPE backward of the fused QKV gradients (SBHD, FP32 cos/sin tables) and the
+ *  (pre-RHT, post-RHT) NVFP4 amaxes of the result, as a 2-element tensor
+ */
+std::tuple<at::Tensor, at::Tensor> fused_qkv_rope_backward_hadamard_transform_amax(
+    const at::Tensor &grad_q, const at::Tensor &grad_k, const at::Tensor &grad_v,
+    const at::Tensor &cos, const at::Tensor &sin, int random_sign_mask_t);
+
+/*! @brief Row-wise NVFP4 cast with a given amax, and the (pre-RHT, post-RHT) NVFP4 amaxes of
+ *  the input for its later column-wise RHT cast, as a 2-element tensor
+ */
+std::tuple<py::object, at::Tensor> nvfp4_quantize_rowwise_with_amax_hadamard_transform_amax(
+    const at::Tensor &tensor, py::handle quantizer, const at::Tensor &rowwise_amax);
+
 py::object situglu(const at::Tensor &input, py::handle quantizer, float beta1, float beta2);
 
 py::object dsituglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer,

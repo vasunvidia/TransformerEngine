@@ -11,6 +11,7 @@ import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
 from transformer_engine.common.recipe import NVFP4BlockScaling
 from transformer_engine.pytorch import fused_add_rmsnorm as far
+from transformer_engine.pytorch import precomputed_rht_amax
 from transformer_engine.pytorch.fused_add_rmsnorm import fused_add_rmsnorm_nvfp4
 from transformer_engine.pytorch.module._common import apply_normalization
 from transformer_engine.pytorch.quantization import RecipeState
@@ -39,8 +40,10 @@ FIELDS = (
 def enable_fusion(monkeypatch):
     monkeypatch.setenv("NVTE_FUSED_ADD_RMSNORM_NVFP4", "1")
     far._pending = None
+    far._last_split = None
     yield
     far._pending = None
+    far._last_split = None
 
 
 def recipe_input_quantizer(swizzled: bool = True, columnwise: bool = True):
@@ -336,3 +339,217 @@ def test_layer_fused_vs_unfused(module, monkeypatch):
     assert_bitwise_equal(fused[2], unfused[2], "residual grad")
     for name in unfused[3]:
         assert_bitwise_equal(fused[3][name], unfused[3][name], name)
+
+
+# Producers that emit the NVFP4 RHT amaxes of their output (precomputed_rht_amax)
+
+
+def recipe_grad_quantizer(stochastic_rounding: bool = False):
+    """Backward (grad output) quantizer as the NVFP4BlockScaling recipe builds it."""
+    state = RecipeState.create(NVFP4BlockScaling(), mode="backward", num_quantizers=2)
+    quantizer = state.make_quantizers()[0]
+    quantizer.set_usage(rowwise=True, columnwise=True)
+    quantizer.internal = True
+    quantizer.optimize_for_gemm = True
+    quantizer.stochastic_rounding = stochastic_rounding
+    return quantizer
+
+
+def hadamard_amaxes(t, quantizer):
+    """Both amaxes as the NVFP4 cast computes them."""
+    out = tex.quantize(t, quantizer)
+    return out._amax_rowwise, out._amax_columnwise
+
+
+@pytest.fixture
+def clean_registry():
+    precomputed_rht_amax._clear()
+    yield
+    precomputed_rht_amax._clear()
+
+
+@pytest.mark.parametrize("shape", [(16384, HIDDEN), (8192, 2, HIDDEN), (64, 128), (192, 3, 256)])
+@pytest.mark.parametrize("kind", ["randn", "outliers", "tiny"])
+def test_add_hadamard_transform_amax(shape, kind, clean_registry):
+    """The sum is torch's BF16 add and the amaxes are those of the NVFP4 RHT cast."""
+    a, b, _ = make_inputs(kind, shape)
+    quantizer = recipe_grad_quantizer()
+    mask = int(quantizer.rht_matrix_random_sign_mask_t)
+    ref_row, ref_col = hadamard_amaxes(a + b, quantizer)
+    for _ in range(2):  # the second launch reuses the workspace the first one left zero-filled
+        out, amax = tex.add_hadamard_transform_amax(a, b, mask)
+        assert_bitwise_equal(out, a + b, "sum")
+        assert_bitwise_equal(amax[0:1], ref_row, "amax rowwise")
+        assert_bitwise_equal(amax[1:2], ref_col, "amax columnwise")
+
+
+def test_add_with_rht_amax_registers_for_cast(clean_registry):
+    """The cast of the sum takes the registered amaxes (once) and equals the unfused cast."""
+    a, b, _ = make_inputs("rowscale", (4096, HIDDEN))
+    quantizer = recipe_grad_quantizer()
+    ref = quantizer(a + b)
+    out = precomputed_rht_amax.add_with_rht_amax(a, b)
+    calls = []
+    cast = tex.nvfp4_quantize_with_amax
+    try:
+        tex.nvfp4_quantize_with_amax = lambda *args: calls.append(1) or cast(*args)
+        assert_nvfp4_equal(quantizer(out), ref)
+        assert calls == [1]
+        assert_nvfp4_equal(quantizer(out), ref)  # taken once: computes the amaxes itself
+        assert calls == [1]
+    finally:
+        tex.nvfp4_quantize_with_amax = cast
+    # A tensor modified after its producer ran does not use the stale amaxes
+    out = precomputed_rht_amax.add_with_rht_amax(a, b)
+    out.mul_(2.0)
+    assert precomputed_rht_amax.take_rht_amax(out, quantizer) is None
+    # Unsupported shapes fall back to a + b with nothing registered
+    out = precomputed_rht_amax.add_with_rht_amax(a[:100], b[:100])
+    assert_bitwise_equal(out, a[:100] + b[:100], "fallback sum")
+    assert precomputed_rht_amax.take_rht_amax(out, quantizer) is None
+
+
+def test_add_hadamard_transform_amax_cuda_graph():
+    """The add captures in a CUDA graph and replays without a workspace memset."""
+    a, b, _ = make_inputs("randn", (2048, HIDDEN))
+    mask = get_random_sign_mask_for_rht(True, torch.cuda.current_device())
+    _, amax_ref = tex.add_hadamard_transform_amax(a, b, mask)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        tex.add_hadamard_transform_amax(a, b, mask)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, amax = tex.add_hadamard_transform_amax(a, b, mask)
+    for _ in range(3):
+        amax.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_bitwise_equal(amax, amax_ref, "amax")
+
+
+def _rope_inputs(s, b, groups, q_per_group, scale=1.0):
+    gen = torch.Generator(device="cuda").manual_seed(s + groups)
+    randn = lambda *size: torch.randn(*size, device="cuda", generator=gen) * scale
+    gq = randn(s, b, groups * q_per_group, 128).to(torch.bfloat16)
+    gk = randn(s, b, groups, 128).to(torch.bfloat16)
+    gv = randn(s, b, groups, 128).to(torch.bfloat16)
+    freqs = te.attention.RotaryPositionEmbedding(128, rotary_base=500000)(s + 3).contiguous()
+    cos = torch.cos(freqs).float().contiguous()
+    sin = torch.sin(freqs).float().contiguous()
+    return gq, gk, gv, freqs, cos, sin
+
+
+@pytest.mark.parametrize(
+    "s, b, groups, q_per_group", [(8192, 2, 8, 4), (256, 1, 2, 8), (96, 2, 4, 1), (64, 4, 1, 3)]
+)
+@pytest.mark.parametrize("scale", [1.0, 1e-3, 300.0])
+def test_fused_qkv_rope_backward_with_rht_amax(s, b, groups, q_per_group, scale, clean_registry):
+    """Bitwise TE's fused QKV RoPE backward (with the FP32 cos/sin tables of the frequencies),
+    with the amaxes of the NVFP4 RHT cast registered for the result."""
+    gq, gk, gv, freqs, cos, sin = _rope_inputs(s, b, groups, q_per_group, scale)
+    split = [q_per_group * 128, 128, 128]
+    ref = tex.fused_qkv_rope_backward(
+        gq, gk, gv, freqs, freqs, split, tex.NVTE_QKV_Format.NVTE_SBHD, False, 1, 0
+    )
+    out = precomputed_rht_amax.fused_qkv_rope_backward_with_rht_amax(gq, gk, gv, cos, sin, split)
+    assert out is not None and out.shape == ref.shape
+    assert_bitwise_equal(out, ref, "grad qkv")
+    # The QKV linear casts the gradient as [s * b, h_kv * (h_q / h_kv + 2) * d]
+    quantizer = recipe_grad_quantizer()
+    ref_row, ref_col = hadamard_amaxes(ref.view(s * b, -1), quantizer)
+    amax = precomputed_rht_amax.take_rht_amax(out.view(s * b, -1), quantizer)
+    assert amax is not None
+    assert_bitwise_equal(amax[0], ref_row, "amax rowwise")
+    assert_bitwise_equal(amax[1], ref_col, "amax columnwise")
+
+
+def test_fused_qkv_rope_backward_with_rht_amax_unsupported(clean_registry):
+    gq, gk, gv, _, cos, sin = _rope_inputs(96, 3, 2, 2)  # batch does not divide 64
+    assert (
+        precomputed_rht_amax.fused_qkv_rope_backward_with_rht_amax(
+            gq, gk, gv, cos, sin, [256, 128, 128]
+        )
+        is None
+    )
+    gq, gk, gv, _, cos, sin = _rope_inputs(96, 2, 2, 2)
+    assert (
+        precomputed_rht_amax.fused_qkv_rope_backward_with_rht_amax(
+            gq.float(), gk, gv, cos, sin, [256, 128, 128]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("swizzled", [True, False])
+@pytest.mark.parametrize("shape", [(16384, HIDDEN), (8192, 2, HIDDEN), (128, 128), (256, 512)])
+@pytest.mark.parametrize("kind", ["randn", "outliers", "tiny"])
+def test_rowwise_cast_with_rht_amax(swizzled, shape, kind, clean_registry):
+    """The row-wise cast equals nvfp4_quantize_with_amax; the later column-wise cast of the same
+    input takes the registered amaxes and equals the unfused one."""
+    x, _, _ = make_inputs(kind, shape)
+    row_quantizer = recipe_input_quantizer(swizzled, columnwise=False)
+    rowwise_amax = x.abs().amax().float().view(1)
+    ref = tex.nvfp4_quantize_with_amax(x, row_quantizer, rowwise_amax, rowwise_amax)
+    out = precomputed_rht_amax.nvfp4_quantize_rowwise_with_amax(
+        x, row_quantizer, rowwise_amax, rowwise_amax
+    )
+    assert_nvfp4_equal(out, ref)
+
+    col_quantizer = recipe_input_quantizer(swizzled, columnwise=True)
+    col_quantizer.set_usage(rowwise=False, columnwise=True)
+    col_ref = tex.quantize(x, col_quantizer)
+    col = col_quantizer(x)
+    assert not precomputed_rht_amax._saved_entries, "the column-wise cast did not take the amaxes"
+    assert_nvfp4_equal(col, col_ref)
+
+
+def test_rowwise_cast_with_rht_amax_registers_only_with_grad(clean_registry):
+    x, _, _ = make_inputs("randn", (256, HIDDEN))
+    quantizer = recipe_input_quantizer(columnwise=False)
+    amax = x.abs().amax().float().view(1)
+    with torch.no_grad():
+        precomputed_rht_amax.nvfp4_quantize_rowwise_with_amax(x, quantizer, amax, amax)
+    assert not precomputed_rht_amax._saved_entries
+    precomputed_rht_amax.nvfp4_quantize_rowwise_with_amax(x, quantizer, amax, amax)
+    assert len(precomputed_rht_amax._saved_entries) == 1
+
+
+def test_residual_grad_rht_amax(monkeypatch, clean_registry):
+    """Two chained fused adds with NVTE_FUSED_ADD_RMSNORM_NVFP4_GRAD_RHT_AMAX=1: the residual
+    gradients are bitwise those of the plain adds, and the summed gradient of the first sum comes
+    with its amaxes."""
+    monkeypatch.setenv("NVTE_FUSED_ADD_RMSNORM_NVFP4_GRAD_RHT_AMAX", "1")
+    x1, residual, weight = make_inputs("randn", (2048, HIDDEN), seed=3)
+    x2, _, _ = make_inputs("randn", (2048, HIDDEN), seed=4)
+    norm_grad = make_inputs("rowscale", (2048, HIDDEN), seed=5)[0]
+    out_grad = make_inputs("rowscale", (2048, HIDDEN), seed=6)[0]
+
+    def run(fused):
+        leaves = [t.detach().clone().requires_grad_(True) for t in (x1, residual, x2)]
+        a, r, b = leaves
+        far._last_split = None
+        s1 = fused_add_rmsnorm_nvfp4(a, r, weight, EPS) if fused else r + a
+        far._pending = None
+        s2 = fused_add_rmsnorm_nvfp4(b, s1, weight, EPS) if fused else s1 + b
+        far._pending = None
+        # s1 feeds an RMSNorm-like consumer and the second add
+        torch.autograd.backward([s1, s2], [norm_grad, out_grad])
+        return [t.grad for t in leaves]
+
+    ref = run(fused=False)
+    fused = run(fused=True)
+    for name, f, r in zip(("x1", "residual", "x2"), fused, ref):
+        assert_bitwise_equal(f, r, name + " grad")
+    # The gradient of the first sum (the one the linear layer producing x1 casts) was registered
+    entries = list(precomputed_rht_amax._grad_entries.values())
+    assert len(entries) == 1, "the summed gradient has no registered amaxes"
+    grad_sum = entries[0].tensor
+    assert_bitwise_equal(grad_sum, ref[0], "summed gradient")
+    quantizer = recipe_grad_quantizer()
+    ref_row, ref_col = hadamard_amaxes(grad_sum, quantizer)
+    amax = precomputed_rht_amax.take_rht_amax(grad_sum, quantizer)
+    assert amax is not None
+    assert_bitwise_equal(amax[0], ref_row, "amax rowwise")
+    assert_bitwise_equal(amax[1], ref_col, "amax columnwise")
