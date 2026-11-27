@@ -699,6 +699,23 @@ def check_gemm_dims(inp: torch.Tensor, weight: torch.Tensor) -> None:
     )
 
 
+def get_main_grad_scale(weight: torch.Tensor) -> float:
+    """Factor a weight-gradient GEMM applies when it writes ``weight.main_grad``.
+
+    Megatron-LM's DistributedDataParallel (``MCORE_DDP_SCALE_FOLD=1``) sets ``main_grad_scale``
+    on a parameter whose gradient pre-scaling (a power of two such as 1 / data-parallel size)
+    it leaves to the producer of ``main_grad``; the GEMM folds it into its alpha. Returns 1.0
+    when the attribute is absent.
+    """
+    return getattr(weight, "main_grad_scale", 1.0)
+
+
+def mark_main_grad_scaled(weight: torch.Tensor) -> None:
+    """Record that this backward pass wrote ``weight.main_grad`` with ``main_grad_scale``."""
+    if hasattr(weight, "main_grad_scale"):
+        weight.main_grad_scale_applied = True
+
+
 def is_bf16_compatible() -> bool:
     """Replaces torch.cuda.is_bf16_compatible() with an explicit
     check on device compute capability to enforce sm_80 or higher.

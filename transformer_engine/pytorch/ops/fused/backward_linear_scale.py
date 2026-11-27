@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from ...utils import clear_tensor_data
+from ...utils import clear_tensor_data, get_main_grad_scale, mark_main_grad_scaled
 from ..basic import BasicLinear, ConstantScale
 from .._common import (
     get_accumulate_flag_in_param,
@@ -60,11 +60,13 @@ class BackwardLinearScale(FusedOperation):
         # directly into it.
         accumulate_into_main_grad = linear_op._accumulate_into_main_grad
         grad_weight = None
+        main_grad_scale = 1.0
         if linear_op_ctx.weight_requires_grad and accumulate_into_main_grad:
             weight_param = linear_op.weight
             main_grad = get_main_grad_from_param(weight_param, op_label="BasicLinear")
             accumulate_into_main_grad = get_accumulate_flag_in_param(weight_param)
             grad_weight = main_grad.detach()
+            main_grad_scale = get_main_grad_scale(weight_param)
         else:
             accumulate_into_main_grad = False
 
@@ -76,7 +78,7 @@ class BackwardLinearScale(FusedOperation):
             input_requires_grad=linear_op_ctx.input_requires_grad,
             grad_input_alpha=scale_op.scale,
             weight_requires_grad=linear_op_ctx.weight_requires_grad,
-            grad_weight_alpha=scale_op.scale,
+            grad_weight_alpha=scale_op.scale * main_grad_scale,
             dtype=linear_op_ctx.dtype,
             grad_weight=grad_weight,
             accumulate_into_grad_weight=accumulate_into_main_grad,
@@ -95,6 +97,8 @@ class BackwardLinearScale(FusedOperation):
 
         # Megatron-LM wgrad fusion
         # Note: Return dummy tensor for grad weight if needed.
+        if main_grad_scale != 1.0:
+            mark_main_grad_scaled(linear_op.weight)
         if accumulate_into_main_grad:
             grad_weight = get_dummy_wgrads_for_params([linear_op.weight])[0]
 
