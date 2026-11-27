@@ -22,9 +22,17 @@ The second part checks the fast 2D quantization path enabled by
 two persistent kernels, ``nvte_nvfp4_2d_amax_quantize``): every output buffer must
 be byte-equal to the default path, for new tensors and in-place updates (with a
 noop flag), and linear layers must produce bitwise identical results.
+
+The last part checks the 2D quantization with a precomputed per-tensor amax
+(``nvfp4_2d_quantize_with_amax``) and the sharded 2D quantization used to all-gather
+NVFP4 weights across data-parallel ranks (``nvfp4_2d_shard_partial_amax``,
+``nvfp4_2d_shard_pack``, ``nvfp4_2d_shard_unpack``), also through the NVFP4 tensor
+producers of ``NVFP4Quantizer``: every output must be byte-equal to quantizing the
+full tensor.
 """
 
-from typing import Optional, Tuple
+import struct
+from typing import List, Optional, Tuple
 
 import pytest
 import torch
@@ -449,3 +457,290 @@ def test_nvfp4_fast_2d_weight_quantization_linear_layers(monkeypatch) -> None:
     assert len(ref) == len(out)
     for i, (a, b) in enumerate(zip(ref, out)):
         assert a.shape == b.shape and torch.equal(a.view(torch.int16), b.view(torch.int16)), i
+
+
+def _amax_of(x: torch.Tensor) -> torch.Tensor:
+    return x.abs().amax().float().reshape(1)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize(
+    "shape, kind",
+    [(s, "normal") for s in _LLAMA_WEIGHT_SHAPES[:4]]
+    + [(s, k) for s in _EDGE_SHAPES for k in ("normal", "wide", "sparse", "zeros", "tiny", "ties")],
+    ids=str,
+)
+@pytest.mark.parametrize("columnwise", [True, False], ids=["rowwise_columnwise", "rowwise"])
+@pytest.mark.parametrize("swizzled", [False, True], ids=["compact", "swizzled"])
+def test_nvfp4_2d_quantize_with_amax(
+    shape: Tuple[int, ...], kind: str, columnwise: bool, swizzled: bool, monkeypatch
+) -> None:
+    """2D quantization with a precomputed amax is bitwise equal to the default path."""
+    monkeypatch.delenv(_FAST_2D_ENV, raising=False)
+    quantizer = _make_quantizer(return_rowwise=True, return_transpose=columnwise)
+    quantizer.optimize_for_gemm = swizzled
+    x = _make_input(shape, kind, seed=0)
+    ref = quantizer(x)
+    amax = _amax_of(x)
+    if _fast_2d_supported():
+        names = _fast_2d_kernel_names(lambda: tex.nvfp4_2d_quantize_with_amax(x, quantizer, amax))
+        assert names and not any("amax_kernel" in n for n in names), names
+    _assert_bitwise_equal(ref, tex.nvfp4_2d_quantize_with_amax(x, quantizer, amax))
+    # In place, with a noop flag
+    dst = quantizer(_make_input(shape, "normal", seed=1))
+    tex.nvfp4_2d_quantize_with_amax(x, quantizer, amax, dst, torch.zeros(1, device="cuda"))
+    _assert_bitwise_equal(ref, dst)
+    before = [None if t is None else t.clone() for t in _unpack_quantized_tensor(dst)]
+    y = _make_input(shape, "wide", seed=2)
+    tex.nvfp4_2d_quantize_with_amax(y, quantizer, _amax_of(y), dst, torch.ones(1, device="cuda"))
+    for a, b in zip(before, _unpack_quantized_tensor(dst)):
+        assert a is None or torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+def test_nvfp4_2d_quantize_with_amax_unsupported_falls_back() -> None:
+    """Shapes the fast kernels do not support are quantized by the default path."""
+    quantizer = _make_quantizer(return_rowwise=True, return_transpose=True)
+    x = _make_input((192, 128), "normal", seed=0)
+    ref = quantizer(x)
+    out = tex.nvfp4_2d_quantize_with_amax(x, quantizer, _amax_of(x))
+    _assert_bitwise_equal(ref, out, shape_with_padded_scales=(192, 128))
+
+
+def _round16(x: int) -> int:
+    return (x + 15) // 16 * 16
+
+
+class _ShardedBucket:
+    """2D weights (and BF16 filler elements between them) in one flat BF16 bucket, sharded over
+    ``dp`` ranks, as a distributed optimizer shards its parameter buffers."""
+
+    def __init__(self, shapes: List[Tuple[int, int]], gap: int, dp: int, seed: int):
+        self.dp = dp
+        starts, pos = [], 0
+        for rows, cols in shapes:
+            starts.append(pos)
+            pos += rows * cols + gap
+        numel = -(-pos // (16 * dp)) * 16 * dp
+        self.flat = _make_input((numel,), "wide", seed=seed)
+        self.shard = numel // dp
+        self.weights = []
+        for (rows, cols), start in zip(shapes, starts):
+            n = rows * cols
+            own = [
+                (
+                    min(max(k * self.shard - start, 0), n),
+                    min(max((k + 1) * self.shard - start, 0), n),
+                )
+                for k in range(dp)
+            ]
+            self.weights.append(
+                dict(
+                    x=self.flat[start : start + n].view(rows, cols),
+                    start=start,
+                    n=n,
+                    rows=rows,
+                    cols=cols,
+                    own=own,
+                )
+            )
+        # Cut row groups, per-rank scale offsets, chunk layout
+        self.cuts = {}
+        n_cut_slots = 0
+        scale_total = [0] * dp
+        for i, w in enumerate(self.weights):
+            rgsz = 16 * w["cols"]
+            for k in range(1, dp):
+                b = k * self.shard
+                if w["start"] < b < w["start"] + w["n"] and (b - w["start"]) % rgsz:
+                    self.cuts[b] = (i, n_cut_slots)
+                    n_cut_slots += w["cols"] // 16
+            w["scale_offset"] = []
+            for k in range(dp):
+                lo, hi = w["own"][k]
+                cnt = (-(-hi // rgsz) - -(-lo // rgsz)) if hi > lo else 0
+                w["scale_offset"].append(scale_total[k])
+                scale_total[k] += cnt * (w["cols"] // 16)
+        self.data_bytes = _round16(self.shard // 2)
+        self.chunk = self.data_bytes + _round16(max(scale_total))
+        # amax slots: one per weight, then the cut row groups' block amaxes
+        self.cut_base = len(self.weights)
+        self.num_slots = self.cut_base + n_cut_slots
+        self.gathered = torch.full((dp * self.chunk,), 0x5A, dtype=torch.uint8, device="cuda")
+
+    def rank_tables(self, k: int):
+        """(pack items, partial-amax entries, number of units) of rank k."""
+        items, partial, unit = [], [], 0
+        chunk_ptr = self.gathered.data_ptr() + k * self.chunk
+        for i, w in enumerate(self.weights):
+            lo, hi = w["own"][k]
+            if hi <= lo:
+                continue
+            cols, rgsz = w["cols"], 16 * w["cols"]
+            rg_first, rg_last = lo // rgsz, (hi - 1) // rgsz
+            cut_lo = self.cuts.get(k * self.shard)
+            cut_hi = self.cuts.get((k + 1) * self.shard)
+            cut_lo_slot = self.cut_base + cut_lo[1] if cut_lo is not None and cut_lo[0] == i else -1
+            cut_hi_slot = self.cut_base + cut_hi[1] if cut_hi is not None and cut_hi[0] == i else -1
+            items.append(
+                (
+                    w["x"].data_ptr(),
+                    chunk_ptr,
+                    lo,
+                    hi,
+                    w["start"] - k * self.shard,
+                    self.data_bytes + w["scale_offset"][k],
+                    unit,
+                    cols,
+                    rg_first,
+                    -(-lo // rgsz),
+                    -(-hi // rgsz),
+                    i,
+                    cut_lo_slot,
+                    cut_hi_slot,
+                    rg_last,
+                )
+            )
+            unit += (rg_last - rg_first + 1) * (cols // 128)
+            for rg, slot in ((rg_first, cut_lo_slot), (rg_last, cut_hi_slot)):
+                if slot >= 0:
+                    partial.append(
+                        (
+                            w["x"].data_ptr() + rg * rgsz * 2,
+                            max(lo - rg * rgsz, 0),
+                            min(hi - rg * rgsz, rgsz),
+                            cols,
+                            slot,
+                        )
+                    )
+        return items, partial, unit
+
+    def scale_base(self, w) -> List[int]:
+        rgsz = 16 * w["cols"]
+        return [
+            (
+                self.data_bytes
+                + w["scale_offset"][k]
+                - -(-w["own"][k][0] // rgsz) * (w["cols"] // 16)
+                if w["own"][k][1] > w["own"][k][0]
+                else 0
+            )
+            for k in range(self.dp)
+        ]
+
+
+def _device_bytes(fmt: str, entries) -> torch.Tensor:
+    raw = b"".join(struct.pack(fmt, *e) for e in entries)
+    if not raw:
+        return torch.empty(0, dtype=torch.uint8, device="cuda")
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).cuda()
+
+
+def _shard_gather(bucket: _ShardedBucket) -> torch.Tensor:
+    """Run every rank's partial amax + (simulated MAX all-reduce) + pack; returns the amaxes."""
+    assert struct.calcsize("<QQqqqqqiiiiiiii") == tex.nvfp4_2d_shard_pack_item_size()
+    assert struct.calcsize("<Qqqii") == tex.nvfp4_2d_shard_partial_entry_size()
+    tables = [bucket.rank_tables(k) for k in range(bucket.dp)]
+    amax = torch.zeros(bucket.num_slots, dtype=torch.int32, device="cuda")
+    for k, (_, partial, _) in enumerate(tables):
+        local = torch.zeros_like(amax)
+        for i, w in enumerate(bucket.weights):  # max|w| of the rank's own elements
+            lo, hi = w["own"][k]
+            if hi > lo:
+                local[i] = (w["x"].view(-1)[lo:hi].view(torch.int16).int() & 0x7FFF).amax() << 16
+        tex.nvfp4_2d_shard_partial_amax(_device_bytes("<Qqqii", partial), local)
+        torch.maximum(amax, local, out=amax)
+    for items, _, units in tables:
+        tex.nvfp4_2d_shard_pack(_device_bytes("<QQqqqqqiiiiiiii", items), units, amax)
+    return amax
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize(
+    "shapes, gap, dp",
+    [
+        ([(256, 384), (384, 256), (128, 1280)], 64, 3),
+        ([(256, 384), (384, 256), (128, 1280)], 64, 8),
+        ([(1024, 512), (512, 256)], 192, 5),
+        ([(6144, 4096), (4096, 4096)], 4096, 8),  # Llama 3.1 8B QKV + projection
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("columnwise", [True, False], ids=["rowwise_columnwise", "rowwise"])
+@pytest.mark.parametrize("swizzled", [False, True], ids=["compact", "swizzled"])
+def test_nvfp4_2d_shard_pack_unpack(
+    shapes: List[Tuple[int, int]], gap: int, dp: int, columnwise: bool, swizzled: bool, monkeypatch
+) -> None:
+    """Every rank quantizes its shard of a bucket (row groups cut by shard boundaries included);
+    expanding the gathered chunks gives the bytes of quantizing each full weight."""
+    monkeypatch.delenv(_FAST_2D_ENV, raising=False)
+    bucket = _ShardedBucket(shapes, gap, dp, seed=7)
+    assert bucket.cuts, "the layout must cut row groups"
+    amax = _shard_gather(bucket)
+    quantizer = _make_quantizer(return_rowwise=True, return_transpose=columnwise)
+    quantizer.optimize_for_gemm = swizzled
+    for i, w in enumerate(bucket.weights):
+        ref = quantizer(w["x"])
+        out = tex.nvfp4_2d_shard_unpack(
+            bucket.gathered,
+            bucket.chunk,
+            bucket.shard,
+            w["start"],
+            bucket.scale_base(w),
+            amax[i : i + 1],
+            w["rows"],
+            w["cols"],
+            quantizer,
+        )
+        _assert_bitwise_equal(ref, out)
+        # In place, with a noop flag
+        dst = quantizer(_make_input(w["x"].shape, "normal", seed=1))
+        tex.nvfp4_2d_shard_unpack(
+            bucket.gathered,
+            bucket.chunk,
+            bucket.shard,
+            w["start"],
+            bucket.scale_base(w),
+            amax[i : i + 1],
+            w["rows"],
+            w["cols"],
+            quantizer,
+            dst,
+            torch.zeros(1, device="cuda"),
+        )
+        _assert_bitwise_equal(ref, dst)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("columnwise", [True, False], ids=["rowwise_columnwise", "rowwise"])
+def test_nvfp4_tensor_producer(columnwise: bool, monkeypatch) -> None:
+    """A registered producer replaces the quantization of the tensors it recognizes, in
+    quantize and update_quantized, and is skipped for other tensors."""
+    from transformer_engine.pytorch.tensor import nvfp4_tensor
+
+    monkeypatch.delenv(_FAST_2D_ENV, raising=False)
+    monkeypatch.setattr(nvfp4_tensor, "_NVFP4_TENSOR_PRODUCERS", [])
+    quantizer = _make_quantizer(return_rowwise=True, return_transpose=columnwise)
+    w = _make_input((256, 384), "wide", seed=3)
+    other = _make_input((256, 384), "normal", seed=4)
+    ref_w, ref_other = quantizer(w), quantizer(other)
+    amax = _amax_of(w)
+    calls = []
+
+    def producer(q, tensor, output, noop_flag):
+        if tensor.data_ptr() != w.data_ptr():
+            return None
+        calls.append(output is None)
+        return tex.nvfp4_2d_quantize_with_amax(tensor, q, amax, output, noop_flag)
+
+    nvfp4_tensor.register_nvfp4_tensor_producer(producer)
+    try:
+        _assert_bitwise_equal(ref_w, quantizer(w))
+        _assert_bitwise_equal(ref_other, quantizer(other))
+        dst = quantizer(other)
+        quantizer.update_quantized(w, dst)
+        _assert_bitwise_equal(ref_w, dst)
+        assert calls == [True, False]
+    finally:
+        nvfp4_tensor.unregister_nvfp4_tensor_producer(producer)
+    assert not nvfp4_tensor._NVFP4_TENSOR_PRODUCERS

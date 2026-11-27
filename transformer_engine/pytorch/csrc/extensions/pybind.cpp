@@ -183,6 +183,25 @@ void init_router_bindings(pybind11::module &m) {
 void bind_quantize_with_amax_extensions(py::module_ &m) {
   m.def("nvfp4_quantize_with_amax", nvfp4_quantize_with_amax, py::arg("tensor"),
         py::arg("quantizer"), py::arg("rowwise_amax"), py::arg("columnwise_amax"));
+  m.def("nvfp4_2d_quantize_with_amax", nvfp4_2d_quantize_with_amax,
+        "NVFP4 2D quantization with a precomputed per-tensor amax", py::arg("tensor"),
+        py::arg("quantizer"), py::arg("amax"), py::arg("output") = py::none(),
+        py::arg("noop_flag") = py::none());
+  m.def("nvfp4_2d_shard_partial_entry_size", nvfp4_2d_shard_partial_entry_size,
+        "Size in bytes of NVTENVFP4ShardPartialEntry");
+  m.def("nvfp4_2d_shard_pack_item_size", nvfp4_2d_shard_pack_item_size,
+        "Size in bytes of NVTENVFP4ShardPackItem");
+  m.def("nvfp4_2d_shard_partial_amax", nvfp4_2d_shard_partial_amax,
+        "Partial block amaxes of row groups cut by shard boundaries", py::arg("entries"),
+        py::arg("amax"));
+  m.def("nvfp4_2d_shard_pack", nvfp4_2d_shard_pack,
+        "NVFP4 2D quantization of data-parallel shards into gathered chunks", py::arg("items"),
+        py::arg("num_units"), py::arg("amax"));
+  m.def("nvfp4_2d_shard_unpack", nvfp4_2d_shard_unpack,
+        "Expand a weight of gathered sharded NVFP4 chunks into an NVFP4 tensor",
+        py::arg("gathered"), py::arg("chunk_bytes"), py::arg("shard"), py::arg("param_start"),
+        py::arg("scale_base"), py::arg("amax"), py::arg("rows"), py::arg("cols"),
+        py::arg("quantizer"), py::arg("output") = py::none(), py::arg("noop_flag") = py::none());
   m.def("nvfp4_group_quantize_with_amax", nvfp4_group_quantize_with_amax, py::arg("tensor"),
         py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
         py::arg("last_dims") = py::none(), py::arg("rowwise_amax"), py::arg("columnwise_amax"),

@@ -190,6 +190,113 @@ py::object nvfp4_quantize_with_amax(const at::Tensor &tensor, py::handle quantiz
   return output_py;
 }
 
+py::object nvfp4_2d_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
+                                       const at::Tensor &amax, const py::object &output,
+                                       std::optional<at::Tensor> noop_flag) {
+  init_extension();
+  NVTE_CHECK(detail::IsNVFP4Quantizers(quantizer.ptr()),
+             "nvfp4_2d_quantize_with_amax only supports NVFP4 quantizers.");
+  NVTE_CHECK(amax.is_cuda() && amax.scalar_type() == at::kFloat && amax.numel() == 1,
+             "nvfp4_2d_quantize_with_amax expects a float32 CUDA amax with one element.");
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+  auto input_contiguous = tensor.contiguous();
+  auto input_cpp = makeTransformerEngineTensor(input_contiguous);
+  TensorWrapper output_cpp;
+  py::object output_py;
+  if (output.is_none()) {
+    std::tie(output_cpp, output_py) =
+        quantizer_cpp->create_tensor(get_tensor_shape(input_cpp), input_cpp.dtype());
+  } else {
+    std::tie(output_cpp, output_py) = quantizer_cpp->convert_and_update_tensor(output);
+  }
+  std::optional<TensorWrapper> noop_flag_cpp;
+  if (noop_flag.has_value()) {
+    noop_flag_cpp = makeTransformerEngineTensor(*noop_flag);
+  }
+  auto amax_cpp = makeTransformerEngineTensor(amax);
+  // Unsupported quantizers and tensors compute the amax themselves.
+  if (!nvfp4_quantizer_cpp->quantize_2d_with_amax(input_cpp, amax_cpp, output_cpp, noop_flag_cpp)) {
+    quantizer_cpp->quantize(input_cpp, output_cpp, noop_flag_cpp);
+  }
+  return output_py;
+}
+
+int64_t nvfp4_2d_shard_partial_entry_size() { return sizeof(NVTENVFP4ShardPartialEntry); }
+
+int64_t nvfp4_2d_shard_pack_item_size() { return sizeof(NVTENVFP4ShardPackItem); }
+
+void nvfp4_2d_shard_partial_amax(const at::Tensor &entries, at::Tensor amax) {
+  constexpr int64_t entry_size = sizeof(NVTENVFP4ShardPartialEntry);
+  NVTE_CHECK(entries.is_cuda() && entries.scalar_type() == at::kByte && entries.is_contiguous() &&
+                 entries.numel() % entry_size == 0,
+             "entries must be a contiguous uint8 CUDA tensor of NVTENVFP4ShardPartialEntry.");
+  NVTE_CHECK(amax.is_cuda() && amax.scalar_type() == at::kInt && amax.is_contiguous(),
+             "amax must be a contiguous int32 CUDA tensor.");
+  const size_t num_entries = entries.numel() / entry_size;
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_2d_shard_partial_amax(
+        reinterpret_cast<const NVTENVFP4ShardPartialEntry *>(entries.data_ptr()), num_entries,
+        amax.data_ptr<int32_t>(), at::cuda::getCurrentCUDAStream());
+  });
+}
+
+void nvfp4_2d_shard_pack(const at::Tensor &items, int64_t num_units, const at::Tensor &amax) {
+  constexpr int64_t item_size = sizeof(NVTENVFP4ShardPackItem);
+  NVTE_CHECK(items.is_cuda() && items.scalar_type() == at::kByte && items.is_contiguous() &&
+                 items.numel() % item_size == 0,
+             "items must be a contiguous uint8 CUDA tensor of NVTENVFP4ShardPackItem.");
+  NVTE_CHECK(amax.is_cuda() && amax.scalar_type() == at::kInt && amax.is_contiguous(),
+             "amax must be a contiguous int32 CUDA tensor.");
+  const size_t num_items = items.numel() / item_size;
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_2d_shard_pack(reinterpret_cast<const NVTENVFP4ShardPackItem *>(items.data_ptr()),
+                             num_items, num_units, amax.data_ptr<int32_t>(),
+                             at::cuda::getCurrentCUDAStream());
+  });
+}
+
+py::object nvfp4_2d_shard_unpack(const at::Tensor &gathered, int64_t chunk_bytes, int64_t shard,
+                                 int64_t param_start, const std::vector<int64_t> &scale_base,
+                                 const at::Tensor &amax, int64_t rows, int64_t cols,
+                                 py::handle quantizer, const py::object &output,
+                                 std::optional<at::Tensor> noop_flag) {
+  init_extension();
+  NVTE_CHECK(detail::IsNVFP4Quantizers(quantizer.ptr()),
+             "nvfp4_2d_shard_unpack only supports NVFP4 quantizers.");
+  NVTE_CHECK(gathered.is_cuda() && gathered.scalar_type() == at::kByte && gathered.is_contiguous(),
+             "gathered must be a contiguous uint8 CUDA tensor.");
+  NVTE_CHECK(amax.is_cuda() && amax.scalar_type() == at::kInt && amax.numel() >= 1,
+             "amax must be an int32 CUDA tensor holding the FP32 bit pattern of the amax.");
+  NVTE_CHECK(rows > 0 && cols > 0, "Invalid weight shape.");
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer_cpp.get());
+  NVTE_CHECK(nvfp4_quantizer_cpp->supports_fast_2d_quantization(),
+             "nvfp4_2d_shard_unpack needs a 2D-quantizing NVFP4 quantizer without RHT, "
+             "stochastic rounding, amax reduction, row scaling or 4over6.");
+  TensorWrapper output_cpp;
+  py::object output_py;
+  const std::vector<size_t> shape{static_cast<size_t>(rows), static_cast<size_t>(cols)};
+  if (output.is_none()) {
+    std::tie(output_cpp, output_py) = quantizer_cpp->create_tensor(shape, DType::kBFloat16);
+  } else {
+    std::tie(output_cpp, output_py) = quantizer_cpp->convert_and_update_tensor(output);
+  }
+  QuantizationConfigWrapper quant_config;
+  std::optional<TensorWrapper> noop_flag_cpp;
+  if (noop_flag.has_value()) {
+    noop_flag_cpp = makeTransformerEngineTensor(*noop_flag);
+    quant_config.set_noop_tensor(noop_flag_cpp->data());
+  }
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_nvfp4_2d_shard_unpack(gathered.data_ptr<uint8_t>(), chunk_bytes, shard, param_start,
+                               scale_base.data(), scale_base.size(), amax.data_ptr<int32_t>(),
+                               static_cast<size_t>(rows), static_cast<size_t>(cols),
+                               output_cpp.data(), quant_config, at::cuda::getCurrentCUDAStream());
+  });
+  return output_py;
+}
+
 py::object create_empty_quantized_tensor(py::handle quantizer, const std::vector<size_t> &shape,
                                          at::ScalarType dtype, at::Device device, bool pin_memory) {
   auto quantizer_cpp = convert_quantizer(quantizer);
