@@ -85,5 +85,15 @@ py::object dropout_bwd(const at::Tensor &grad_output, const at::Tensor &mask,
   return py::cast(std::move(*grad_input));
 }
 
+at::Tensor philox_rng_state(int64_t rng_elts_per_thread) {
+  NVTE_CHECK(rng_elts_per_thread > 0, "rng_elts_per_thread must be positive.");
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+  const at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+  auto rng_state = allocateTorchTensor(2, DType::kInt64);
+  philox_unpack(philox_args, static_cast<int64_t *>(rng_state.data_ptr()));
+  return rng_state;
+}
+
 }  // namespace pytorch
 }  // namespace transformer_engine

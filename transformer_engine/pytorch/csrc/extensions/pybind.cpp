@@ -661,6 +661,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dropout_bwd", transformer_engine::pytorch::dropout_bwd, "Dropout backward with 8-bit RNG",
         py::arg("grad_output"), py::arg("mask"), py::arg("dropout_probability"),
         py::arg("grad_input") = std::nullopt);
+  m.def("philox_rng_state", transformer_engine::pytorch::philox_rng_state,
+        "Reserve Philox offsets of the default CUDA generator and return its (seed, offset) as a "
+        "CUDA-graph-safe int64 tensor of 2 elements",
+        py::arg("rng_elts_per_thread"));
 
   // Misc
   m.def("get_cublasLt_version", &transformer_engine::pytorch::get_cublasLt_version,
